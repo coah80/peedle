@@ -1479,6 +1479,41 @@ impl LayoutEngine {
             }
         }
 
+        if let (Some(l), Some(r)) = (left, right) {
+            if style.width != LengthPercentageAuto::Auto {
+                let b = self.tree.get_mut(id);
+                let bw = b.dims.border_box().width;
+                let auto_l = style.margin_left == LengthPercentageAuto::Auto;
+                let auto_r = style.margin_right == LengthPercentageAuto::Auto;
+                if auto_l && auto_r {
+                    let rem = (cb.width - l - r - bw).max(0.0) * 0.5;
+                    b.dims.margin.left = rem;
+                    b.dims.margin.right = rem;
+                } else if auto_l {
+                    b.dims.margin.left = (cb.width - l - r - bw - b.dims.margin.right).max(0.0);
+                } else if auto_r {
+                    b.dims.margin.right = (cb.width - l - r - bw - b.dims.margin.left).max(0.0);
+                }
+            }
+        }
+        if let (Some(t), Some(bt)) = (top, bottom) {
+            if style.height != LengthPercentageAuto::Auto {
+                let b = self.tree.get_mut(id);
+                let bh = b.dims.border_box().height;
+                let auto_t = style.margin_top == LengthPercentageAuto::Auto;
+                let auto_b = style.margin_bottom == LengthPercentageAuto::Auto;
+                if auto_t && auto_b {
+                    let rem = (cb.height - t - bt - bh).max(0.0) * 0.5;
+                    b.dims.margin.top = rem;
+                    b.dims.margin.bottom = rem;
+                } else if auto_t {
+                    b.dims.margin.top = (cb.height - t - bt - bh - b.dims.margin.bottom).max(0.0);
+                } else if auto_b {
+                    b.dims.margin.bottom = (cb.height - t - bt - bh - b.dims.margin.top).max(0.0);
+                }
+            }
+        }
+
         let mb = self.tree.get(id).dims.margin_box();
         let target_x = if let Some(l) = left {
             cb.x + l

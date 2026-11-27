@@ -160,3 +160,101 @@ fn wpt_css_logical_properties_and_mask_image() {
     assert_eq!(s.border_left_color, Color::rgb(37, 99, 235));
     assert_eq!(s.mask_image.as_deref(), Some("icon.svg"));
 }
+
+#[test]
+fn wpt_css_nesting_and_nested_media_and_forced_colors() {
+    let doc = parse_html(r#"<div class="card"><span class="icon">x</span></div>"#);
+    let sheet = parse_stylesheet(
+        r#"
+        .card {
+            color: #112233;
+            & .icon {
+                color: #224466;
+                @media (forced-colors: active) {
+                    color: #ff0000;
+                }
+                @media (forced-colors: none) and (prefers-reduced-motion: no-preference) {
+                    background-color: #ddeeff;
+                }
+                @media (any-hover: hover) and (any-pointer: fine) {
+                    padding-left: 8px;
+                }
+            }
+        }
+        "#,
+    );
+    let styles = compute_styles(
+        &doc,
+        &[sheet],
+        Viewport {
+            width: 1280.0,
+            height: 800.0,
+            dark_mode: false,
+        },
+    );
+    let icon_id = query_selector_all(&doc, doc.root, ".icon")[0];
+    let s = styles.get(icon_id).unwrap();
+    assert_eq!(s.color, Color::rgb(0x22, 0x44, 0x66));
+    assert_eq!(s.background_color, Color::rgb(0xdd, 0xee, 0xff));
+    assert_eq!(s.padding_left, LengthPercentageAuto::px(8.0));
+}
+
+#[test]
+fn wpt_css_rule_index_and_cow_custom_properties_scale() {
+    let mut html = String::from("<!DOCTYPE html><html><body><div id='root'>");
+    for i in 0..400 {
+        html.push_str(&format!("<div class='item c{}' id='n{}'><span>{}</span></div>", i % 20, i, i));
+    }
+    html.push_str("</div></body></html>");
+
+    let mut css = String::from(":root {\n");
+    for i in 0..500 {
+        css.push_str(&format!("  --tok-{}: {}px;\n", i, (i % 40) + 1));
+    }
+    css.push_str("  --accent: #3b82f6;\n  --accent-alias: var(--accent);\n}\n");
+    for i in 0..2000 {
+        css.push_str(&format!(".unused-rule-{} {{ margin-top: {}px; }}\n", i, i % 10));
+    }
+    css.push_str(".c5 { color: var(--accent-alias); padding-left: var(--tok-12); }\n");
+    css.push_str("#n25 { background-color: #10b981; }\n");
+
+    let doc = parse_html(&html);
+    let sheet = parse_stylesheet(&css);
+    let start = std::time::Instant::now();
+    let styles = compute_styles(&doc, &[sheet], Viewport::default());
+    let elapsed = start.elapsed();
+
+    let n25 = styles.get(doc.get_element_by_id("n25").unwrap()).unwrap();
+    assert_eq!(n25.color, Color::rgb(0x3b, 0x82, 0xf6));
+    assert_eq!(n25.padding_left, LengthPercentageAuto::px(13.0));
+    assert_eq!(n25.background_color, Color::rgb(0x10, 0xb9, 0x81));
+    assert!(
+        elapsed.as_millis() < 500,
+        "indexed cascade + CoW custom props took too long: {:?}",
+        elapsed
+    );
+}
+
+#[test]
+fn wpt_css_specificity_is_where_not_has_and_layers() {
+    let doc = parse_html(
+        r#"<div id="wrap"><p class="lead"><span>hi</span></p><p class="plain">yo</p></div>"#,
+    );
+    let sheet = parse_stylesheet(
+        r#"
+        @layer reset, components, overrides;
+        @layer overrides {
+            :where(#wrap p.lead) { color: #111111; }
+        }
+        @layer components {
+            :is(#wrap, .nope) p:has(> span) { color: #22aa44; }
+            p:not(.lead) { color: #4455cc; }
+        }
+        "#,
+    );
+    let styles = compute_styles(&doc, &[sheet], Viewport::default());
+    let lead = query_selector_all(&doc, doc.root, "p.lead")[0];
+    let plain = query_selector_all(&doc, doc.root, "p.plain")[0];
+    assert_eq!(styles.get(lead).unwrap().color, Color::rgb(0x11, 0x11, 0x11));
+    assert_eq!(styles.get(plain).unwrap().color, Color::rgb(0x44, 0x55, 0xcc));
+}

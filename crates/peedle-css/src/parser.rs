@@ -1627,7 +1627,7 @@ fn parse_media_feature(tokens: &[Token]) -> MediaFeature {
                 }
                 _ => MediaFeature::Invalid,
             },
-            "hover" => match val {
+            "hover" | "any-hover" => match val {
                 Some(Token::Ident(s)) if s.eq_ignore_ascii_case("hover") => {
                     MediaFeature::Hover(true)
                 }
@@ -1636,8 +1636,26 @@ fn parse_media_feature(tokens: &[Token]) -> MediaFeature {
                 }
                 _ => MediaFeature::Invalid,
             },
-            "pointer" => match val {
+            "pointer" | "any-pointer" => match val {
                 Some(Token::Ident(s)) => MediaFeature::Pointer(s.clone()),
+                _ => MediaFeature::Invalid,
+            },
+            "forced-colors" => match val {
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("none") => {
+                    MediaFeature::Unknown(true)
+                }
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("active") => {
+                    MediaFeature::Unknown(false)
+                }
+                _ => MediaFeature::Invalid,
+            },
+            "prefers-reduced-motion" => match val {
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("no-preference") => {
+                    MediaFeature::Unknown(true)
+                }
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("reduce") => {
+                    MediaFeature::Unknown(false)
+                }
                 _ => MediaFeature::Invalid,
             },
             _ => MediaFeature::Invalid,

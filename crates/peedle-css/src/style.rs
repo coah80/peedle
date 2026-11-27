@@ -5,6 +5,7 @@ use crate::values::{
     GridTrackSize, LengthPercentageAuto, TextShadow, TransformOp,
 };
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Display {
@@ -1011,7 +1012,7 @@ pub struct ComputedStyle {
     pub cursor: Cursor,
     pub pointer_events: PointerEvents,
     pub user_select: UserSelect,
-    pub custom_properties: HashMap<String, Vec<Token>>,
+    pub custom_properties: Rc<HashMap<String, Vec<Token>>>,
 }
 
 impl Default for ComputedStyle {
@@ -1151,7 +1152,7 @@ impl Default for ComputedStyle {
             cursor: Cursor::Auto,
             pointer_events: PointerEvents::Auto,
             user_select: UserSelect::Auto,
-            custom_properties: HashMap::new(),
+            custom_properties: Rc::new(HashMap::new()),
         }
     }
 }
@@ -1188,7 +1189,7 @@ impl ComputedStyle {
         s.cursor = parent.cursor;
         s.pointer_events = parent.pointer_events;
         s.user_select = parent.user_select;
-        s.custom_properties = parent.custom_properties.clone();
+        s.custom_properties = Rc::clone(&parent.custom_properties);
         s
     }
 

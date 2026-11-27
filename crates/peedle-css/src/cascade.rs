@@ -2,7 +2,9 @@ use crate::parser::{
     parse_inline_declarations, Declaration, FontFaceRule, KeyframesRule, Rule, StyleRule,
     Stylesheet, Viewport,
 };
-use crate::selector::{matches_complex_selector, ComplexSelector, PseudoElement, Specificity};
+use crate::selector::{
+    matches_complex_selector, ComplexSelector, PseudoElement, SimpleSelector, Specificity,
+};
 use crate::style::{
     is_inherited_property, ua_stylesheet, AlignContent, AlignItems, AlignSelf, BackgroundClip,
     BackgroundRepeat, BackgroundSize, BorderCollapse, BorderStyle, BoxSizing, Clear, ComputedStyle,
@@ -20,6 +22,7 @@ use crate::values::{
 };
 use peedle_html::{Document, ElementData, NodeId};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 #[derive(Clone, Debug, Default)]
 pub struct StyleMap {
@@ -103,6 +106,94 @@ struct FlatRule<'a> {
     origin: Origin,
     layer_rank: Option<usize>,
     order: usize,
+    specificity: Specificity,
+}
+
+struct RuleIndex<'a> {
+    rules: Vec<FlatRule<'a>>,
+    by_id: HashMap<&'a str, Vec<usize>>,
+    by_class: HashMap<&'a str, Vec<usize>>,
+    by_tag: HashMap<String, Vec<usize>>,
+    universal: Vec<usize>,
+}
+
+impl<'a> RuleIndex<'a> {
+    fn build(rules: Vec<FlatRule<'a>>) -> Self {
+        let mut by_id: HashMap<&'a str, Vec<usize>> = HashMap::new();
+        let mut by_class: HashMap<&'a str, Vec<usize>> = HashMap::new();
+        let mut by_tag: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut universal: Vec<usize> = Vec::new();
+
+        for (idx, rule) in rules.iter().enumerate() {
+            let mut key_id: Option<&'a str> = None;
+            let mut key_class: Option<&'a str> = None;
+            let mut key_tag: Option<&'a str> = None;
+            if let Some(last) = rule.selector.compounds.last() {
+                for s in &last.simple {
+                    match s {
+                        SimpleSelector::Id(id) if key_id.is_none() => key_id = Some(id.as_str()),
+                        SimpleSelector::Class(c) if key_class.is_none() => {
+                            key_class = Some(c.as_str())
+                        }
+                        SimpleSelector::Type(t) if key_tag.is_none() => {
+                            key_tag = Some(t.as_str())
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(id) = key_id {
+                by_id.entry(id).or_default().push(idx);
+            } else if let Some(c) = key_class {
+                by_class.entry(c).or_default().push(idx);
+            } else if let Some(t) = key_tag {
+                by_tag.entry(t.to_ascii_lowercase()).or_default().push(idx);
+            } else {
+                universal.push(idx);
+            }
+        }
+
+        Self {
+            rules,
+            by_id,
+            by_class,
+            by_tag,
+            universal,
+        }
+    }
+
+    fn for_each_candidate(&self, el: &ElementData, mut f: impl FnMut(&FlatRule<'a>)) {
+        for &idx in &self.universal {
+            f(&self.rules[idx]);
+        }
+        let tag_lower = el.tag_name.to_ascii_lowercase();
+        if let Some(bucket) = self.by_tag.get(&tag_lower) {
+            for &idx in bucket {
+                f(&self.rules[idx]);
+            }
+        }
+        if let Some(id) = el.id() {
+            if let Some(bucket) = self.by_id.get(id) {
+                for &idx in bucket {
+                    f(&self.rules[idx]);
+                }
+            }
+        }
+        if let Some(cls_attr) = el.get_attr("class") {
+            let mut seen: Vec<&str> = Vec::new();
+            for cls in cls_attr.split_ascii_whitespace() {
+                if seen.contains(&cls) {
+                    continue;
+                }
+                seen.push(cls);
+                if let Some(bucket) = self.by_class.get(cls) {
+                    for &idx in bucket {
+                        f(&self.rules[idx]);
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct LayerRegistry {
@@ -212,6 +303,8 @@ pub fn compute_styles_with_ua_root(
         );
     }
 
+    let rule_index = RuleIndex::build(flat_rules);
+
     let prev_dark = crate::values::set_active_dark_mode(viewport.dark_mode);
     let root_default = ComputedStyle::default();
     let mut root_font_size = 16.0f32;
@@ -222,7 +315,7 @@ pub fn compute_styles_with_ua_root(
             &root_default,
             &mut root_font_size,
             true,
-            &flat_rules,
+            &rule_index,
             &viewport,
             &mut map,
         );
@@ -234,7 +327,7 @@ pub fn compute_styles_with_ua_root(
                 &root_default,
                 &mut root_font_size,
                 true,
-                &flat_rules,
+                &rule_index,
                 &viewport,
                 &mut map,
             );
@@ -272,6 +365,7 @@ fn collect_rules<'a>(
                         origin,
                         layer_rank,
                         order: *order,
+                        specificity: sel.specificity(),
                     });
                 }
             }
@@ -359,7 +453,7 @@ fn resolve_subtree(
     parent_style: &ComputedStyle,
     root_font_size: &mut f32,
     is_root_element: bool,
-    rules: &[FlatRule<'_>],
+    rule_index: &RuleIndex<'_>,
     viewport: &Viewport,
     map: &mut StyleMap,
 ) {
@@ -383,16 +477,16 @@ fn resolve_subtree(
         matched.push((key, decl));
     }
 
-    for rule in rules {
+    rule_index.for_each_candidate(el, |rule| {
         if !matches_complex_selector(doc, node, rule.selector, None) {
-            continue;
+            return;
         }
-        let spec = rule.selector.specificity();
+        let spec = rule.specificity;
         let target = match rule.selector.pseudo_element {
             None => &mut matched,
             Some(PseudoElement::Before) => &mut before_matched,
             Some(PseudoElement::After) => &mut after_matched,
-            Some(_) => continue,
+            Some(_) => return,
         };
         for (idx, decl) in rule.declarations.iter().enumerate() {
             let key = CascadeKey::new(
@@ -405,7 +499,7 @@ fn resolve_subtree(
             );
             target.push((key, decl.clone()));
         }
-    }
+    });
 
     if let Some(inline_str) = el.get_attr("style") {
         let inline_decls = parse_inline_declarations(inline_str);
@@ -458,7 +552,7 @@ fn resolve_subtree(
             &style_clone,
             root_font_size,
             false,
-            rules,
+            rule_index,
             viewport,
             map,
         );
@@ -489,34 +583,43 @@ fn compute_element_style(
         }
     }
 
-    let mut raw_custom = parent.custom_properties.clone();
-    for (name, (_, val)) in custom_winners {
-        if is_css_wide(&val, "initial") {
-            raw_custom.remove(&name);
-        } else if is_css_wide(&val, "inherit") || is_css_wide(&val, "unset") {
-            if let Some(p) = parent.custom_properties.get(&name) {
-                raw_custom.insert(name, p.clone());
-            } else {
+    if !custom_winners.is_empty() {
+        let mut raw_custom = (*parent.custom_properties).clone();
+        let mut to_resolve: Vec<String> = Vec::with_capacity(custom_winners.len());
+        for (name, (_, val)) in custom_winners {
+            if is_css_wide(&val, "initial") {
                 raw_custom.remove(&name);
+            } else if is_css_wide(&val, "inherit") || is_css_wide(&val, "unset") {
+                if let Some(p) = parent.custom_properties.get(&name) {
+                    raw_custom.insert(name, p.clone());
+                } else {
+                    raw_custom.remove(&name);
+                }
+            } else {
+                to_resolve.push(name.clone());
+                raw_custom.insert(name, val);
             }
-        } else {
-            raw_custom.insert(name, val);
         }
-    }
 
-    let mut resolved_custom = HashMap::new();
-    for name in raw_custom.keys() {
-        let mut visiting = HashSet::new();
-        visiting.insert(name.clone());
-        if let Some(tokens) = resolve_var_in_tokens(
-            raw_custom.get(name).unwrap(),
-            &raw_custom,
-            &mut visiting,
-        ) {
-            resolved_custom.insert(name.clone(), tokens);
+        let mut resolved_custom = raw_custom.clone();
+        for name in &to_resolve {
+            if let Some(raw_val) = raw_custom.get(name) {
+                if contains_var_call(raw_val) {
+                    let mut visiting = HashSet::new();
+                    visiting.insert(name.clone());
+                    match resolve_var_in_tokens(raw_val, &raw_custom, &mut visiting) {
+                        Some(tokens) => {
+                            resolved_custom.insert(name.clone(), tokens);
+                        }
+                        None => {
+                            resolved_custom.remove(name);
+                        }
+                    }
+                }
+            }
         }
+        style.custom_properties = Rc::new(resolved_custom);
     }
-    style.custom_properties = resolved_custom;
 
     let mut expanded_lists: HashMap<String, Vec<(CascadeKey, Vec<Token>)>> = HashMap::new();
     let mut ua_winners: HashMap<String, (CascadeKey, Vec<Token>)> = HashMap::new();

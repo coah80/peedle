@@ -196,3 +196,40 @@ fn websocket_rfc6455_handshake_text_binary_close() {
     assert_eq!(ws.read_message().unwrap(), WsMessage::Close(1000, String::new()));
     server.join().unwrap();
 }
+
+#[test]
+fn http11_keep_alive_chunked_reuse() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepts_srv = accepts.clone();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        accepts_srv.fetch_add(1, Ordering::SeqCst);
+        for body in ["first-chunked-html", "body { color: red; }"] {
+            let mut req_buf = [0u8; 2048];
+            let n = stream.read(&mut req_buf).unwrap();
+            assert!(n > 0);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        }
+    });
+
+    let client = HttpClient::new();
+    let r1 = client.get(&format!("http://127.0.0.1:{}/index.html", port)).unwrap();
+    let r2 = client.get(&format!("http://127.0.0.1:{}/styles.css", port)).unwrap();
+    assert_eq!(r1.status, 200);
+    assert_eq!(r1.text(), "first-chunked-html");
+    assert_eq!(r2.status, 200);
+    assert_eq!(r2.text(), "body { color: red; }");
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    server.join().unwrap();
+}

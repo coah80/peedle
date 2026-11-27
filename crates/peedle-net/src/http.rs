@@ -354,7 +354,7 @@ impl HttpClient {
         };
 
         match write_and_status(&mut reader, &mut status_line) {
-            Ok(n) if n > 0 => {}
+            Ok(n) if n > 0 && status_line.starts_with("HTTP/") => {}
             _ if reused => {
                 reader = self.open_transport(&req.url.scheme, &host, port)?;
                 let n = write_and_status(&mut reader, &mut status_line)?;
@@ -505,13 +505,20 @@ fn read_chunked<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, HttpError> {
         let chunk_len = usize::from_str_radix(hex, 16)
             .map_err(|_| HttpError::Protocol("invalid chunk size".to_string()))?;
         if chunk_len == 0 {
+            loop {
+                let mut trailer = String::new();
+                let tn = reader.read_line(&mut trailer)?;
+                if tn == 0 || trailer == "\r\n" || trailer == "\n" {
+                    break;
+                }
+            }
             break;
         }
         let mut chunk = vec![0u8; chunk_len];
         reader.read_exact(&mut chunk)?;
         out.extend_from_slice(&chunk);
-        let mut crlf = [0u8; 2];
-        let _ = reader.read_exact(&mut crlf);
+        let mut line_end = String::new();
+        let _ = reader.read_line(&mut line_end);
     }
     Ok(out)
 }
