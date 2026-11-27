@@ -23,6 +23,21 @@ pub fn paint_layout(
     scroll_x: f32,
     scroll_y: f32,
 ) {
+    paint_layout_scaled(doc, tree, fb, fonts, images, canvases, scroll_x, scroll_y, 1.0);
+}
+
+pub fn paint_layout_scaled(
+    doc: &Document,
+    tree: &LayoutTree,
+    fb: &mut Framebuffer,
+    fonts: &FontSystem,
+    images: &ImageCache,
+    canvases: &HashMap<NodeId, Canvas2D>,
+    scroll_x: f32,
+    scroll_y: f32,
+    scale: f32,
+) {
+    let s = scale.max(0.25);
     let bg = doc
         .document_element()
         .and_then(|id| tree.box_of(id))
@@ -39,7 +54,7 @@ pub fn paint_layout(
     fb.clear(to_rgba(bg));
 
     if let Some(root) = tree.root {
-        paint_box(doc, tree, root, fb, fonts, images, canvases, -scroll_x, -scroll_y);
+        paint_box(doc, tree, root, fb, fonts, images, canvases, -scroll_x, -scroll_y, s);
     }
 }
 
@@ -68,6 +83,10 @@ fn to_rgba(c: Color) -> RgbaColor {
     RgbaColor::new(c.r, c.g, c.b, c.a)
 }
 
+fn scale_arr4(v: [f32; 4], s: f32) -> [f32; 4] {
+    [v[0] * s, v[1] * s, v[2] * s, v[3] * s]
+}
+
 fn resolve_radii(style: &ComputedStyle, w: f32, h: f32) -> [f32; 4] {
     let ctx = CalcContext {
         font_size: style.font_size,
@@ -94,11 +113,15 @@ fn paint_box(
     canvases: &HashMap<NodeId, Canvas2D>,
     ox: f32,
     oy: f32,
+    s: f32,
 ) {
     let b = tree.get(id);
     if b.style.visibility == Visibility::Hidden || b.style.opacity <= 0.001 || b.style.clip_hidden {
         return;
     }
+
+    let vp_w = fb.width as f32 / s;
+    let vp_h = fb.height as f32 / s;
 
     let is_fixed = b.style.position == Position::Fixed;
     let mut dx = if is_fixed { 0.0 } else { ox };
@@ -109,12 +132,12 @@ fn paint_box(
         let ctx_x = CalcContext {
             font_size: b.style.font_size,
             root_font_size: 16.0,
-            viewport_width: fb.width as f32,
-            viewport_height: fb.height as f32,
-            percentage_base: fb.width as f32,
+            viewport_width: vp_w,
+            viewport_height: vp_h,
+            percentage_base: vp_w,
         };
         let ctx_y = CalcContext {
-            percentage_base: fb.height as f32,
+            percentage_base: vp_h,
             ..ctx_x
         };
         if let Some(top_limit) = b.style.top.resolve(&ctx_y) {
@@ -135,8 +158,8 @@ fn paint_box(
         let ctx_w = CalcContext {
             font_size: b.style.font_size,
             root_font_size: 16.0,
-            viewport_width: fb.width as f32,
-            viewport_height: fb.height as f32,
+            viewport_width: vp_w,
+            viewport_height: vp_h,
             percentage_base: bb.width,
         };
         let ctx_h = CalcContext {
@@ -173,20 +196,23 @@ fn paint_box(
     let rx = bb.x + dx;
     let ry = bb.y + dy;
     let radii = resolve_radii(&b.style, bb.width, bb.height);
+    let sradii = scale_arr4(radii, s);
 
-    if !matches!(b.kind, BoxKind::Text(_)) {
+    let box_in_view = ry + bb.height >= -96.0 && ry <= vp_h + 96.0;
+
+    if !matches!(b.kind, BoxKind::Text(_)) && box_in_view {
         for sh in &b.style.box_shadow {
             if !sh.inset {
                 fb.draw_box_shadow(
-                    rx,
-                    ry,
-                    bb.width,
-                    bb.height,
-                    radii,
-                    sh.offset_x,
-                    sh.offset_y,
-                    sh.blur_radius,
-                    sh.spread_radius,
+                    rx * s,
+                    ry * s,
+                    bb.width * s,
+                    bb.height * s,
+                    sradii,
+                    sh.offset_x * s,
+                    sh.offset_y * s,
+                    sh.blur_radius * s,
+                    sh.spread_radius * s,
                     to_rgba(sh.color).with_alpha(alpha),
                     false,
                 );
@@ -199,19 +225,19 @@ fn paint_box(
                     if mimg.width > 0 && mimg.height > 0 && bb.width > 0.0 && bb.height > 0.0 {
                         let sx = bb.width / mimg.width as f32;
                         let sy = bb.height / mimg.height as f32;
-                        let s = sx.min(sy);
-                        let tw = mimg.width as f32 * s;
-                        let th = mimg.height as f32 * s;
+                        let ms = sx.min(sy);
+                        let tw = mimg.width as f32 * ms;
+                        let th = mimg.height as f32 * ms;
                         let tx = rx + (bb.width - tw) * 0.5;
                         let ty = ry + (bb.height - th) * 0.5;
                         fb.blit_tinted_mask_rgba(
                             mimg.width,
                             mimg.height,
                             &mimg.rgba,
-                            tx,
-                            ty,
-                            tw,
-                            th,
+                            tx * s,
+                            ty * s,
+                            tw * s,
+                            th * s,
                             to_rgba(b.style.background_color).with_alpha(alpha),
                         );
                     }
@@ -230,11 +256,11 @@ fn paint_box(
                 _ => (rx, ry, bb.width, bb.height),
             };
             fb.fill_rounded_rect(
-                bg_x,
-                bg_y,
-                bg_w,
-                bg_h,
-                radii,
+                bg_x * s,
+                bg_y * s,
+                bg_w * s,
+                bg_h * s,
+                sradii,
                 to_rgba(b.style.background_color).with_alpha(alpha),
             );
         }
@@ -246,11 +272,28 @@ fn paint_box(
                 stops,
             } => {
                 let norm = normalize_stops(stops, alpha);
-                fb.fill_linear_gradient(rx, ry, bb.width, bb.height, radii, *angle_deg, &norm, *repeating);
+                fb.fill_linear_gradient(
+                    rx * s,
+                    ry * s,
+                    bb.width * s,
+                    bb.height * s,
+                    sradii,
+                    *angle_deg,
+                    &norm,
+                    *repeating,
+                );
             }
             BackgroundImage::RadialGradient { repeating, stops, .. } => {
                 let norm = normalize_stops(stops, alpha);
-                fb.fill_radial_gradient(rx, ry, bb.width, bb.height, radii, &norm, *repeating);
+                fb.fill_radial_gradient(
+                    rx * s,
+                    ry * s,
+                    bb.width * s,
+                    bb.height * s,
+                    sradii,
+                    &norm,
+                    *repeating,
+                );
             }
             BackgroundImage::ConicGradient {
                 from_deg,
@@ -260,11 +303,11 @@ fn paint_box(
             } => {
                 let norm = normalize_stops(stops, alpha);
                 fb.fill_conic_gradient(
-                    rx,
-                    ry,
-                    bb.width,
-                    bb.height,
-                    radii,
+                    rx * s,
+                    ry * s,
+                    bb.width * s,
+                    bb.height * s,
+                    sradii,
                     *from_deg,
                     &norm,
                     *repeating,
@@ -274,30 +317,30 @@ fn paint_box(
                 if let Some(img) = images.get(u) {
                     if img.width > 0 && img.height > 0 && bb.width > 0.0 && bb.height > 0.0 {
                         fb.push_clip(ClipRect {
-                            x: rx.floor() as i32,
-                            y: ry.floor() as i32,
-                            w: bb.width.ceil() as i32,
-                            h: bb.height.ceil() as i32,
+                            x: (rx * s).floor() as i32,
+                            y: (ry * s).floor() as i32,
+                            w: (bb.width * s).ceil() as i32,
+                            h: (bb.height * s).ceil() as i32,
                         });
                         let (tw, th) = match &b.style.background_size {
                             peedle_css::BackgroundSize::Cover => {
                                 let sx = bb.width / img.width as f32;
                                 let sy = bb.height / img.height as f32;
-                                let s = sx.max(sy);
-                                (img.width as f32 * s, img.height as f32 * s)
+                                let bs = sx.max(sy);
+                                (img.width as f32 * bs, img.height as f32 * bs)
                             }
                             peedle_css::BackgroundSize::Contain => {
                                 let sx = bb.width / img.width as f32;
                                 let sy = bb.height / img.height as f32;
-                                let s = sx.min(sy);
-                                (img.width as f32 * s, img.height as f32 * s)
+                                let bs = sx.min(sy);
+                                (img.width as f32 * bs, img.height as f32 * bs)
                             }
                             peedle_css::BackgroundSize::Explicit(bw, bh) => {
                                 let ctx_w = CalcContext {
                                     font_size: b.style.font_size,
                                     root_font_size: 16.0,
-                                    viewport_width: fb.width as f32,
-                                    viewport_height: fb.height as f32,
+                                    viewport_width: vp_w,
+                                    viewport_height: vp_h,
                                     percentage_base: bb.width,
                                 };
                                 let ctx_h = CalcContext {
@@ -322,15 +365,15 @@ fn paint_box(
                         };
                         let pb = b.dims.padding_box();
                         let (area_x, area_y, area_w, area_h) = if b.style.background_attachment_fixed {
-                            (0.0f32, 0.0f32, fb.width as f32, fb.height as f32)
+                            (0.0f32, 0.0f32, vp_w, vp_h)
                         } else {
                             (pb.x + dx, pb.y + dy, pb.width, pb.height)
                         };
                         let ctx_x = CalcContext {
                             font_size: b.style.font_size,
                             root_font_size: 16.0,
-                            viewport_width: fb.width as f32,
-                            viewport_height: fb.height as f32,
+                            viewport_width: vp_w,
+                            viewport_height: vp_h,
                             percentage_base: (area_w - tw).max(0.0),
                         };
                         let ctx_y = CalcContext {
@@ -343,19 +386,19 @@ fn paint_box(
                         if img.width == 1 && img.height == 1 && rep_x && rep_y {
                             let c = RgbaColor::new(img.rgba[0], img.rgba[1], img.rgba[2], img.rgba[3])
                                 .with_alpha(alpha);
-                            fb.fill_rounded_rect(rx, ry, bb.width, bb.height, radii, c);
+                            fb.fill_rounded_rect(rx * s, ry * s, bb.width * s, bb.height * s, sradii, c);
                         } else {
                             let (c_start, c_end) = if rep_x && tw >= 1.0 {
-                                let s = ((rx - bg_ox) / tw).floor() as i32;
-                                let e = ((rx + bb.width - bg_ox) / tw).ceil() as i32;
-                                (s, e.min(s + 2048))
+                                let cs = ((rx - bg_ox) / tw).floor() as i32;
+                                let ce = ((rx + bb.width - bg_ox) / tw).ceil() as i32;
+                                (cs, ce.min(cs + 2048))
                             } else {
                                 (0, 1)
                             };
                             let (r_start, r_end) = if rep_y && th >= 1.0 {
-                                let s = ((ry - bg_oy) / th).floor() as i32;
-                                let e = ((ry + bb.height - bg_oy) / th).ceil() as i32;
-                                (s, e.min(s + 2048))
+                                let rs = ((ry - bg_oy) / th).floor() as i32;
+                                let re = ((ry + bb.height - bg_oy) / th).ceil() as i32;
+                                (rs, re.min(rs + 2048))
                             } else {
                                 (0, 1)
                             };
@@ -370,10 +413,10 @@ fn paint_box(
                                         img.width,
                                         img.height,
                                         &img.rgba,
-                                        tx,
-                                        ty,
-                                        tw,
-                                        th,
+                                        tx * s,
+                                        ty * s,
+                                        tw * s,
+                                        th * s,
                                         alpha,
                                     );
                                 }
@@ -396,15 +439,15 @@ fn paint_box(
         for sh in &b.style.box_shadow {
             if sh.inset {
                 fb.draw_box_shadow(
-                    pb_in.x + dx,
-                    pb_in.y + dy,
-                    pb_in.width,
-                    pb_in.height,
-                    in_radii,
-                    sh.offset_x,
-                    sh.offset_y,
-                    sh.blur_radius,
-                    sh.spread_radius,
+                    (pb_in.x + dx) * s,
+                    (pb_in.y + dy) * s,
+                    pb_in.width * s,
+                    pb_in.height * s,
+                    scale_arr4(in_radii, s),
+                    sh.offset_x * s,
+                    sh.offset_y * s,
+                    sh.blur_radius * s,
+                    sh.spread_radius * s,
                     to_rgba(sh.color).with_alpha(alpha),
                     true,
                 );
@@ -438,7 +481,16 @@ fn paint_box(
                 style_code(b.style.border_bottom_style),
                 style_code(b.style.border_left_style),
             ];
-            fb.stroke_styled_borders(rx, ry, bb.width, bb.height, radii, widths, colors, bstyles);
+            fb.stroke_styled_borders(
+                rx * s,
+                ry * s,
+                bb.width * s,
+                bb.height * s,
+                sradii,
+                scale_arr4(widths, s),
+                colors,
+                bstyles,
+            );
         }
 
         if b.style.outline_width > 0.0
@@ -455,12 +507,12 @@ fn paint_box(
                 (radii[3] + expand).max(0.0),
             ];
             fb.stroke_rounded_rect(
-                rx - expand,
-                ry - expand,
-                bb.width + expand * 2.0,
-                bb.height + expand * 2.0,
-                out_radii,
-                [ow; 4],
+                (rx - expand) * s,
+                (ry - expand) * s,
+                (bb.width + expand * 2.0) * s,
+                (bb.height + expand * 2.0) * s,
+                scale_arr4(out_radii, s),
+                [ow * s; 4],
                 [oc; 4],
             );
         }
@@ -476,10 +528,10 @@ fn paint_box(
             fonts.draw_text(
                 fb,
                 marker,
-                b.dims.content.x + dx - mw - 4.0,
-                b.dims.content.y + dy + asc,
+                (b.dims.content.x + dx - mw - 4.0) * s,
+                (b.dims.content.y + dy + asc) * s,
                 key,
-                b.style.font_size,
+                b.style.font_size * s,
                 to_rgba(b.style.color).with_alpha(alpha),
             );
         }
@@ -494,20 +546,24 @@ fn paint_box(
             );
             let color = to_rgba(b.style.color).with_alpha(alpha);
             for frag in &b.text_fragments {
+                let top_y = frag.y + dy;
+                if top_y + frag.height < -8.0 || top_y > vp_h + 8.0 {
+                    continue;
+                }
                 let fx = frag.x + dx;
                 let fy = frag.baseline + dy;
                 for ts in &b.style.text_shadow {
                     fonts.draw_text(
                         fb,
                         &frag.text,
-                        fx + ts.offset_x,
-                        fy + ts.offset_y,
+                        (fx + ts.offset_x) * s,
+                        (fy + ts.offset_y) * s,
                         key,
-                        b.style.font_size,
+                        b.style.font_size * s,
                         to_rgba(ts.color).with_alpha(alpha),
                     );
                 }
-                fonts.draw_text(fb, &frag.text, fx, fy, key, b.style.font_size, color);
+                fonts.draw_text(fb, &frag.text, fx * s, fy * s, key, b.style.font_size * s, color);
                 match b.style.text_decoration_line {
                     TextDecorationLine::Underline => {
                         let dec_c = b
@@ -515,7 +571,7 @@ fn paint_box(
                             .text_decoration_color
                             .map(to_rgba)
                             .unwrap_or(color);
-                        fb.fill_rect(fx, fy + 2.0, frag.width, 1.0, dec_c);
+                        fb.fill_rect(fx * s, (fy + 2.0) * s, frag.width * s, 1.0 * s, dec_c);
                     }
                     TextDecorationLine::LineThrough => {
                         let dec_c = b
@@ -523,7 +579,13 @@ fn paint_box(
                             .text_decoration_color
                             .map(to_rgba)
                             .unwrap_or(color);
-                        fb.fill_rect(fx, fy - b.style.font_size * 0.3, frag.width, 1.0, dec_c);
+                        fb.fill_rect(
+                            fx * s,
+                            (fy - b.style.font_size * 0.3) * s,
+                            frag.width * s,
+                            1.0 * s,
+                            dec_c,
+                        );
                     }
                     TextDecorationLine::Overline => {
                         let dec_c = b
@@ -531,7 +593,7 @@ fn paint_box(
                             .text_decoration_color
                             .map(to_rgba)
                             .unwrap_or(color);
-                        fb.fill_rect(fx, frag.y + dy, frag.width, 1.0, dec_c);
+                        fb.fill_rect(fx * s, (frag.y + dy) * s, frag.width * s, 1.0 * s, dec_c);
                     }
                     TextDecorationLine::None => {}
                 }
@@ -542,7 +604,24 @@ fn paint_box(
             let cy = b.dims.content.y + dy;
             let cw = b.dims.content.width;
             let ch = b.dims.content.height;
-            paint_replaced(doc, b.node, rep, &b.style, fb, fonts, images, canvases, cx, cy, cw, ch, alpha);
+            if cy + ch >= -8.0 && cy <= vp_h + 8.0 {
+                paint_replaced(
+                    doc,
+                    b.node,
+                    rep,
+                    &b.style,
+                    fb,
+                    fonts,
+                    images,
+                    canvases,
+                    cx,
+                    cy,
+                    cw,
+                    ch,
+                    alpha,
+                    s,
+                );
+            }
         }
         _ => {}
     }
@@ -551,11 +630,15 @@ fn paint_box(
         || !matches!(b.style.overflow_y, Overflow::Visible);
     if clips {
         let pb = b.dims.padding_box();
+        let clip_top = pb.y + dy;
+        if clip_top + pb.height < -4.0 || clip_top > vp_h + 4.0 {
+            return;
+        }
         fb.push_clip(ClipRect {
-            x: (pb.x + dx).floor() as i32,
-            y: (pb.y + dy).floor() as i32,
-            w: pb.width.ceil() as i32,
-            h: pb.height.ceil() as i32,
+            x: ((pb.x + dx) * s).floor() as i32,
+            y: (clip_top * s).floor() as i32,
+            w: (pb.width * s).ceil() as i32,
+            h: (pb.height * s).ceil() as i32,
         });
     }
 
@@ -570,8 +653,10 @@ fn paint_box(
             (4i32, z)
         } else if cb.style.float != peedle_css::Float::None {
             (2i32, 0)
-        } else if matches!(cb.kind, BoxKind::Inline | BoxKind::InlineBlock | BoxKind::Text(_) | BoxKind::Replaced(_))
-            || is_inline_only_container(tree, cid)
+        } else if matches!(
+            cb.kind,
+            BoxKind::Inline | BoxKind::InlineBlock | BoxKind::Text(_) | BoxKind::Replaced(_)
+        ) || is_inline_only_container(tree, cid)
         {
             (3i32, 0)
         } else {
@@ -596,6 +681,7 @@ fn paint_box(
             canvases,
             dx - scroll_dx,
             dy - scroll_dy,
+            s,
         );
     }
 
@@ -618,6 +704,7 @@ fn paint_replaced(
     w: f32,
     h: f32,
     alpha: f32,
+    s: f32,
 ) {
     if w <= 0.0 || h <= 0.0 {
         return;
@@ -630,16 +717,16 @@ fn paint_replaced(
                 let ih = img.height.max(1) as f32;
                 let (dw, dh) = match style.object_fit {
                     peedle_css::ObjectFit::Cover => {
-                        let s = (w / iw).max(h / ih);
-                        (iw * s, ih * s)
+                        let sc = (w / iw).max(h / ih);
+                        (iw * sc, ih * sc)
                     }
                     peedle_css::ObjectFit::Contain => {
-                        let s = (w / iw).min(h / ih);
-                        (iw * s, ih * s)
+                        let sc = (w / iw).min(h / ih);
+                        (iw * sc, ih * sc)
                     }
                     peedle_css::ObjectFit::ScaleDown => {
-                        let s = (w / iw).min(h / ih).min(1.0);
-                        (iw * s, ih * s)
+                        let sc = (w / iw).min(h / ih).min(1.0);
+                        (iw * sc, ih * sc)
                     }
                     peedle_css::ObjectFit::None => (iw, ih),
                     peedle_css::ObjectFit::Fill => (w, h),
@@ -647,19 +734,39 @@ fn paint_replaced(
                 let dx = x + (w - dw) * 0.5;
                 let dy = y + (h - dh) * 0.5;
                 if radii.iter().any(|&r| r > 0.01) || (dw - w).abs() > 0.5 || (dh - h).abs() > 0.5 {
-                    fb.blit_rgba_rounded(img.width, img.height, &img.rgba, dx, dy, dw, dh, x, y, w, h, radii, alpha);
+                    fb.blit_rgba_rounded(
+                        img.width,
+                        img.height,
+                        &img.rgba,
+                        dx * s,
+                        dy * s,
+                        dw * s,
+                        dh * s,
+                        x * s,
+                        y * s,
+                        w * s,
+                        h * s,
+                        scale_arr4(radii, s),
+                        alpha,
+                    );
                 } else {
-                    fb.blit_rgba(img.width, img.height, &img.rgba, x, y, w, h, alpha);
+                    fb.blit_rgba(img.width, img.height, &img.rgba, x * s, y * s, w * s, h * s, alpha);
                 }
             } else {
-                fb.fill_rect(x, y, w, h, RgbaColor::new(235, 238, 242, 255).with_alpha(alpha));
+                fb.fill_rect(
+                    x * s,
+                    y * s,
+                    w * s,
+                    h * s,
+                    RgbaColor::new(235, 238, 242, 255).with_alpha(alpha),
+                );
                 fb.stroke_rounded_rect(
-                    x,
-                    y,
-                    w,
-                    h,
+                    x * s,
+                    y * s,
+                    w * s,
+                    h * s,
                     [0.0; 4],
-                    [1.0; 4],
+                    [1.0 * s; 4],
                     [RgbaColor::new(190, 196, 204, 255); 4],
                 );
             }
@@ -667,7 +774,7 @@ fn paint_replaced(
         ReplacedKind::Canvas { .. } => {
             if let Some(nid) = node {
                 if let Some(cv) = canvases.get(&nid) {
-                    fb.blit_rgba(cv.fb.width, cv.fb.height, &cv.fb.data, x, y, w, h, alpha);
+                    fb.blit_rgba(cv.fb.width, cv.fb.height, &cv.fb.data, x * s, y * s, w * s, h * s, alpha);
                 }
             }
         }
@@ -678,10 +785,10 @@ fn paint_replaced(
                     nid,
                     fb,
                     fonts,
-                    x,
-                    y,
-                    w,
-                    h,
+                    x * s,
+                    y * s,
+                    w * s,
+                    h * s,
                     to_rgba(style.color).with_alpha(alpha),
                 );
             }
@@ -699,41 +806,55 @@ fn paint_replaced(
                 } else {
                     RgbaColor::WHITE
                 };
-                fb.fill_rounded_rect(x, y, w, h, [3.0; 4], bg);
+                fb.fill_rounded_rect(x * s, y * s, w * s, h * s, [3.0 * s; 4], bg);
                 fb.stroke_rounded_rect(
-                    x,
-                    y,
-                    w,
-                    h,
-                    [3.0; 4],
-                    [1.0; 4],
+                    x * s,
+                    y * s,
+                    w * s,
+                    h * s,
+                    [3.0 * s; 4],
+                    [1.0 * s; 4],
                     [RgbaColor::new(148, 163, 184, 255); 4],
                 );
                 if *checked {
-                    fb.draw_line(x + 3.0, y + h * 0.55, x + w * 0.42, y + h - 3.5, 2.0, RgbaColor::WHITE);
-                    fb.draw_line(x + w * 0.42, y + h - 3.5, x + w - 3.0, y + 3.5, 2.0, RgbaColor::WHITE);
+                    fb.draw_line(
+                        (x + 3.0) * s,
+                        (y + h * 0.55) * s,
+                        (x + w * 0.42) * s,
+                        (y + h - 3.5) * s,
+                        2.0 * s,
+                        RgbaColor::WHITE,
+                    );
+                    fb.draw_line(
+                        (x + w * 0.42) * s,
+                        (y + h - 3.5) * s,
+                        (x + w - 3.0) * s,
+                        (y + 3.5) * s,
+                        2.0 * s,
+                        RgbaColor::WHITE,
+                    );
                 }
             }
             "radio" => {
                 let r = w.min(h) * 0.5;
-                fb.fill_rounded_rect(x, y, w, h, [r; 4], RgbaColor::WHITE);
+                fb.fill_rounded_rect(x * s, y * s, w * s, h * s, [r * s; 4], RgbaColor::WHITE);
                 fb.stroke_rounded_rect(
-                    x,
-                    y,
-                    w,
-                    h,
-                    [r; 4],
-                    [1.5; 4],
+                    x * s,
+                    y * s,
+                    w * s,
+                    h * s,
+                    [r * s; 4],
+                    [1.5 * s; 4],
                     [RgbaColor::new(100, 116, 139, 255); 4],
                 );
                 if *checked {
                     let ir = r * 0.5;
                     fb.fill_rounded_rect(
-                        x + ir,
-                        y + ir,
-                        w - ir * 2.0,
-                        h - ir * 2.0,
-                        [ir; 4],
+                        (x + ir) * s,
+                        (y + ir) * s,
+                        (w - ir * 2.0) * s,
+                        (h - ir * 2.0) * s,
+                        [ir * s; 4],
                         RgbaColor::new(37, 99, 235, 255),
                     );
                 }
@@ -746,14 +867,21 @@ fn paint_replaced(
                     || style.effective_border_bottom_width() > 0.0
                     || style.effective_border_left_width() > 0.0;
                 if !has_author_chrome {
-                    fb.fill_rounded_rect(x, y, w, h, [4.0; 4], RgbaColor::new(241, 245, 249, 255));
+                    fb.fill_rounded_rect(
+                        x * s,
+                        y * s,
+                        w * s,
+                        h * s,
+                        [4.0 * s; 4],
+                        RgbaColor::new(241, 245, 249, 255),
+                    );
                     fb.stroke_rounded_rect(
-                        x,
-                        y,
-                        w,
-                        h,
-                        [4.0; 4],
-                        [1.0; 4],
+                        x * s,
+                        y * s,
+                        w * s,
+                        h * s,
+                        [4.0 * s; 4],
+                        [1.0 * s; 4],
                         [RgbaColor::new(148, 163, 184, 255); 4],
                     );
                 }
@@ -773,10 +901,10 @@ fn paint_replaced(
                 fonts.draw_text(
                     fb,
                     label,
-                    x + (w - tw) * 0.5,
-                    y + (h + fs * 0.72) * 0.5,
+                    (x + (w - tw) * 0.5) * s,
+                    (y + (h + fs * 0.72) * 0.5) * s,
                     key,
-                    fs,
+                    fs * s,
                     tc,
                 );
             }
@@ -796,14 +924,14 @@ fn paint_replaced(
                     } else {
                         RgbaColor::new(180, 188, 198, 255)
                     };
-                    fb.fill_rounded_rect(x, y, w, h, [4.0; 4], RgbaColor::WHITE);
+                    fb.fill_rounded_rect(x * s, y * s, w * s, h * s, [4.0 * s; 4], RgbaColor::WHITE);
                     fb.stroke_rounded_rect(
-                        x,
-                        y,
-                        w,
-                        h,
-                        [4.0; 4],
-                        [if focused { 2.0 } else { 1.0 }; 4],
+                        x * s,
+                        y * s,
+                        w * s,
+                        h * s,
+                        [4.0 * s; 4],
+                        [if focused { 2.0 } else { 1.0 } * s; 4],
                         [border_c; 4],
                     );
                 }
@@ -815,31 +943,35 @@ fn paint_replaced(
                 );
                 let pad_x = if has_author_chrome { 0.0 } else { 8.0 };
                 let (shown, tc) = if !value.is_empty() {
-                    let s = if input_type == "password" {
+                    let sv = if input_type == "password" {
                         "\u{2022}".repeat(value.chars().count())
                     } else {
                         value.clone()
                     };
-                    (s, to_rgba(style.color).with_alpha(alpha))
+                    (sv, to_rgba(style.color).with_alpha(alpha))
                 } else {
                     (placeholder.clone(), RgbaColor::new(148, 163, 184, 255).with_alpha(alpha))
                 };
-                let end_x = fonts.draw_text(
+                let end_x_phys = fonts.draw_text(
                     fb,
                     &shown,
-                    x + pad_x,
-                    y + (h + fs * 0.72) * 0.5,
+                    (x + pad_x) * s,
+                    (y + (h + fs * 0.72) * 0.5) * s,
                     key,
-                    fs,
+                    fs * s,
                     tc,
                 );
                 if focused {
-                    let caret_x = if value.is_empty() { x + pad_x } else { end_x + 1.0 };
+                    let caret_x = if value.is_empty() {
+                        (x + pad_x) * s
+                    } else {
+                        end_x_phys + 1.0 * s
+                    };
                     fb.fill_rect(
                         caret_x,
-                        y + (h - fs).max(4.0) * 0.5,
-                        1.5,
-                        fs.min(h - 4.0).max(8.0),
+                        (y + (h - fs).max(4.0) * 0.5) * s,
+                        1.5 * s,
+                        fs.min(h - 4.0).max(8.0) * s,
                         to_rgba(style.color).with_alpha(alpha),
                     );
                 }
@@ -853,14 +985,14 @@ fn paint_replaced(
                 || style.effective_border_bottom_width() > 0.0
                 || style.effective_border_left_width() > 0.0;
             if !has_author_chrome {
-                fb.fill_rounded_rect(x, y, w, h, [4.0; 4], RgbaColor::WHITE);
+                fb.fill_rounded_rect(x * s, y * s, w * s, h * s, [4.0 * s; 4], RgbaColor::WHITE);
                 fb.stroke_rounded_rect(
-                    x,
-                    y,
-                    w,
-                    h,
-                    [4.0; 4],
-                    [1.0; 4],
+                    x * s,
+                    y * s,
+                    w * s,
+                    h * s,
+                    [4.0 * s; 4],
+                    [1.0 * s; 4],
                     [RgbaColor::new(180, 188, 198, 255); 4],
                 );
             }
@@ -872,10 +1004,10 @@ fn paint_replaced(
                     fonts.draw_text(
                         fb,
                         line,
-                        x + pad_x,
-                        ly,
+                        (x + pad_x) * s,
+                        ly * s,
                         FontFaceKey::SansRegular,
-                        fs,
+                        fs * s,
                         to_rgba(style.color).with_alpha(alpha),
                     );
                 }
@@ -889,14 +1021,21 @@ fn paint_replaced(
                 || style.effective_border_bottom_width() > 0.0
                 || style.effective_border_left_width() > 0.0;
             if !has_author_chrome {
-                fb.fill_rounded_rect(x, y, w, h, [4.0; 4], RgbaColor::new(248, 250, 252, 255));
+                fb.fill_rounded_rect(
+                    x * s,
+                    y * s,
+                    w * s,
+                    h * s,
+                    [4.0 * s; 4],
+                    RgbaColor::new(248, 250, 252, 255),
+                );
                 fb.stroke_rounded_rect(
-                    x,
-                    y,
-                    w,
-                    h,
-                    [4.0; 4],
-                    [1.0; 4],
+                    x * s,
+                    y * s,
+                    w * s,
+                    h * s,
+                    [4.0 * s; 4],
+                    [1.0 * s; 4],
                     [RgbaColor::new(180, 188, 198, 255); 4],
                 );
             }
@@ -905,24 +1044,33 @@ fn paint_replaced(
             fonts.draw_text(
                 fb,
                 label,
-                x + pad_x,
-                y + (h + fs * 0.72) * 0.5,
+                (x + pad_x) * s,
+                (y + (h + fs * 0.72) * 0.5) * s,
                 FontFaceKey::SansRegular,
-                fs,
+                fs * s,
                 to_rgba(style.color).with_alpha(alpha),
             );
-            fonts.draw_text(
-                fb,
-                "v",
-                x + w - 14.0,
-                y + (h + 10.0) * 0.5,
-                FontFaceKey::SansRegular,
-                11.0,
+            let ax = (x + w - 12.0) * s;
+            let ay = (y + h * 0.44) * s;
+            fb.draw_line_aa(
+                ax - 3.5 * s,
+                ay,
+                ax,
+                ay + 3.5 * s,
+                1.4 * s,
+                RgbaColor::new(100, 116, 139, 255),
+            );
+            fb.draw_line_aa(
+                ax,
+                ay + 3.5 * s,
+                ax + 3.5 * s,
+                ay,
+                1.4 * s,
                 RgbaColor::new(100, 116, 139, 255),
             );
         }
         ReplacedKind::Hr => {
-            fb.fill_rect(x, y, w, h.max(1.0), RgbaColor::new(203, 213, 225, 255));
+            fb.fill_rect(x * s, y * s, w * s, h.max(1.0) * s, RgbaColor::new(203, 213, 225, 255));
         }
         ReplacedKind::Br => {}
     }

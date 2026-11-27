@@ -1,6 +1,9 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+pub type SharedOriginStorage = Arc<Mutex<HashMap<String, HashMap<String, String>>>>;
 
 use peedle_css::{
     compute_styles, parse_stylesheet, CalcContext, StyleMap, Stylesheet, Viewport,
@@ -113,6 +116,7 @@ pub struct DomState {
     pub viewport_h: f32,
     pub scroll_x: f32,
     pub scroll_y: f32,
+    pub device_pixel_ratio: f32,
     pub dark_mode: bool,
     pub dirty_style: bool,
     pub dirty_layout: bool,
@@ -129,6 +133,7 @@ pub struct DomState {
     pub custom_elements: HashMap<String, ObjectId>,
     pub local_storage: HashMap<String, String>,
     pub session_storage: HashMap<String, String>,
+    pub origin_storage: Option<SharedOriginStorage>,
     pub history_stack: Vec<(String, JsValue)>,
     pub history_index: usize,
     pub client: HttpClient,
@@ -136,6 +141,7 @@ pub struct DomState {
     pub protos: Option<DomPrototypes>,
     pub focused_node: Option<NodeId>,
     pub pending_navigation: Option<String>,
+    pub pending_new_tabs: Vec<String>,
     pub sub_documents: HashMap<NodeId, NodeId>,
     pub subdoc_urls: HashMap<NodeId, String>,
     pub pending_subdoc_loads: Vec<NodeId>,
@@ -167,6 +173,7 @@ impl DomState {
             viewport_h,
             scroll_x: 0.0,
             scroll_y: 0.0,
+            device_pixel_ratio: 1.0,
             dark_mode: false,
             dirty_style: true,
             dirty_layout: true,
@@ -183,6 +190,7 @@ impl DomState {
             custom_elements: HashMap::new(),
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
+            origin_storage: None,
             history_stack: vec![(url, JsValue::Null)],
             history_index: 0,
             client,
@@ -190,6 +198,7 @@ impl DomState {
             protos: None,
             focused_node: None,
             pending_navigation: None,
+            pending_new_tabs: Vec::new(),
             sub_documents: HashMap::new(),
             subdoc_urls: HashMap::new(),
             pending_subdoc_loads: Vec::new(),

@@ -189,7 +189,9 @@ impl FontSystem {
         if self.custom_names.iter().any(|(n, _)| n == &norm) {
             return true;
         }
-        if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+        let decoded = decode_woff1(bytes);
+        let font_bytes = decoded.as_deref().unwrap_or(bytes);
+        if let Ok(font) = Font::from_bytes(font_bytes, FontSettings::default()) {
             let key = FontFaceKey::Custom(self.custom_names.len());
             self.faces.insert(key, Arc::new(font));
             self.custom_names.push((norm, key));
@@ -342,4 +344,71 @@ impl FontSystem {
         }
         pen_x
     }
+}
+
+fn decode_woff1(bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if bytes.len() < 44 || &bytes[0..4] != b"wOFF" {
+        return None;
+    }
+    let flavor = &bytes[4..8];
+    let num_tables = u16::from_be_bytes([bytes[12], bytes[13]]) as usize;
+    if num_tables == 0 || 44 + num_tables * 20 > bytes.len() {
+        return None;
+    }
+    let mut entry_selector = 0u16;
+    let mut search_range = 16u16;
+    while (search_range as usize) * 2 <= num_tables * 16 {
+        search_range *= 2;
+        entry_selector += 1;
+    }
+    let range_shift = (num_tables as u16).saturating_mul(16).saturating_sub(search_range);
+
+    let mut tables: Vec<([u8; 4], u32, Vec<u8>)> = Vec::with_capacity(num_tables);
+    for i in 0..num_tables {
+        let base = 44 + i * 20;
+        let tag = [bytes[base], bytes[base + 1], bytes[base + 2], bytes[base + 3]];
+        let offset = u32::from_be_bytes([bytes[base + 4], bytes[base + 5], bytes[base + 6], bytes[base + 7]]) as usize;
+        let comp_len = u32::from_be_bytes([bytes[base + 8], bytes[base + 9], bytes[base + 10], bytes[base + 11]]) as usize;
+        let orig_len = u32::from_be_bytes([bytes[base + 12], bytes[base + 13], bytes[base + 14], bytes[base + 15]]) as usize;
+        let checksum = u32::from_be_bytes([bytes[base + 16], bytes[base + 17], bytes[base + 18], bytes[base + 19]]);
+        if offset.checked_add(comp_len)? > bytes.len() {
+            return None;
+        }
+        let slice = &bytes[offset..offset + comp_len];
+        let data = if comp_len < orig_len {
+            let mut dec = flate2::read::ZlibDecoder::new(slice);
+            let mut buf = Vec::with_capacity(orig_len);
+            dec.read_to_end(&mut buf).ok()?;
+            buf
+        } else {
+            slice.to_vec()
+        };
+        tables.push((tag, checksum, data));
+    }
+
+    let header_len = 12 + num_tables * 16;
+    let mut out = Vec::with_capacity(header_len + tables.iter().map(|t| t.2.len() + 4).sum::<usize>());
+    out.extend_from_slice(flavor);
+    out.extend_from_slice(&(num_tables as u16).to_be_bytes());
+    out.extend_from_slice(&search_range.to_be_bytes());
+    out.extend_from_slice(&entry_selector.to_be_bytes());
+    out.extend_from_slice(&range_shift.to_be_bytes());
+
+    let mut cur_offset = header_len;
+    for (tag, checksum, data) in &tables {
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&checksum.to_be_bytes());
+        out.extend_from_slice(&(cur_offset as u32).to_be_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let padded = (data.len() + 3) & !3;
+        cur_offset += padded;
+    }
+    for (_, _, data) in &tables {
+        out.extend_from_slice(data);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+    Some(out)
 }

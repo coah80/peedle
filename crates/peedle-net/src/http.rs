@@ -166,9 +166,17 @@ impl Write for Transport {
 type PoolKey = (String, String, u16);
 
 #[derive(Clone)]
+struct CachedEntry {
+    response: HttpResponse,
+    stored_at: std::time::Instant,
+    max_age_secs: u64,
+}
+
+#[derive(Clone)]
 pub struct HttpClient {
     tls_config: Arc<ClientConfig>,
     pool: Arc<Mutex<HashMap<PoolKey, Vec<BufReader<Transport>>>>>,
+    cache: Arc<Mutex<HashMap<String, CachedEntry>>>,
     pub cookies: Arc<Mutex<CookieJar>>,
     pub user_agent: String,
     pub timeout: Duration,
@@ -180,8 +188,27 @@ impl Default for HttpClient {
     }
 }
 
+pub fn default_user_agent() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    }
+}
+
 impl HttpClient {
     pub fn new() -> Self {
+        Self::with_shared_cookies(Arc::new(Mutex::new(CookieJar::new())))
+    }
+
+    pub fn with_shared_cookies(cookies: Arc<Mutex<CookieJar>>) -> Self {
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let config = ClientConfig::builder()
@@ -190,10 +217,73 @@ impl HttpClient {
         Self {
             tls_config: Arc::new(config),
             pool: Arc::new(Mutex::new(HashMap::new())),
-            cookies: Arc::new(Mutex::new(CookieJar::new())),
-            user_agent: "Mozilla/5.0 (X11; Linux x86_64) Peedle/0.1".to_string(),
-            timeout: Duration::from_secs(20),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            cookies,
+            user_agent: default_user_agent().to_string(),
+            timeout: Duration::from_secs(18),
         }
+    }
+
+    pub fn clear_cache(&self) {
+        self.cache.lock().unwrap().clear();
+    }
+
+    pub fn get_cached(&self, url_str: &str) -> Result<HttpResponse, HttpError> {
+        if let Some(hit) = self.lookup_cache(url_str) {
+            return Ok(hit);
+        }
+        let resp = self.get(url_str)?;
+        self.store_cache(url_str, &resp);
+        Ok(resp)
+    }
+
+    fn lookup_cache(&self, url_str: &str) -> Option<HttpResponse> {
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(entry) = cache.get(url_str) {
+            if entry.stored_at.elapsed().as_secs() < entry.max_age_secs {
+                return Some(entry.response.clone());
+            }
+            cache.remove(url_str);
+        }
+        None
+    }
+
+    fn store_cache(&self, url_str: &str, resp: &HttpResponse) {
+        if resp.status != 200 || resp.body.len() > 8 * 1024 * 1024 {
+            return;
+        }
+        let cc = resp
+            .header("cache-control")
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if cc.contains("no-store") || cc.contains("private") {
+            return;
+        }
+        let mut max_age = 300u64;
+        if let Some(idx) = cc.find("max-age=") {
+            let rest = &cc[idx + 8..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = digits.parse::<u64>() {
+                if v == 0 {
+                    return;
+                }
+                max_age = v.min(3600);
+            }
+        } else if cc.contains("no-cache") {
+            return;
+        }
+        let mut cache = self.cache.lock().unwrap();
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(
+            url_str.to_string(),
+            CachedEntry {
+                response: resp.clone(),
+                stored_at: std::time::Instant::now(),
+                max_age_secs: max_age,
+            },
+        );
     }
 
     pub fn get(&self, url_str: &str) -> Result<HttpResponse, HttpError> {
@@ -248,6 +338,7 @@ impl HttpClient {
     fn open_transport(&self, scheme: &str, host: &str, port: u16) -> Result<BufReader<Transport>, HttpError> {
         let addr = format!("{}:{}", host, port);
         let tcp = TcpStream::connect(&addr)?;
+        let _ = tcp.set_nodelay(true);
         tcp.set_read_timeout(Some(self.timeout))?;
         tcp.set_write_timeout(Some(self.timeout))?;
         let transport = if scheme == "https" {
@@ -269,7 +360,7 @@ impl HttpClient {
     fn return_pooled(&self, key: PoolKey, reader: BufReader<Transport>) {
         let mut map = self.pool.lock().unwrap();
         let entry = map.entry(key).or_default();
-        if entry.len() < 4 {
+        if entry.len() < 6 {
             entry.push(reader);
         }
     }
@@ -302,7 +393,13 @@ impl HttpClient {
         }
         let has_accept = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept"));
         if !has_accept {
-            wire.push_str("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n");
+            wire.push_str("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n");
+        }
+        if !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept-language")) {
+            wire.push_str("Accept-Language: en-US,en;q=0.9\r\n");
+        }
+        if !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("sec-fetch-site")) {
+            wire.push_str("Sec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: document\r\nUpgrade-Insecure-Requests: 1\r\n");
         }
 
         let cookie_header = self

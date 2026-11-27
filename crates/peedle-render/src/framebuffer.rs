@@ -158,6 +158,145 @@ impl Framebuffer {
         }
     }
 
+    pub fn resize_or_clear(&mut self, width: u32, height: u32, color: RgbaColor) {
+        let needed = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        if self.width != width || self.height != height || self.data.len() != needed {
+            self.width = width;
+            self.height = height;
+            self.data.resize(needed, 0);
+        }
+        self.clip_stack.clear();
+        self.clip_stack.push(ClipRect {
+            x: 0,
+            y: 0,
+            w: width as i32,
+            h: height as i32,
+        });
+        self.clear(color);
+    }
+
+    pub fn draw_line_aa(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: RgbaColor) {
+        if color.a == 0 || thickness <= 0.0 {
+            return;
+        }
+        let half = thickness * 0.5;
+        let pad = half + 1.5;
+        let clip = self.current_clip();
+        let min_x = (x0.min(x1) - pad).floor() as i32;
+        let max_x = (x0.max(x1) + pad).ceil() as i32;
+        let min_y = (y0.min(y1) - pad).floor() as i32;
+        let max_y = (y0.max(y1) + pad).ceil() as i32;
+        let ix0 = min_x.max(clip.x);
+        let iy0 = min_y.max(clip.y);
+        let ix1 = max_x.min(clip.x + clip.w);
+        let iy1 = max_y.min(clip.y + clip.h);
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let len_sq = dx * dx + dy * dy;
+        for py in iy0..iy1 {
+            let cy = py as f32 + 0.5;
+            for px in ix0..ix1 {
+                let cx = px as f32 + 0.5;
+                let dist = if len_sq < 1e-6 {
+                    (cx - x0).hypot(cy - y0)
+                } else {
+                    let t = (((cx - x0) * dx + (cy - y0) * dy) / len_sq).clamp(0.0, 1.0);
+                    let nx = x0 + t * dx;
+                    let ny = y0 + t * dy;
+                    (cx - nx).hypot(cy - ny)
+                };
+                let cov = (half + 0.5 - dist).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    self.blend_pixel(px, py, color.with_alpha(cov));
+                }
+            }
+        }
+    }
+
+    pub fn draw_circle_fill(&mut self, cx: f32, cy: f32, r: f32, color: RgbaColor) {
+        if color.a == 0 || r <= 0.0 {
+            return;
+        }
+        let clip = self.current_clip();
+        let x0 = ((cx - r - 1.5).floor() as i32).max(clip.x);
+        let y0 = ((cy - r - 1.5).floor() as i32).max(clip.y);
+        let x1 = ((cx + r + 1.5).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((cy + r + 1.5).ceil() as i32).min(clip.y + clip.h);
+        for py in y0..y1 {
+            let dy = py as f32 + 0.5 - cy;
+            for px in x0..x1 {
+                let dx = px as f32 + 0.5 - cx;
+                let cov = (r + 0.5 - dx.hypot(dy)).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    self.blend_pixel(px, py, color.with_alpha(cov));
+                }
+            }
+        }
+    }
+
+    pub fn draw_circle_stroke(&mut self, cx: f32, cy: f32, r: f32, thickness: f32, color: RgbaColor) {
+        if color.a == 0 || r <= 0.0 || thickness <= 0.0 {
+            return;
+        }
+        let half = thickness * 0.5;
+        let outer = r + half + 1.5;
+        let clip = self.current_clip();
+        let x0 = ((cx - outer).floor() as i32).max(clip.x);
+        let y0 = ((cy - outer).floor() as i32).max(clip.y);
+        let x1 = ((cx + outer).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((cy + outer).ceil() as i32).min(clip.y + clip.h);
+        for py in y0..y1 {
+            let dy = py as f32 + 0.5 - cy;
+            for px in x0..x1 {
+                let dx = px as f32 + 0.5 - cx;
+                let d = (dx.hypot(dy) - r).abs();
+                let cov = (half + 0.5 - d).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    self.blend_pixel(px, py, color.with_alpha(cov));
+                }
+            }
+        }
+    }
+
+    pub fn draw_arc_stroke(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        r: f32,
+        start_rad: f32,
+        sweep_rad: f32,
+        thickness: f32,
+        color: RgbaColor,
+    ) {
+        if color.a == 0 || r <= 0.0 || thickness <= 0.0 || sweep_rad.abs() < 1e-4 {
+            return;
+        }
+        let steps = ((r * sweep_rad.abs()).ceil() as usize).clamp(8, 64);
+        let mut prev_x = cx + r * start_rad.cos();
+        let mut prev_y = cy + r * start_rad.sin();
+        for i in 1..=steps {
+            let a = start_rad + sweep_rad * (i as f32 / steps as f32);
+            let nx = cx + r * a.cos();
+            let ny = cy + r * a.sin();
+            self.draw_line_aa(prev_x, prev_y, nx, ny, thickness, color);
+            prev_x = nx;
+            prev_y = ny;
+        }
+    }
+
+    pub fn draw_triangle_fill(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        color: RgbaColor,
+    ) {
+        self.fill_polygon(&[vec![(x0, y0), (x1, y1), (x2, y2)]], color, false);
+    }
+
     pub fn current_clip(&self) -> ClipRect {
         *self.clip_stack.last().unwrap()
     }

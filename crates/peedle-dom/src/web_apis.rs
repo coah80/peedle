@@ -37,7 +37,38 @@ pub fn define_web_apis(rt: &mut JsRuntime, dom: SharedDom) {
     define_getter_setter(rt, global, "innerHeight", Some(get_ih), None);
     define_getter_setter(rt, global, "outerWidth", Some(get_iw), None);
     define_getter_setter(rt, global, "outerHeight", Some(get_ih), None);
-    let _ = rt.set_property(global, "devicePixelRatio", JsValue::Number(1.0));
+    let d = dom.clone();
+    let get_dpr = rt.create_native_function(
+        "get devicePixelRatio",
+        0,
+        Rc::new(move |_, _, _| Ok(JsValue::Number(d.borrow().device_pixel_ratio as f64))),
+    );
+    define_getter_setter(rt, global, "devicePixelRatio", Some(get_dpr), None);
+    let d = dom.clone();
+    let win_open = rt.create_native_function(
+        "open",
+        1,
+        Rc::new(move |rt, _, args| {
+            if let Some(arg) = args.first() {
+                if !arg.is_nullish() {
+                    if let Ok(raw) = rt.to_string(arg) {
+                        let trimmed = raw.trim();
+                        if !trimmed.is_empty() {
+                            let mut st = d.borrow_mut();
+                            let dest = Url::parse(&st.url)
+                                .ok()
+                                .and_then(|b| b.join(trimmed).ok())
+                                .map(|u| u.href())
+                                .unwrap_or_else(|| trimmed.to_string());
+                            st.pending_new_tabs.push(dest);
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::Object(global))
+        }),
+    );
+    let _ = rt.set_property(global, "open", JsValue::Object(win_open));
 
     define_timers_and_channels(rt, dom.clone(), global);
     define_location_and_history(rt, dom.clone(), global);
@@ -380,16 +411,20 @@ fn define_location_and_history(rt: &mut JsRuntime, dom: SharedDom, global: Objec
 
 fn define_navigator_screen_perf(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {
     let nav = rt.create_object();
-    let _ = rt.set_property(
-        nav,
-        "userAgent",
-        JsValue::String("Mozilla/5.0 (X11; Linux x86_64) Peedle/0.1".into()),
-    );
+    let ua = dom.borrow().client.user_agent.clone();
+    let platform = if cfg!(target_os = "windows") {
+        "Win32"
+    } else if cfg!(target_os = "macos") {
+        "MacIntel"
+    } else {
+        "Linux x86_64"
+    };
+    let _ = rt.set_property(nav, "userAgent", JsValue::String(ua));
     let _ = rt.set_property(nav, "language", JsValue::String("en-US".into()));
     let langs = rt.create_array(vec![JsValue::String("en-US".into()), JsValue::String("en".into())]);
     let _ = rt.set_property(nav, "languages", JsValue::Object(langs));
-    let _ = rt.set_property(nav, "platform", JsValue::String("Linux x86_64".into()));
-    let _ = rt.set_property(nav, "vendor", JsValue::String("Peedle".into()));
+    let _ = rt.set_property(nav, "platform", JsValue::String(platform.into()));
+    let _ = rt.set_property(nav, "vendor", JsValue::String("Google Inc.".into()));
     let _ = rt.set_property(nav, "cookieEnabled", JsValue::Boolean(true));
     let _ = rt.set_property(nav, "onLine", JsValue::Boolean(true));
     let _ = rt.set_property(nav, "hardwareConcurrency", JsValue::Number(8.0));
@@ -446,8 +481,20 @@ fn define_storage(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {
                 let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
                 let v = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
                 let mut st = d.borrow_mut();
-                let map = if is_local { &mut st.local_storage } else { &mut st.session_storage };
-                map.insert(k, v);
+                if is_local {
+                    st.local_storage.insert(k.clone(), v.clone());
+                    let origin = origin_key(&st.url);
+                    if let Some(ref shared) = st.origin_storage {
+                        shared
+                            .lock()
+                            .unwrap()
+                            .entry(origin)
+                            .or_default()
+                            .insert(k, v);
+                    }
+                } else {
+                    st.session_storage.insert(k, v);
+                }
                 Ok(JsValue::Undefined)
             }),
         );
@@ -458,8 +505,17 @@ fn define_storage(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {
             Rc::new(move |rt, _, args| {
                 let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
                 let mut st = d.borrow_mut();
-                let map = if is_local { &mut st.local_storage } else { &mut st.session_storage };
-                map.remove(&k);
+                if is_local {
+                    st.local_storage.remove(&k);
+                    let origin = origin_key(&st.url);
+                    if let Some(ref shared) = st.origin_storage {
+                        if let Some(m) = shared.lock().unwrap().get_mut(&origin) {
+                            m.remove(&k);
+                        }
+                    }
+                } else {
+                    st.session_storage.remove(&k);
+                }
                 Ok(JsValue::Undefined)
             }),
         );
@@ -471,6 +527,10 @@ fn define_storage(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {
                 let mut st = d.borrow_mut();
                 if is_local {
                     st.local_storage.clear();
+                    let origin = origin_key(&st.url);
+                    if let Some(ref shared) = st.origin_storage {
+                        shared.lock().unwrap().remove(&origin);
+                    }
                 } else {
                     st.session_storage.clear();
                 }
@@ -498,6 +558,12 @@ fn define_storage(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {
         define_getter_setter(rt, obj, "length", Some(get_len), None);
         let _ = rt.set_property(global, name, JsValue::Object(obj));
     }
+}
+
+fn origin_key(url: &str) -> String {
+    Url::parse(url)
+        .map(|u| u.origin())
+        .unwrap_or_else(|_| "null".to_string())
 }
 
 fn define_url_apis(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {

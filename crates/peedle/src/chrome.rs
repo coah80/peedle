@@ -1,17 +1,15 @@
 use peedle_css::get_computed_property;
 use peedle_engine::Page;
-use peedle_render::{FontFaceKey, FontSystem, Framebuffer, RgbaColor};
+use peedle_html::NodeId;
+use peedle_render::{ClipRect, FontFaceKey, FontSystem, Framebuffer, RgbaColor};
 
-pub const TAB_BAR_H: f32 = 34.0;
-pub const TOOLBAR_H: f32 = 42.0;
-pub const BOOKMARK_BAR_H: f32 = 28.0;
-pub const DEVTOOLS_H: f32 = 220.0;
+use crate::profile::SavedBookmark;
+use crate::text_edit::TextEdit;
 
-#[derive(Clone, Debug)]
-pub struct Bookmark {
-    pub title: String,
-    pub url: String,
-}
+pub const TAB_BAR_H: f32 = 38.0;
+pub const TOOLBAR_H: f32 = 44.0;
+pub const BOOKMARK_BAR_H: f32 = 30.0;
+pub const DEVTOOLS_H: f32 = 230.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DevToolsTab {
@@ -20,18 +18,101 @@ pub enum DevToolsTab {
     Network,
 }
 
+#[derive(Clone, Debug)]
+pub struct OmniboxSuggestion {
+    pub title: String,
+    pub url: String,
+    pub kind: SuggestionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionKind {
+    Bookmark,
+    History,
+    Search,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContextMenuItem {
+    pub label: String,
+    pub action: MenuAction,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuAction {
+    Back,
+    Forward,
+    Reload,
+    NewTab,
+    ReopenClosedTab,
+    DuplicateTab(usize),
+    ReloadTab(usize),
+    CloseTab(usize),
+    CloseOtherTabs(usize),
+    OpenLinkNewTab(String),
+    CopyText(String),
+    SearchText(String),
+    SavePage,
+    ViewSource,
+    Inspect,
+    OpenUrl(String),
+    ToggleBookmarksBar,
+    OpenFind,
+    ToggleDevTools,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    ToggleTheme,
+    RemoveBookmark(usize),
+}
+
+#[derive(Clone, Debug)]
+pub struct PopupMenu {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub items: Vec<ContextMenuItem>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SelectPopup {
+    pub node_id: NodeId,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub options: Vec<String>,
+    pub selected: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct DownloadToast {
+    pub filename: String,
+    pub path: String,
+    pub bytes: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChromeHit {
     Tab(usize),
     CloseTab(usize),
     NewTab,
+    TabBarEmpty,
     Back,
     Forward,
     Reload,
     Omnibox,
     ToggleBookmark,
-    BookmarkItem(usize),
+    DownloadsBtn,
     ToggleDevTools,
+    MenuBtn,
+    BookmarkItem(usize),
+    SuggestionItem(usize),
+    PopupMenuItem(usize),
+    SelectOptionItem(usize),
+    ToastReveal,
+    ToastDownloads,
+    ToastClose,
     DevToolsTab(DevToolsTab),
     ConsoleInput,
     FindInput,
@@ -40,69 +121,131 @@ pub enum ChromeHit {
     None,
 }
 
+pub struct TabVisual<'a> {
+    pub page: &'a Page,
+    pub loading: bool,
+    pub load_progress: f32,
+}
+
 pub struct ChromeState {
-    pub omnibox_text: String,
+    pub dark_mode: bool,
+    pub omnibox: TextEdit,
     pub omnibox_focused: bool,
-    pub omnibox_selected: bool,
+    pub suggestions: Vec<OmniboxSuggestion>,
+    pub suggestion_index: Option<usize>,
     pub devtools_open: bool,
     pub devtools_tab: DevToolsTab,
-    pub console_input: String,
+    pub console: TextEdit,
     pub console_focused: bool,
     pub bookmarks_visible: bool,
-    pub bookmarks: Vec<Bookmark>,
+    pub bookmarks: Vec<SavedBookmark>,
     pub find_open: bool,
-    pub find_query: String,
+    pub find: TextEdit,
     pub find_match_count: usize,
     pub find_match_index: usize,
     pub zoom: f32,
+    pub hovered_hit: ChromeHit,
+    pub popup_menu: Option<PopupMenu>,
+    pub select_popup: Option<SelectPopup>,
+    pub download_toast: Option<DownloadToast>,
+    pub has_downloads: bool,
+    pub anim_phase: f32,
 }
 
 impl Default for ChromeState {
     fn default() -> Self {
         Self {
-            omnibox_text: "peedle://newtab".to_string(),
+            dark_mode: true,
+            omnibox: TextEdit::new("peedle://newtab"),
             omnibox_focused: false,
-            omnibox_selected: false,
+            suggestions: Vec::new(),
+            suggestion_index: None,
             devtools_open: false,
             devtools_tab: DevToolsTab::Elements,
-            console_input: String::new(),
+            console: TextEdit::default(),
             console_focused: false,
             bookmarks_visible: true,
-            bookmarks: vec![
-                Bookmark {
-                    title: "Example".to_string(),
-                    url: "https://example.com".to_string(),
-                },
-                Bookmark {
-                    title: "Hacker News".to_string(),
-                    url: "https://news.ycombinator.com".to_string(),
-                },
-                Bookmark {
-                    title: "Wikipedia".to_string(),
-                    url: "https://en.wikipedia.org/wiki/Rust_(programming_language)".to_string(),
-                },
-                Bookmark {
-                    title: "GitHub".to_string(),
-                    url: "https://github.com/coah80/peedle".to_string(),
-                },
-                Bookmark {
-                    title: "Demo".to_string(),
-                    url: "peedle://demo".to_string(),
-                },
-                Bookmark {
-                    title: "History".to_string(),
-                    url: "peedle://history".to_string(),
-                },
-                Bookmark {
-                    title: "About Peedle".to_string(),
-                    url: "peedle://about".to_string(),
-                },
-            ],
+            bookmarks: Vec::new(),
             find_open: false,
-            find_query: String::new(),
+            find: TextEdit::default(),
             find_match_count: 0,
             find_match_index: 0,
             zoom: 1.0,
+            hovered_hit: ChromeHit::None,
+            popup_menu: None,
+            select_popup: None,
+            download_toast: None,
+            has_downloads: false,
+            anim_phase: 0.0,
+        }
+    }
+}
+
+struct Palette {
+    tab_strip: RgbaColor,
+    toolbar: RgbaColor,
+    tab_active: RgbaColor,
+    tab_hover: RgbaColor,
+    omni_bg: RgbaColor,
+    omni_hover: RgbaColor,
+    border: RgbaColor,
+    accent: RgbaColor,
+    accent_sel: RgbaColor,
+    gold: RgbaColor,
+    green: RgbaColor,
+    text_hi: RgbaColor,
+    text_dim: RgbaColor,
+    text_muted: RgbaColor,
+    btn_hover: RgbaColor,
+    popup_bg: RgbaColor,
+    popup_hover: RgbaColor,
+    bookmark_bar: RgbaColor,
+}
+
+impl Palette {
+    fn for_dark(dark: bool) -> Self {
+        if dark {
+            Self {
+                tab_strip: RgbaColor::new(17, 20, 27, 255),
+                toolbar: RgbaColor::new(30, 34, 44, 255),
+                tab_active: RgbaColor::new(30, 34, 44, 255),
+                tab_hover: RgbaColor::new(26, 31, 41, 255),
+                omni_bg: RgbaColor::new(20, 23, 31, 255),
+                omni_hover: RgbaColor::new(25, 29, 38, 255),
+                border: RgbaColor::new(48, 55, 70, 255),
+                accent: RgbaColor::new(56, 189, 248, 255),
+                accent_sel: RgbaColor::new(37, 99, 235, 165),
+                gold: RgbaColor::new(250, 204, 21, 255),
+                green: RgbaColor::new(74, 222, 128, 255),
+                text_hi: RgbaColor::new(236, 241, 248, 255),
+                text_dim: RgbaColor::new(156, 168, 186, 255),
+                text_muted: RgbaColor::new(98, 110, 128, 255),
+                btn_hover: RgbaColor::new(45, 52, 66, 255),
+                popup_bg: RgbaColor::new(24, 28, 37, 252),
+                popup_hover: RgbaColor::new(42, 50, 66, 255),
+                bookmark_bar: RgbaColor::new(25, 29, 38, 255),
+            }
+        } else {
+            Self {
+                tab_strip: RgbaColor::new(222, 226, 232, 255),
+                toolbar: RgbaColor::new(248, 250, 252, 255),
+                tab_active: RgbaColor::new(248, 250, 252, 255),
+                tab_hover: RgbaColor::new(234, 238, 244, 255),
+                omni_bg: RgbaColor::new(236, 240, 245, 255),
+                omni_hover: RgbaColor::new(228, 234, 241, 255),
+                border: RgbaColor::new(203, 213, 225, 255),
+                accent: RgbaColor::new(2, 132, 199, 255),
+                accent_sel: RgbaColor::new(59, 130, 246, 120),
+                gold: RgbaColor::new(217, 119, 6, 255),
+                green: RgbaColor::new(22, 163, 74, 255),
+                text_hi: RgbaColor::new(15, 23, 42, 255),
+                text_dim: RgbaColor::new(71, 85, 105, 255),
+                text_muted: RgbaColor::new(148, 163, 184, 255),
+                btn_hover: RgbaColor::new(226, 232, 240, 255),
+                popup_bg: RgbaColor::new(255, 255, 255, 252),
+                popup_hover: RgbaColor::new(241, 245, 249, 255),
+                bookmark_bar: RgbaColor::new(241, 245, 249, 255),
+            }
         }
     }
 }
@@ -116,6 +259,13 @@ pub fn content_viewport_height(window_h: f32, chrome: &ChromeState) -> f32 {
     (window_h - top_chrome_height(chrome) - dt).max(100.0)
 }
 
+pub fn omnibox_rect(win_w: f32) -> (f32, f32, f32, f32) {
+    let right_controls = 112.0;
+    let omni_x = 114.0;
+    let omni_w = (win_w - right_controls - omni_x).max(140.0);
+    (omni_x, TAB_BAR_H + 6.0, omni_w, 32.0)
+}
+
 pub fn hit_test_chrome(
     x: f32,
     y: f32,
@@ -124,45 +274,116 @@ pub fn hit_test_chrome(
     tab_count: usize,
     chrome: &ChromeState,
 ) -> ChromeHit {
+    if let Some(ref menu) = chrome.popup_menu {
+        let item_h = 30.0;
+        let mh = menu.items.len() as f32 * item_h + 10.0;
+        if x >= menu.x && x <= menu.x + menu.w && y >= menu.y && y <= menu.y + mh {
+            let rel = y - menu.y - 5.0;
+            if rel >= 0.0 {
+                let idx = (rel / item_h) as usize;
+                if idx < menu.items.len() {
+                    return ChromeHit::PopupMenuItem(idx);
+                }
+            }
+            return ChromeHit::None;
+        }
+    }
+
+    if let Some(ref sel) = chrome.select_popup {
+        let item_h = 28.0;
+        let vis = sel.options.len().min(10);
+        let sh = vis as f32 * item_h + 8.0;
+        if x >= sel.x && x <= sel.x + sel.w && y >= sel.y && y <= sel.y + sh {
+            let rel = y - sel.y - 4.0;
+            if rel >= 0.0 {
+                let idx = (rel / item_h) as usize;
+                if idx < vis {
+                    return ChromeHit::SelectOptionItem(idx);
+                }
+            }
+            return ChromeHit::None;
+        }
+    }
+
+    if chrome.omnibox_focused && !chrome.suggestions.is_empty() {
+        let (ox, oy, ow, oh) = omnibox_rect(win_w);
+        let sy = oy + oh + 4.0;
+        let row_h = 36.0;
+        let sh = chrome.suggestions.len() as f32 * row_h + 10.0;
+        if x >= ox && x <= ox + ow && y >= sy && y <= sy + sh {
+            let rel = y - sy - 5.0;
+            if rel >= 0.0 {
+                let idx = (rel / row_h) as usize;
+                if idx < chrome.suggestions.len() {
+                    return ChromeHit::SuggestionItem(idx);
+                }
+            }
+            return ChromeHit::None;
+        }
+    }
+
+    if let Some(ref _toast) = chrome.download_toast {
+        let dt_off = if chrome.devtools_open { DEVTOOLS_H } else { 0.0 };
+        let ty = win_h - dt_off - 42.0;
+        if y >= ty && y <= ty + 36.0 && x >= 12.0 && x <= 440.0 {
+            if x >= 412.0 {
+                return ChromeHit::ToastClose;
+            }
+            if x >= 332.0 {
+                return ChromeHit::ToastDownloads;
+            }
+            return ChromeHit::ToastReveal;
+        }
+    }
+
     if y < TAB_BAR_H {
-        let tab_w = ((win_w - 60.0) / tab_count.max(1) as f32).clamp(90.0, 200.0);
-        let start_x = 10.0;
+        let tab_w = ((win_w - 64.0) / tab_count.max(1) as f32).clamp(110.0, 224.0);
+        let start_x = 8.0;
         for i in 0..tab_count {
-            let tx = start_x + i as f32 * (tab_w + 4.0);
+            let tx = start_x + i as f32 * (tab_w + 3.0);
             if x >= tx && x < tx + tab_w {
-                if x >= tx + tab_w - 22.0 {
+                if x >= tx + tab_w - 24.0 {
                     return ChromeHit::CloseTab(i);
                 }
                 return ChromeHit::Tab(i);
             }
         }
-        let plus_x = start_x + tab_count as f32 * (tab_w + 4.0) + 2.0;
+        let plus_x = start_x + tab_count as f32 * (tab_w + 3.0) + 4.0;
         if x >= plus_x && x < plus_x + 28.0 {
             return ChromeHit::NewTab;
         }
-        return ChromeHit::None;
+        return ChromeHit::TabBarEmpty;
     }
 
     let toolbar_end = TAB_BAR_H + TOOLBAR_H;
     if y < toolbar_end {
-        if x >= 8.0 && x < 36.0 {
+        if x >= 8.0 && x < 38.0 {
             return ChromeHit::Back;
         }
-        if x >= 40.0 && x < 68.0 {
+        if x >= 42.0 && x < 72.0 {
             return ChromeHit::Forward;
         }
-        if x >= 72.0 && x < 100.0 {
+        if x >= 76.0 && x < 106.0 {
             return ChromeHit::Reload;
         }
-        let dt_x = win_w - 46.0;
-        if x >= dt_x && x < win_w - 8.0 {
+        let menu_x = win_w - 38.0;
+        let dt_x = menu_x - 34.0;
+        let dl_x = dt_x - 34.0;
+        if x >= menu_x && x < win_w - 6.0 {
+            return ChromeHit::MenuBtn;
+        }
+        if x >= dt_x && x < menu_x - 2.0 {
             return ChromeHit::ToggleDevTools;
         }
-        let star_x = dt_x - 38.0;
-        if x >= star_x && x < dt_x - 8.0 {
+        if x >= dl_x && x < dt_x - 2.0 {
+            return ChromeHit::DownloadsBtn;
+        }
+        let (ox, _, ow, _) = omnibox_rect(win_w);
+        let star_x = ox + ow - 32.0;
+        if x >= star_x && x < ox + ow {
             return ChromeHit::ToggleBookmark;
         }
-        if x >= 108.0 && x < star_x {
+        if x >= ox && x < star_x {
             return ChromeHit::Omnibox;
         }
         return ChromeHit::None;
@@ -170,22 +391,23 @@ pub fn hit_test_chrome(
 
     let top_h = top_chrome_height(chrome);
     if chrome.bookmarks_visible && y < top_h {
-        let mut bx = 12.0;
+        let mut bx = 10.0;
         for (i, bm) in chrome.bookmarks.iter().enumerate() {
-            let bw = (bm.title.chars().count() as f32 * 7.2 + 20.0).clamp(52.0, 150.0);
+            let label = truncate_chars(&bm.title, 20);
+            let bw = (label.chars().count() as f32 * 6.8 + 22.0).clamp(52.0, 160.0);
             if x >= bx && x < bx + bw {
                 return ChromeHit::BookmarkItem(i);
             }
-            bx += bw + 6.0;
+            bx += bw + 4.0;
         }
         return ChromeHit::None;
     }
 
     if chrome.find_open {
-        let fw = 280.0;
-        let fx = win_w - fw - 16.0;
+        let fw = 300.0;
+        let fx = win_w - fw - 18.0;
         let fy = top_h + 8.0;
-        if x >= fx && x <= fx + fw && y >= fy && y <= fy + 32.0 {
+        if x >= fx && x <= fx + fw && y >= fy && y <= fy + 34.0 {
             return ChromeHit::FindInput;
         }
     }
@@ -193,7 +415,7 @@ pub fn hit_test_chrome(
     if chrome.devtools_open {
         let dt_top = win_h - DEVTOOLS_H;
         if y >= dt_top {
-            if y < dt_top + 28.0 {
+            if y < dt_top + 30.0 {
                 if x < 100.0 {
                     return ChromeHit::DevToolsTab(DevToolsTab::Elements);
                 }
@@ -204,7 +426,7 @@ pub fn hit_test_chrome(
                     return ChromeHit::DevToolsTab(DevToolsTab::Network);
                 }
             }
-            if y >= win_h - 32.0 {
+            if y >= win_h - 34.0 {
                 return ChromeHit::ConsoleInput;
             }
             return ChromeHit::None;
@@ -264,6 +486,43 @@ impl<'a> ScaledDraw<'a> {
         );
     }
 
+    fn shadow(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32) {
+        let s = self.s;
+        self.fb.draw_box_shadow(
+            x * s,
+            y * s,
+            w * s,
+            h * s,
+            [r * s; 4],
+            0.0,
+            6.0 * s,
+            16.0 * s,
+            0.0,
+            RgbaColor::new(0, 0, 0, 110),
+            false,
+        );
+    }
+
+    fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, t: f32, color: RgbaColor) {
+        let s = self.s;
+        self.fb.draw_line_aa(x0 * s, y0 * s, x1 * s, y1 * s, t * s, color);
+    }
+
+    fn circle_fill(&mut self, cx: f32, cy: f32, r: f32, color: RgbaColor) {
+        let s = self.s;
+        self.fb.draw_circle_fill(cx * s, cy * s, r * s, color);
+    }
+
+    fn circle_stroke(&mut self, cx: f32, cy: f32, r: f32, t: f32, color: RgbaColor) {
+        let s = self.s;
+        self.fb.draw_circle_stroke(cx * s, cy * s, r * s, t * s, color);
+    }
+
+    fn arc(&mut self, cx: f32, cy: f32, r: f32, start: f32, sweep: f32, t: f32, color: RgbaColor) {
+        let s = self.s;
+        self.fb.draw_arc_stroke(cx * s, cy * s, r * s, start, sweep, t * s, color);
+    }
+
     fn text(
         &mut self,
         text: &str,
@@ -279,15 +538,25 @@ impl<'a> ScaledDraw<'a> {
             / s
     }
 
-    fn measure(&self, text: &str, face: FontFaceKey, px: f32) -> f32 {
-        self.fonts.measure_text(text, face, px * self.s) / self.s
+    fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        let s = self.s;
+        self.fb.push_clip(ClipRect {
+            x: (x * s).floor() as i32,
+            y: (y * s).floor() as i32,
+            w: (w * s).ceil() as i32,
+            h: (h * s).ceil() as i32,
+        });
+    }
+
+    fn pop_clip(&mut self) {
+        self.fb.pop_clip();
     }
 }
 
 pub fn draw_chrome(
     fb: &mut Framebuffer,
     fonts: &FontSystem,
-    tabs: &[Page],
+    tabs: &[TabVisual<'_>],
     active_tab: usize,
     chrome: &ChromeState,
     scale: f32,
@@ -295,188 +564,267 @@ pub fn draw_chrome(
     let s = scale.max(1.0);
     let w = fb.width as f32 / s;
     let h = fb.height as f32 / s;
+    let pal = Palette::for_dark(chrome.dark_mode);
     let mut d = ScaledDraw { fb, fonts, s };
 
-    let bg_tabs = RgbaColor::new(15, 19, 26, 255);
-    let bg_bar = RgbaColor::new(23, 28, 38, 255);
-    let bg_tab_active = RgbaColor::new(28, 35, 48, 255);
-    let bg_tab_inactive = RgbaColor::new(19, 24, 33, 255);
-    let border_c = RgbaColor::new(40, 50, 68, 255);
-    let accent = RgbaColor::new(56, 189, 248, 255);
-    let gold = RgbaColor::new(250, 204, 21, 255);
-    let text_hi = RgbaColor::new(235, 241, 248, 255);
-    let text_dim = RgbaColor::new(148, 163, 184, 255);
+    d.rect(0.0, 0.0, w, TAB_BAR_H, pal.tab_strip);
 
-    d.rect(0.0, 0.0, w, TAB_BAR_H, bg_tabs);
-
-    let tab_w = ((w - 60.0) / tabs.len().max(1) as f32).clamp(90.0, 200.0);
-    let start_x = 10.0;
-    for (i, page) in tabs.iter().enumerate() {
-        let tx = start_x + i as f32 * (tab_w + 4.0);
+    let tab_w = ((w - 64.0) / tabs.len().max(1) as f32).clamp(110.0, 224.0);
+    let start_x = 8.0;
+    for (i, tab) in tabs.iter().enumerate() {
+        let tx = start_x + i as f32 * (tab_w + 3.0);
         let is_active = i == active_tab;
-        let fill = if is_active { bg_tab_active } else { bg_tab_inactive };
-        d.rrect(tx, 5.0, tab_w, TAB_BAR_H - 5.0, [7.0, 7.0, 0.0, 0.0], fill);
+        let is_hover = chrome.hovered_hit == ChromeHit::Tab(i)
+            || chrome.hovered_hit == ChromeHit::CloseTab(i);
         if is_active {
-            d.rect(tx + 8.0, 5.0, tab_w - 16.0, 2.0, accent);
+            d.rrect(tx, 6.0, tab_w, TAB_BAR_H - 6.0, [8.0, 8.0, 0.0, 0.0], pal.tab_active);
+            d.rect(tx + 12.0, 6.0, tab_w - 24.0, 2.0, pal.accent);
+        } else if is_hover {
+            d.rrect(tx, 7.0, tab_w, TAB_BAR_H - 10.0, [7.0; 4], pal.tab_hover);
+        } else if i + 1 < tabs.len() && i + 1 != active_tab {
+            d.rect(tx + tab_w + 1.0, 11.0, 1.0, 18.0, pal.border);
         }
-        let title = truncate_chars(&page.title(), ((tab_w - 34.0) / 7.5).max(4.0) as usize);
+
+        let ico_cx = tx + 16.0;
+        let ico_cy = 22.0;
+        if tab.loading {
+            d.arc(ico_cx, ico_cy, 5.5, chrome.anim_phase, 4.4, 1.7, pal.accent);
+        } else if let Some(ref fav) = tab.page.favicon {
+            d.fb.blit_rgba(
+                fav.width,
+                fav.height,
+                &fav.rgba,
+                (ico_cx - 7.0) * s,
+                (ico_cy - 7.0) * s,
+                14.0 * s,
+                14.0 * s,
+                1.0,
+            );
+        } else {
+            d.circle_stroke(ico_cx, ico_cy, 5.5, 1.3, if is_active { pal.accent } else { pal.text_muted });
+            d.circle_fill(ico_cx, ico_cy, 1.8, if is_active { pal.accent } else { pal.text_muted });
+        }
+
+        let max_title_w = (tab_w - 52.0).max(24.0);
+        let title = truncate_chars(&tab.page.title(), (max_title_w / 6.8).max(4.0) as usize);
         d.text(
             &title,
-            tx + 10.0,
-            22.0,
-            if is_active {
-                FontFaceKey::SansBold
-            } else {
-                FontFaceKey::SansRegular
-            },
+            tx + 28.0,
+            26.0,
+            if is_active { FontFaceKey::SansBold } else { FontFaceKey::SansRegular },
             12.0,
-            if is_active { text_hi } else { text_dim },
+            if is_active { pal.text_hi } else { pal.text_dim },
         );
-        d.text(
-            "x",
-            tx + tab_w - 16.0,
-            21.0,
-            FontFaceKey::SansRegular,
-            11.0,
-            text_dim,
-        );
+
+        let cx = tx + tab_w - 14.0;
+        let cy = 22.0;
+        if chrome.hovered_hit == ChromeHit::CloseTab(i) {
+            d.circle_fill(cx, cy, 8.5, pal.btn_hover);
+        }
+        let xc = if chrome.hovered_hit == ChromeHit::CloseTab(i) {
+            pal.text_hi
+        } else {
+            pal.text_muted
+        };
+        d.line(cx - 3.2, cy - 3.2, cx + 3.2, cy + 3.2, 1.35, xc);
+        d.line(cx + 3.2, cy - 3.2, cx - 3.2, cy + 3.2, 1.35, xc);
     }
 
-    let plus_x = start_x + tabs.len() as f32 * (tab_w + 4.0) + 2.0;
-    d.rrect(plus_x, 7.0, 24.0, 22.0, [6.0; 4], bg_tab_inactive);
-    d.text("+", plus_x + 7.0, 22.0, FontFaceKey::SansBold, 14.0, text_dim);
+    let plus_x = start_x + tabs.len() as f32 * (tab_w + 3.0) + 4.0;
+    let pcx = plus_x + 14.0;
+    let pcy = 22.0;
+    if chrome.hovered_hit == ChromeHit::NewTab {
+        d.circle_fill(pcx, pcy, 12.0, pal.btn_hover);
+    }
+    let pc = if chrome.hovered_hit == ChromeHit::NewTab { pal.text_hi } else { pal.text_dim };
+    d.line(pcx - 5.0, pcy, pcx + 5.0, pcy, 1.6, pc);
+    d.line(pcx, pcy - 5.0, pcx, pcy + 5.0, 1.6, pc);
 
     let toolbar_end = TAB_BAR_H + TOOLBAR_H;
-    d.rect(0.0, TAB_BAR_H, w, TOOLBAR_H, bg_bar);
-    d.rect(0.0, toolbar_end - 1.0, w, 1.0, border_c);
+    d.rect(0.0, TAB_BAR_H, w, TOOLBAR_H, pal.toolbar);
+    d.rect(0.0, toolbar_end - 1.0, w, 1.0, pal.border);
 
-    let page = &tabs[active_tab];
-    draw_nav_button(&mut d, 8.0, TAB_BAR_H + 7.0, "<", page.can_go_back());
-    draw_nav_button(&mut d, 40.0, TAB_BAR_H + 7.0, ">", page.can_go_forward());
-    draw_nav_button(&mut d, 72.0, TAB_BAR_H + 7.0, "R", true);
+    let active = &tabs[active_tab];
+    let page = active.page;
 
-    let dt_x = w - 46.0;
-    let omni_x = 108.0;
-    let omni_w = (dt_x - 8.0 - omni_x).max(120.0);
-    let omni_y = TAB_BAR_H + 6.0;
-    let omni_h = 30.0;
+    draw_icon_btn(&mut d, 8.0, TAB_BAR_H + 7.0, chrome.hovered_hit == ChromeHit::Back, &pal, |d, cx, cy| {
+        let c = if page.can_go_back() { pal.text_hi } else { pal.text_muted };
+        d.line(cx + 5.0, cy, cx - 5.0, cy, 1.6, c);
+        d.line(cx - 5.0, cy, cx - 0.5, cy - 4.5, 1.6, c);
+        d.line(cx - 5.0, cy, cx - 0.5, cy + 4.5, 1.6, c);
+    });
+    draw_icon_btn(&mut d, 42.0, TAB_BAR_H + 7.0, chrome.hovered_hit == ChromeHit::Forward, &pal, |d, cx, cy| {
+        let c = if page.can_go_forward() { pal.text_hi } else { pal.text_muted };
+        d.line(cx - 5.0, cy, cx + 5.0, cy, 1.6, c);
+        d.line(cx + 5.0, cy, cx + 0.5, cy - 4.5, 1.6, c);
+        d.line(cx + 5.0, cy, cx + 0.5, cy + 4.5, 1.6, c);
+    });
+    draw_icon_btn(&mut d, 76.0, TAB_BAR_H + 7.0, chrome.hovered_hit == ChromeHit::Reload, &pal, |d, cx, cy| {
+        if active.loading {
+            d.line(cx - 4.5, cy - 4.5, cx + 4.5, cy + 4.5, 1.7, pal.text_hi);
+            d.line(cx + 4.5, cy - 4.5, cx - 4.5, cy + 4.5, 1.7, pal.text_hi);
+        } else {
+            d.arc(cx, cy, 5.5, -0.8, 5.1, 1.6, pal.text_hi);
+            d.line(cx + 3.8, cy - 4.2, cx + 6.4, cy - 3.6, 1.5, pal.text_hi);
+            d.line(cx + 3.8, cy - 4.2, cx + 4.2, cy - 7.0, 1.5, pal.text_hi);
+        }
+    });
 
-    d.rrect(omni_x, omni_y, omni_w, omni_h, [8.0; 4], RgbaColor::new(13, 17, 23, 255));
-    let omni_border = if chrome.omnibox_focused { accent } else { border_c };
-    d.stroke_rrect(omni_x, omni_y, omni_w, omni_h, [8.0; 4], [1.0; 4], [omni_border; 4]);
-
-    let is_https = page.url.starts_with("https://");
-    let badge_color = if is_https {
-        RgbaColor::new(74, 222, 128, 255)
+    let (omni_x, omni_y, omni_w, omni_h) = omnibox_rect(w);
+    let omni_fill = if chrome.hovered_hit == ChromeHit::Omnibox && !chrome.omnibox_focused {
+        pal.omni_hover
     } else {
-        text_dim
+        pal.omni_bg
     };
-    let badge_label = if is_https { "TLS" } else { "WEB" };
-    d.text(
-        badge_label,
-        omni_x + 10.0,
-        omni_y + 19.0,
-        FontFaceKey::MonoBold,
-        10.0,
-        badge_color,
+    d.rrect(omni_x, omni_y, omni_w, omni_h, [16.0; 4], omni_fill);
+    let omni_border = if chrome.omnibox_focused { pal.accent } else { pal.border };
+    d.stroke_rrect(
+        omni_x,
+        omni_y,
+        omni_w,
+        omni_h,
+        [16.0; 4],
+        [if chrome.omnibox_focused { 1.6 } else { 1.0 }; 4],
+        [omni_border; 4],
     );
 
-    let text_x = omni_x + 42.0;
-    let shown = truncate_chars(
-        &chrome.omnibox_text,
-        ((omni_w - 86.0) / 7.5).max(10.0) as usize,
-    );
-    if chrome.omnibox_focused && chrome.omnibox_selected && !shown.is_empty() {
-        let sel_w = d
-            .measure(&shown, FontFaceKey::SansRegular, 13.0)
-            .min(omni_w - 80.0);
-        d.rrect(
-            text_x - 2.0,
-            omni_y + 5.0,
-            sel_w + 4.0,
-            20.0,
-            [3.0; 4],
-            RgbaColor::new(37, 99, 235, 165),
-        );
+    let lock_cx = omni_x + 17.0;
+    let lock_cy = omni_y + 16.0;
+    if page.url.starts_with("https://") {
+        d.rrect(lock_cx - 4.5, lock_cy - 0.5, 9.0, 6.8, [1.8; 4], pal.green);
+        d.arc(lock_cx, lock_cy - 1.0, 3.0, std::f32::consts::PI, std::f32::consts::PI, 1.4, pal.green);
+    } else if page.url.starts_with("peedle://") {
+        d.circle_fill(lock_cx, lock_cy, 4.0, pal.accent);
+    } else {
+        d.circle_stroke(lock_cx, lock_cy, 4.8, 1.3, pal.text_muted);
     }
-    let end_x = d.text(
-        &shown,
-        text_x,
-        omni_y + 19.5,
+
+    let text_x = omni_x + 32.0;
+    let text_w = (omni_w - 76.0).max(60.0);
+    let cursor_px = chrome.omnibox.prefix_width(
+        chrome.omnibox.cursor,
+        d.fonts,
         FontFaceKey::SansRegular,
         13.0,
-        text_hi,
     );
-    if chrome.omnibox_focused && !chrome.omnibox_selected {
-        d.rect(end_x + 1.0, omni_y + 6.0, 1.5, 18.0, accent);
+    let scroll_x = if cursor_px > text_w - 8.0 {
+        cursor_px - (text_w - 8.0)
+    } else {
+        0.0
+    };
+    d.push_clip(text_x - 2.0, omni_y + 2.0, text_w + 4.0, omni_h - 4.0);
+    if chrome.omnibox_focused {
+        if let Some((lo, hi)) = chrome.omnibox.selected_range() {
+            let x0 = text_x - scroll_x
+                + chrome.omnibox.prefix_width(lo, d.fonts, FontFaceKey::SansRegular, 13.0);
+            let x1 = text_x - scroll_x
+                + chrome.omnibox.prefix_width(hi, d.fonts, FontFaceKey::SansRegular, 13.0);
+            d.rrect(x0, omni_y + 6.0, (x1 - x0).max(2.0), 20.0, [3.0; 4], pal.accent_sel);
+        }
     }
+    if chrome.omnibox.text.is_empty() {
+        d.text(
+            "Search or enter address",
+            text_x,
+            omni_y + 20.5,
+            FontFaceKey::SansRegular,
+            13.0,
+            pal.text_muted,
+        );
+    } else {
+        d.text(
+            &chrome.omnibox.text,
+            text_x - scroll_x,
+            omni_y + 20.5,
+            FontFaceKey::SansRegular,
+            13.0,
+            pal.text_hi,
+        );
+    }
+    if chrome.omnibox_focused && chrome.omnibox.selected_range().is_none() {
+        d.rect(text_x - scroll_x + cursor_px, omni_y + 7.0, 1.5, 18.0, pal.accent);
+    }
+    d.pop_clip();
 
     if (chrome.zoom - 1.0).abs() > 0.01 {
         let ztxt = format!("{}%", (chrome.zoom * 100.0).round() as i32);
-        d.rrect(
-            dt_x - 84.0,
-            omni_y + 5.0,
-            44.0,
-            20.0,
-            [5.0; 4],
-            RgbaColor::new(30, 58, 95, 255),
-        );
-        d.text(
-            &ztxt,
-            dt_x - 77.0,
-            omni_y + 18.5,
-            FontFaceKey::MonoBold,
-            10.5,
-            accent,
-        );
+        let zx = omni_x + omni_w - 78.0;
+        d.rrect(zx, omni_y + 6.0, 42.0, 20.0, [10.0; 4], pal.btn_hover);
+        d.text(&ztxt, zx + 7.0, omni_y + 19.5, FontFaceKey::MonoBold, 10.5, pal.accent);
     }
 
     let is_bookmarked = chrome.bookmarks.iter().any(|b| b.url == page.url);
-    d.text(
-        if is_bookmarked { "*" } else { "+" },
-        dt_x - 28.0,
-        omni_y + 20.5,
-        FontFaceKey::MonoBold,
-        14.0,
-        if is_bookmarked { gold } else { text_dim },
+    let star_cx = omni_x + omni_w - 17.0;
+    let star_cy = omni_y + 16.0;
+    if chrome.hovered_hit == ChromeHit::ToggleBookmark {
+        d.circle_fill(star_cx, star_cy, 11.0, pal.btn_hover);
+    }
+    draw_star(&mut d, star_cx, star_cy, 6.2, is_bookmarked, if is_bookmarked { pal.gold } else { pal.text_dim });
+
+    let menu_x = w - 38.0;
+    let dt_x = menu_x - 34.0;
+    let dl_x = dt_x - 34.0;
+
+    draw_icon_btn(&mut d, dl_x, TAB_BAR_H + 7.0, chrome.hovered_hit == ChromeHit::DownloadsBtn, &pal, |d, cx, cy| {
+        let c = if chrome.has_downloads { pal.accent } else { pal.text_dim };
+        d.line(cx, cy - 5.5, cx, cy + 2.5, 1.6, c);
+        d.line(cx - 3.5, cy - 0.8, cx, cy + 2.8, 1.6, c);
+        d.line(cx + 3.5, cy - 0.8, cx, cy + 2.8, 1.6, c);
+        d.line(cx - 5.5, cy + 5.5, cx + 5.5, cy + 5.5, 1.6, c);
+    });
+
+    draw_icon_btn(
+        &mut d,
+        dt_x,
+        TAB_BAR_H + 7.0,
+        chrome.hovered_hit == ChromeHit::ToggleDevTools || chrome.devtools_open,
+        &pal,
+        |d, cx, cy| {
+            let c = if chrome.devtools_open { pal.accent } else { pal.text_dim };
+            d.line(cx - 2.5, cy - 4.0, cx - 6.0, cy, 1.5, c);
+            d.line(cx - 6.0, cy, cx - 2.5, cy + 4.0, 1.5, c);
+            d.line(cx + 2.5, cy - 4.0, cx + 6.0, cy, 1.5, c);
+            d.line(cx + 6.0, cy, cx + 2.5, cy + 4.0, 1.5, c);
+            d.line(cx + 1.0, cy - 4.8, cx - 1.0, cy + 4.8, 1.3, c);
+        },
     );
 
-    let dt_bg = if chrome.devtools_open {
-        RgbaColor::new(30, 58, 95, 255)
-    } else {
-        RgbaColor::new(31, 39, 53, 255)
-    };
-    d.rrect(dt_x, TAB_BAR_H + 7.0, 38.0, 28.0, [6.0; 4], dt_bg);
-    d.text(
-        "DT",
-        dt_x + 10.0,
-        TAB_BAR_H + 25.0,
-        FontFaceKey::MonoBold,
-        11.0,
-        if chrome.devtools_open { accent } else { text_dim },
-    );
+    draw_icon_btn(&mut d, menu_x, TAB_BAR_H + 7.0, chrome.hovered_hit == ChromeHit::MenuBtn, &pal, |d, cx, cy| {
+        let c = pal.text_hi;
+        d.circle_fill(cx, cy - 4.5, 1.4, c);
+        d.circle_fill(cx, cy, 1.4, c);
+        d.circle_fill(cx, cy + 4.5, 1.4, c);
+    });
+
+    if active.loading {
+        let prog_w = (w * active.load_progress.clamp(0.12, 0.94)).max(60.0);
+        d.rect(0.0, toolbar_end - 2.0, prog_w, 2.0, pal.accent);
+    }
 
     let top_h = top_chrome_height(chrome);
     if chrome.bookmarks_visible {
-        d.rect(0.0, toolbar_end, w, BOOKMARK_BAR_H, RgbaColor::new(19, 24, 33, 255));
-        d.rect(0.0, top_h - 1.0, w, 1.0, border_c);
-        let mut bx = 12.0;
-        for bm in &chrome.bookmarks {
-            let label = truncate_chars(&bm.title, 18);
-            let bw = (label.chars().count() as f32 * 7.2 + 20.0).clamp(52.0, 150.0);
+        d.rect(0.0, toolbar_end, w, BOOKMARK_BAR_H, pal.bookmark_bar);
+        d.rect(0.0, top_h - 1.0, w, 1.0, pal.border);
+        let mut bx = 10.0;
+        for (i, bm) in chrome.bookmarks.iter().enumerate() {
+            let label = truncate_chars(&bm.title, 20);
+            let bw = (label.chars().count() as f32 * 6.8 + 22.0).clamp(52.0, 160.0);
             if bx + bw > w - 12.0 {
                 break;
             }
-            d.rrect(bx, toolbar_end + 4.0, bw, 20.0, [5.0; 4], RgbaColor::new(28, 35, 48, 255));
+            let hovered = chrome.hovered_hit == ChromeHit::BookmarkItem(i);
+            if hovered {
+                d.rrect(bx, toolbar_end + 4.0, bw, 22.0, [6.0; 4], pal.btn_hover);
+            }
             d.text(
                 &label,
                 bx + 10.0,
-                toolbar_end + 17.5,
+                toolbar_end + 19.0,
                 FontFaceKey::SansRegular,
                 11.5,
-                text_dim,
+                if hovered { pal.text_hi } else { pal.text_dim },
             );
-            bx += bw + 6.0;
+            bx += bw + 4.0;
         }
     }
 
@@ -484,7 +832,7 @@ pub fn draw_chrome(
     let content_h = page.js_env.dom.borrow().layout.content_height;
     if content_h > vh + 1.0 {
         let track_h = vh - 8.0;
-        let thumb_h = ((vh / content_h) * track_h).clamp(24.0, track_h);
+        let thumb_h = ((vh / content_h) * track_h).clamp(28.0, track_h);
         let max_scroll = (content_h - vh).max(1.0);
         let thumb_y = top_h + 4.0 + (page.scroll_y / max_scroll) * (track_h - thumb_h);
         d.rrect(
@@ -493,20 +841,21 @@ pub fn draw_chrome(
             6.0,
             thumb_h,
             [3.0; 4],
-            RgbaColor::new(100, 116, 139, 175),
+            RgbaColor::new(120, 134, 154, 165),
         );
     }
 
     if chrome.find_open {
-        let fw = 280.0;
-        let fx = w - fw - 16.0;
+        let fw = 300.0;
+        let fx = w - fw - 18.0;
         let fy = top_h + 8.0;
-        d.rrect(fx, fy, fw, 32.0, [8.0; 4], RgbaColor::new(19, 24, 33, 245));
-        d.stroke_rrect(fx, fy, fw, 32.0, [8.0; 4], [1.0; 4], [accent; 4]);
-        let q = truncate_chars(&chrome.find_query, 24);
-        let end = d.text(&q, fx + 10.0, fy + 20.0, FontFaceKey::SansRegular, 12.5, text_hi);
-        d.rect(end + 1.0, fy + 8.0, 1.5, 16.0, accent);
-        let counter = if chrome.find_query.is_empty() {
+        d.shadow(fx, fy, fw, 34.0, 10.0);
+        d.rrect(fx, fy, fw, 34.0, [10.0; 4], pal.popup_bg);
+        d.stroke_rrect(fx, fy, fw, 34.0, [10.0; 4], [1.2; 4], [pal.accent; 4]);
+        let q = truncate_chars(&chrome.find.text, 24);
+        let end = d.text(&q, fx + 12.0, fy + 21.5, FontFaceKey::SansRegular, 12.5, pal.text_hi);
+        d.rect(end + 1.0, fy + 9.0, 1.5, 16.0, pal.accent);
+        let counter = if chrome.find.text.is_empty() {
             String::new()
         } else if chrome.find_match_count == 0 {
             "0/0".to_string()
@@ -515,42 +864,156 @@ pub fn draw_chrome(
         };
         d.text(
             &counter,
-            fx + fw - 48.0,
-            fy + 20.0,
+            fx + fw - 52.0,
+            fy + 21.0,
             FontFaceKey::MonoRegular,
             11.0,
-            text_dim,
+            pal.text_dim,
         );
     }
 
     if let Some(ref href) = page.hovered_href {
         let dt_off = if chrome.devtools_open { DEVTOOLS_H } else { 0.0 };
-        let pill_w = (href.len() as f32 * 7.2 + 20.0).min(w * 0.7);
+        let shown = truncate_chars(href, 86);
+        let pill_w = (shown.chars().count() as f32 * 6.8 + 18.0).min(w * 0.72);
         let pill_y = h - dt_off - 24.0;
-        d.rrect(6.0, pill_y, pill_w, 20.0, [4.0; 4], RgbaColor::new(15, 19, 26, 235));
-        d.text(
-            &truncate_chars(href, 80),
-            12.0,
-            pill_y + 14.0,
-            FontFaceKey::MonoRegular,
-            11.0,
-            text_dim,
-        );
+        d.rrect(6.0, pill_y, pill_w, 20.0, [5.0; 4], pal.popup_bg);
+        d.stroke_rrect(6.0, pill_y, pill_w, 20.0, [5.0; 4], [1.0; 4], [pal.border; 4]);
+        d.text(&shown, 12.0, pill_y + 14.0, FontFaceKey::MonoRegular, 11.0, pal.text_dim);
+    }
+
+    if let Some(ref toast) = chrome.download_toast {
+        let dt_off = if chrome.devtools_open { DEVTOOLS_H } else { 0.0 };
+        let ty = h - dt_off - 42.0;
+        d.shadow(12.0, ty, 428.0, 36.0, 10.0);
+        d.rrect(12.0, ty, 428.0, 36.0, [10.0; 4], pal.popup_bg);
+        d.stroke_rrect(12.0, ty, 428.0, 36.0, [10.0; 4], [1.0; 4], [pal.border; 4]);
+        d.circle_fill(28.0, ty + 18.0, 5.0, pal.green);
+        let label = format!("Saved {} ({})", truncate_chars(&toast.filename, 24), fmt_bytes(toast.bytes));
+        d.text(&label, 40.0, ty + 22.0, FontFaceKey::SansBold, 12.0, pal.text_hi);
+        d.text("Show", 290.0, ty + 22.0, FontFaceKey::SansBold, 11.5, pal.accent);
+        d.text("Downloads", 336.0, ty + 22.0, FontFaceKey::SansRegular, 11.5, pal.text_dim);
+        d.line(418.0, ty + 14.0, 426.0, ty + 22.0, 1.4, pal.text_dim);
+        d.line(426.0, ty + 14.0, 418.0, ty + 22.0, 1.4, pal.text_dim);
     }
 
     if chrome.devtools_open {
-        draw_devtools(&mut d, page, chrome, h - DEVTOOLS_H, w, DEVTOOLS_H);
+        draw_devtools(&mut d, page, chrome, h - DEVTOOLS_H, w, DEVTOOLS_H, &pal);
+    }
+
+    if chrome.omnibox_focused && !chrome.suggestions.is_empty() {
+        let sy = omni_y + omni_h + 4.0;
+        let row_h = 36.0;
+        let sh = chrome.suggestions.len() as f32 * row_h + 10.0;
+        d.shadow(omni_x, sy, omni_w, sh, 12.0);
+        d.rrect(omni_x, sy, omni_w, sh, [12.0; 4], pal.popup_bg);
+        d.stroke_rrect(omni_x, sy, omni_w, sh, [12.0; 4], [1.0; 4], [pal.border; 4]);
+        for (i, sug) in chrome.suggestions.iter().enumerate() {
+            let ry = sy + 5.0 + i as f32 * row_h;
+            let active_row = chrome.suggestion_index == Some(i)
+                || chrome.hovered_hit == ChromeHit::SuggestionItem(i);
+            if active_row {
+                d.rrect(omni_x + 5.0, ry, omni_w - 10.0, row_h - 2.0, [8.0; 4], pal.popup_hover);
+            }
+            let tag = match sug.kind {
+                SuggestionKind::Bookmark => "BM",
+                SuggestionKind::History => "HIS",
+                SuggestionKind::Search => "WEB",
+            };
+            let tag_c = match sug.kind {
+                SuggestionKind::Bookmark => pal.gold,
+                SuggestionKind::History => pal.accent,
+                SuggestionKind::Search => pal.green,
+            };
+            d.text(tag, omni_x + 14.0, ry + 22.0, FontFaceKey::MonoBold, 10.0, tag_c);
+            let max_c = ((omni_w - 60.0) / 7.5).max(16.0) as usize;
+            let title = truncate_chars(&sug.title, max_c / 2);
+            let url_s = truncate_chars(&sug.url, max_c / 2);
+            let tx_end = d.text(&title, omni_x + 44.0, ry + 22.0, FontFaceKey::SansBold, 12.5, pal.text_hi);
+            d.text(&url_s, tx_end + 10.0, ry + 22.0, FontFaceKey::MonoRegular, 11.0, pal.text_dim);
+        }
+    }
+
+    if let Some(ref sel) = chrome.select_popup {
+        let item_h = 28.0;
+        let vis = sel.options.len().min(10);
+        let sh = vis as f32 * item_h + 8.0;
+        d.shadow(sel.x, sel.y, sel.w, sh, 8.0);
+        d.rrect(sel.x, sel.y, sel.w, sh, [8.0; 4], pal.popup_bg);
+        d.stroke_rrect(sel.x, sel.y, sel.w, sh, [8.0; 4], [1.0; 4], [pal.border; 4]);
+        for (i, opt) in sel.options.iter().take(vis).enumerate() {
+            let ry = sel.y + 4.0 + i as f32 * item_h;
+            let hi = chrome.hovered_hit == ChromeHit::SelectOptionItem(i) || i == sel.selected;
+            if hi {
+                d.rrect(sel.x + 4.0, ry, sel.w - 8.0, item_h - 2.0, [5.0; 4], pal.popup_hover);
+            }
+            d.text(
+                &truncate_chars(opt, 36),
+                sel.x + 12.0,
+                ry + 18.0,
+                if i == sel.selected { FontFaceKey::SansBold } else { FontFaceKey::SansRegular },
+                12.5,
+                if i == sel.selected { pal.accent } else { pal.text_hi },
+            );
+        }
+    }
+
+    if let Some(ref menu) = chrome.popup_menu {
+        let item_h = 30.0;
+        let mh = menu.items.len() as f32 * item_h + 10.0;
+        d.shadow(menu.x, menu.y, menu.w, mh, 10.0);
+        d.rrect(menu.x, menu.y, menu.w, mh, [10.0; 4], pal.popup_bg);
+        d.stroke_rrect(menu.x, menu.y, menu.w, mh, [10.0; 4], [1.0; 4], [pal.border; 4]);
+        for (i, item) in menu.items.iter().enumerate() {
+            let ry = menu.y + 5.0 + i as f32 * item_h;
+            let hi = item.enabled && chrome.hovered_hit == ChromeHit::PopupMenuItem(i);
+            if hi {
+                d.rrect(menu.x + 5.0, ry, menu.w - 10.0, item_h - 2.0, [6.0; 4], pal.popup_hover);
+            }
+            d.text(
+                &item.label,
+                menu.x + 14.0,
+                ry + 19.5,
+                FontFaceKey::SansRegular,
+                12.5,
+                if item.enabled { pal.text_hi } else { pal.text_muted },
+            );
+        }
     }
 }
 
-fn draw_nav_button(d: &mut ScaledDraw<'_>, x: f32, y: f32, label: &str, enabled: bool) {
-    d.rrect(x, y, 28.0, 28.0, [6.0; 4], RgbaColor::new(31, 39, 53, 255));
-    let c = if enabled {
-        RgbaColor::new(226, 232, 240, 255)
+fn draw_icon_btn<F>(
+    d: &mut ScaledDraw<'_>,
+    x: f32,
+    y: f32,
+    hovered: bool,
+    pal: &Palette,
+    paint_icon: F,
+) where
+    F: FnOnce(&mut ScaledDraw<'_>, f32, f32),
+{
+    if hovered {
+        d.rrect(x, y, 30.0, 30.0, [8.0; 4], pal.btn_hover);
+    }
+    paint_icon(d, x + 15.0, y + 15.0);
+}
+
+fn draw_star(d: &mut ScaledDraw<'_>, cx: f32, cy: f32, r: f32, filled: bool, color: RgbaColor) {
+    let mut pts = Vec::with_capacity(10);
+    for i in 0..10 {
+        let ang = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+        let rad = if i % 2 == 0 { r } else { r * 0.44 };
+        pts.push(((cx + rad * ang.cos()) * d.s, (cy + rad * ang.sin()) * d.s));
+    }
+    if filled {
+        d.fb.fill_polygon(&[pts], color, false);
     } else {
-        RgbaColor::new(71, 85, 105, 255)
-    };
-    d.text(label, x + 9.5, y + 18.5, FontFaceKey::MonoBold, 13.0, c);
+        for i in 0..10 {
+            let (x0, y0) = pts[i];
+            let (x1, y1) = pts[(i + 1) % 10];
+            d.fb.draw_line_aa(x0, y0, x1, y1, 1.2 * d.s, color);
+        }
+    }
 }
 
 fn draw_devtools(
@@ -560,22 +1023,16 @@ fn draw_devtools(
     top: f32,
     w: f32,
     h: f32,
+    pal: &Palette,
 ) {
     let tab = chrome.devtools_tab;
-    let bg = RgbaColor::new(13, 17, 23, 255);
-    let header_bg = RgbaColor::new(22, 27, 36, 255);
-    let border = RgbaColor::new(40, 50, 68, 255);
-    let accent = RgbaColor::new(56, 189, 248, 255);
-    let text_hi = RgbaColor::new(226, 232, 240, 255);
-    let text_dim = RgbaColor::new(148, 163, 184, 255);
-
-    d.rect(0.0, top, w, h, bg);
-    d.rect(0.0, top, w, 28.0, header_bg);
-    d.rect(0.0, top, w, 1.0, border);
-    d.rect(0.0, top + 28.0, w, 1.0, border);
+    d.rect(0.0, top, w, h, pal.omni_bg);
+    d.rect(0.0, top, w, 30.0, pal.toolbar);
+    d.rect(0.0, top, w, 1.0, pal.border);
+    d.rect(0.0, top + 30.0, w, 1.0, pal.border);
 
     let tabs = [
-        (DevToolsTab::Elements, "Elements", 12.0),
+        (DevToolsTab::Elements, "Elements", 14.0),
         (DevToolsTab::Console, "Console", 108.0),
         (DevToolsTab::Network, "Network", 198.0),
     ];
@@ -584,18 +1041,18 @@ fn draw_devtools(
         d.text(
             label,
             x,
-            top + 18.0,
+            top + 19.0,
             FontFaceKey::SansBold,
             12.0,
-            if active { accent } else { text_dim },
+            if active { pal.accent } else { pal.text_dim },
         );
         if active {
-            d.rect(x, top + 26.0, 64.0, 2.0, accent);
+            d.rect(x, top + 28.0, 64.0, 2.0, pal.accent);
         }
     }
 
-    let mut y = top + 46.0;
-    let max_y = top + h - 36.0;
+    let mut y = top + 48.0;
+    let max_y = top + h - 38.0;
     match tab {
         DevToolsTab::Elements => {
             let split_x = (w * 0.58).max(260.0);
@@ -608,21 +1065,21 @@ fn draw_devtools(
                 if y > max_y + 20.0 {
                     break;
                 }
-                d.text(&truncate_chars(&line, 66), 12.0, y, FontFaceKey::MonoRegular, 11.5, text_hi);
+                d.text(&truncate_chars(&line, 66), 12.0, y, FontFaceKey::MonoRegular, 11.5, pal.text_hi);
                 y += 16.0;
             }
-            d.rect(split_x, top + 28.0, 1.0, h - 28.0, border);
+            d.rect(split_x, top + 30.0, 1.0, h - 30.0, pal.border);
             let inspect_node = page.hovered_node.or_else(|| st.doc.body());
-            let mut sy = top + 46.0;
+            let mut sy = top + 48.0;
             if let Some(nid) = inspect_node {
                 if let Some(el) = st.doc.element(nid) {
                     let hdr = format!("<{}> computed", el.tag_name);
-                    d.text(&hdr, split_x + 12.0, sy, FontFaceKey::MonoBold, 11.5, accent);
+                    d.text(&hdr, split_x + 12.0, sy, FontFaceKey::MonoBold, 11.5, pal.accent);
                     sy += 18.0;
                 }
                 if let Some(r) = st.layout.bounding_rect(nid) {
                     let box_line = format!("box: {:.0}x{:.0} @ ({:.0}, {:.0})", r.width, r.height, r.x, r.y);
-                    d.text(&box_line, split_x + 12.0, sy, FontFaceKey::MonoRegular, 11.0, text_dim);
+                    d.text(&box_line, split_x + 12.0, sy, FontFaceKey::MonoRegular, 11.0, pal.text_dim);
                     sy += 16.0;
                 }
                 if let Some(cs) = st.styles.get(nid) {
@@ -632,7 +1089,7 @@ fn draw_devtools(
                         }
                         let val = get_computed_property(cs, prop);
                         let row = format!("{}: {}", prop, truncate_chars(&val, 34));
-                        d.text(&row, split_x + 12.0, sy, FontFaceKey::MonoRegular, 11.0, text_hi);
+                        d.text(&row, split_x + 12.0, sy, FontFaceKey::MonoRegular, 11.0, pal.text_hi);
                         sy += 15.0;
                     }
                 }
@@ -640,7 +1097,7 @@ fn draw_devtools(
         }
         DevToolsTab::Console => {
             if page.console_logs.is_empty() {
-                d.text("(no console output)", 12.0, y, FontFaceKey::MonoRegular, 11.5, text_dim);
+                d.text("(no console output)", 12.0, y, FontFaceKey::MonoRegular, 11.5, pal.text_dim);
             } else {
                 for line in page.console_logs.iter().rev().take(9).rev() {
                     if y > max_y {
@@ -649,22 +1106,22 @@ fn draw_devtools(
                     let c = if line.starts_with("[Error]") {
                         RgbaColor::new(248, 113, 113, 255)
                     } else if line.starts_with("=> ") {
-                        RgbaColor::new(125, 211, 252, 255)
+                        pal.accent
                     } else {
-                        text_hi
+                        pal.text_hi
                     };
                     d.text(&truncate_chars(line, 110), 12.0, y, FontFaceKey::MonoRegular, 11.5, c);
                     y += 16.0;
                 }
             }
-            let input_y = top + h - 30.0;
-            d.rect(0.0, input_y - 2.0, w, 1.0, border);
-            d.rect(0.0, input_y - 1.0, w, 31.0, header_bg);
-            d.text(">", 12.0, input_y + 18.0, FontFaceKey::MonoBold, 12.0, accent);
-            let shown_in = truncate_chars(&chrome.console_input, 110);
-            let end_x = d.text(&shown_in, 26.0, input_y + 18.0, FontFaceKey::MonoRegular, 12.0, text_hi);
+            let input_y = top + h - 32.0;
+            d.rect(0.0, input_y - 2.0, w, 1.0, pal.border);
+            d.rect(0.0, input_y - 1.0, w, 33.0, pal.toolbar);
+            d.text(">", 12.0, input_y + 19.0, FontFaceKey::MonoBold, 12.0, pal.accent);
+            let shown_in = truncate_chars(&chrome.console.text, 110);
+            let end_x = d.text(&shown_in, 26.0, input_y + 19.0, FontFaceKey::MonoRegular, 12.0, pal.text_hi);
             if chrome.console_focused {
-                d.rect(end_x + 1.0, input_y + 6.0, 1.5, 16.0, accent);
+                d.rect(end_x + 1.0, input_y + 7.0, 1.5, 16.0, pal.accent);
             }
         }
         DevToolsTab::Network => {
@@ -676,7 +1133,7 @@ fn draw_devtools(
                     "{} {} {:>6}B {:>4}ms  {}",
                     entry.status, entry.method, entry.bytes, entry.duration_ms, entry.url
                 );
-                d.text(&truncate_chars(&row, 110), 12.0, y, FontFaceKey::MonoRegular, 11.5, text_hi);
+                d.text(&truncate_chars(&row, 110), 12.0, y, FontFaceKey::MonoRegular, 11.5, pal.text_hi);
                 y += 16.0;
             }
         }
@@ -685,7 +1142,7 @@ fn draw_devtools(
 
 fn collect_dom_lines(
     doc: &peedle_html::Document,
-    id: peedle_html::NodeId,
+    id: NodeId,
     depth: usize,
     out: &mut Vec<String>,
     limit: usize,
@@ -707,6 +1164,16 @@ fn collect_dom_lines(
         for c in doc.element_children(id) {
             collect_dom_lines(doc, c, depth + 1, out, limit);
         }
+    }
+}
+
+fn fmt_bytes(b: usize) -> String {
+    if b >= 1024 * 1024 {
+        format!("{:.1} MB", b as f64 / (1024.0 * 1024.0))
+    } else if b >= 1024 {
+        format!("{:.1} KB", b as f64 / 1024.0)
+    } else {
+        format!("{} B", b)
     }
 }
 

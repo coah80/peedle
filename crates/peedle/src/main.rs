@@ -3,6 +3,8 @@
 mod app;
 mod chrome;
 mod icon;
+mod profile;
+mod text_edit;
 
 use std::path::Path;
 

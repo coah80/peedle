@@ -225,6 +225,8 @@ impl BrowserJsEnv {
                 .collect()
         };
 
+        let mut script_specs: Vec<(NodeId, bool, Option<String>, Option<String>, String)> = Vec::new();
+        let mut to_fetch: Vec<(usize, String)> = Vec::new();
         for sid in script_nodes {
             let (script_type, src_attr, inline_code) = {
                 let st = self.dom.borrow();
@@ -250,24 +252,60 @@ impl BrowserJsEnv {
                 continue;
             }
 
-            let code = if let Some(ref src) = src_attr {
-                let resolved = {
-                    let st = self.dom.borrow();
-                    Url::parse(&st.url)
-                        .ok()
-                        .and_then(|b| b.join(src).ok())
-                        .or_else(|| Url::parse(src).ok())
-                        .map(|u| u.href())
-                };
-                if let Some(u) = resolved {
-                    let client = self.dom.borrow().client.clone();
-                    match client.get(&u) {
-                        Ok(resp) if resp.status < 400 => resp.text(),
-                        _ => continue,
-                    }
-                } else {
-                    continue;
+            let resolved = if let Some(ref src) = src_attr {
+                let st = self.dom.borrow();
+                Url::parse(&st.url)
+                    .ok()
+                    .and_then(|b| b.join(src).ok())
+                    .or_else(|| Url::parse(src).ok())
+                    .map(|u| u.href())
+            } else {
+                None
+            };
+            let idx = script_specs.len();
+            if let Some(ref u) = resolved {
+                to_fetch.push((idx, u.clone()));
+            }
+            script_specs.push((sid, is_module, src_attr, resolved, inline_code));
+        }
+
+        let mut fetched_scripts: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
+        if !to_fetch.is_empty() {
+            let client = self.dom.borrow().client.clone();
+            let queue = std::sync::Mutex::new(std::collections::VecDeque::from(to_fetch));
+            let results = std::sync::Mutex::new(Vec::new());
+            let workers = queue.lock().unwrap().len().min(6);
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| loop {
+                        let item = queue.lock().unwrap().pop_front();
+                        let Some((idx, url)) = item else {
+                            break;
+                        };
+                        if let Ok(resp) = client.get_cached(&url) {
+                            if resp.status < 400 {
+                                results.lock().unwrap().push((idx, resp.text()));
+                            }
+                        }
+                    });
                 }
+            });
+            for (idx, txt) in results.into_inner().unwrap() {
+                fetched_scripts.insert(idx, txt);
+            }
+        }
+
+        for (idx, (sid, is_module, src_attr, resolved, inline_code)) in
+            script_specs.into_iter().enumerate()
+        {
+            let code = if resolved.is_some() {
+                match fetched_scripts.remove(&idx) {
+                    Some(c) => c,
+                    None => continue,
+                }
+            } else if src_attr.is_some() {
+                continue;
             } else {
                 inline_code
             };
@@ -436,6 +474,11 @@ impl BrowserJsEnv {
     pub fn advance_time_ms(&mut self, delta_ms: u64) {
         self.dom.borrow_mut().now_ms += delta_ms;
         self.tick_event_loop(64);
+    }
+
+    pub fn has_pending_timers(&self) -> bool {
+        let st = self.dom.borrow();
+        st.timers.iter().any(|t| !t.cancelled) || !st.message_queue.is_empty()
     }
 
     fn pop_due_timers(&self) -> Vec<crate::state::TimerEntry> {

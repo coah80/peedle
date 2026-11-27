@@ -1,6 +1,9 @@
-use peedle_url::Url;
+use std::path::Path;
 
-#[derive(Clone, Debug)]
+use peedle_url::Url;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Cookie {
     pub name: String,
     pub value: String,
@@ -11,7 +14,7 @@ pub struct Cookie {
     pub http_only: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
 }
@@ -20,6 +23,34 @@ impl CookieJar {
     pub fn new() -> Self {
         Self {
             cookies: Vec::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.cookies.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.cookies.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cookies.is_empty()
+    }
+
+    pub fn load_from_file(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_to_file(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, json);
         }
     }
 

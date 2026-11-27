@@ -9,5 +9,5 @@ pub use canvas2d::{Canvas2D, CanvasTextAlign, CanvasTextBaseline};
 pub use fonts::{FontFaceKey, FontSystem};
 pub use framebuffer::{Affine2D, ClipRect, Framebuffer, RgbaColor};
 pub use images::{DecodedImage, ImageCache};
-pub use paint::paint_layout;
+pub use paint::{paint_layout, paint_layout_scaled};
 pub use svg::render_svg_node;
