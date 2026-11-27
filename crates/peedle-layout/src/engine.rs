@@ -298,6 +298,7 @@ impl LayoutEngine {
                                 Display::InlineBlock => BoxKind::InlineBlock,
                                 Display::Flex | Display::InlineFlex => BoxKind::Flex,
                                 Display::Grid | Display::InlineGrid => BoxKind::Grid,
+                                Display::Table | Display::InlineTable => BoxKind::Table,
                                 _ => BoxKind::Inline,
                             };
                             let pbox = self.tree.alloc(None, pkind, before_style.clone());
@@ -335,6 +336,7 @@ impl LayoutEngine {
                                 Display::InlineBlock => BoxKind::InlineBlock,
                                 Display::Flex | Display::InlineFlex => BoxKind::Flex,
                                 Display::Grid | Display::InlineGrid => BoxKind::Grid,
+                                Display::Table | Display::InlineTable => BoxKind::Table,
                                 _ => BoxKind::Inline,
                             };
                             let pbox = self.tree.alloc(None, pkind, after_style.clone());

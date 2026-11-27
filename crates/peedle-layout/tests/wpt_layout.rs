@@ -410,3 +410,23 @@ fn wpt_flex_intrinsic_ignores_descendant_percent_width() {
     assert!(i2.x >= i1.right() - 1.0 && i2.x < 300.0, "item 2 must sit next to item 1: i1={:?} i2={:?}", i1, i2);
     assert!(i3.x >= i2.right() - 1.0 && i3.right() < 500.0, "item 3 must remain inside navbar: {:?}", i3);
 }
+
+#[test]
+fn wpt_micro_clearfix_pseudo_after_table() {
+    let (doc, tree) = run_layout(
+        r#"<div id="wrap" class="cf"><div id="flt">Floated</div></div><div id="after">Next</div>"#,
+        r#"
+            body { margin: 0; }
+            .cf::before, .cf::after { content: " "; display: table; }
+            .cf::after { clear: both; }
+            #flt { float: left; width: 200px; height: 120px; }
+            #after { height: 40px; }
+        "#,
+        800.0,
+        600.0,
+    );
+    let wrap = tree.bounding_rect(doc.get_element_by_id("wrap").unwrap()).unwrap();
+    let after = tree.bounding_rect(doc.get_element_by_id("after").unwrap()).unwrap();
+    assert!(wrap.height >= 119.0, "micro-clearfix wrapper must enclose float: {:?}", wrap);
+    assert!(after.y >= 119.0, "sibling after micro-clearfix must sit below float: {:?}", after);
+}
