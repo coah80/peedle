@@ -606,6 +606,50 @@ impl Framebuffer {
         }
     }
 
+    pub fn fill_conic_gradient(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: [f32; 4],
+        from_deg: f32,
+        stops: &[(RgbaColor, f32)],
+        repeating: bool,
+    ) {
+        if w <= 0.0 || h <= 0.0 || stops.is_empty() {
+            return;
+        }
+        let clip = self.current_clip();
+        let x0 = (x.floor() as i32).max(clip.x);
+        let y0 = (y.floor() as i32).max(clip.y);
+        let x1 = ((x + w).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((y + h).ceil() as i32).min(clip.y + clip.h);
+        let cx0 = x + w * 0.5;
+        let cy0 = y + h * 0.5;
+        let from_rad = from_deg.to_radians();
+        let tau = std::f32::consts::TAU;
+        for py in y0..y1 {
+            let cy = py as f32 + 0.5;
+            for px in x0..x1 {
+                let cx = px as f32 + 0.5;
+                let dist = rounded_rect_sdf(cx, cy, x, y, w, h, radii);
+                let cov = (0.5 - dist).clamp(0.0, 1.0);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let angle = (cx - cx0).atan2(-(cy - cy0)) - from_rad;
+                let mut t = angle.rem_euclid(tau) / tau;
+                if repeating && stops.len() >= 2 {
+                    let span = (stops.last().unwrap().1 - stops[0].1).max(0.0001);
+                    t = stops[0].1 + (t - stops[0].1).rem_euclid(span);
+                }
+                let c = sample_gradient(stops, t);
+                self.blend_pixel(px, py, c.with_alpha(cov));
+            }
+        }
+    }
+
     pub fn draw_box_shadow(
         &mut self,
         x: f32,
@@ -620,15 +664,60 @@ impl Framebuffer {
         color: RgbaColor,
         inset: bool,
     ) {
-        if color.a == 0 || inset {
+        if color.a == 0 {
+            return;
+        }
+        let clip = self.current_clip();
+        let pad = blur.max(0.0);
+        let sigma = (blur * 0.5).max(0.5);
+        if inset {
+            let x0 = (x.floor() as i32).max(clip.x);
+            let y0 = (y.floor() as i32).max(clip.y);
+            let x1 = ((x + w).ceil() as i32).min(clip.x + clip.w);
+            let y1 = ((y + h).ceil() as i32).min(clip.y + clip.h);
+            let ix = x + offset_x + spread;
+            let iy = y + offset_y + spread;
+            let iw = (w - spread * 2.0).max(0.0);
+            let ih = (h - spread * 2.0).max(0.0);
+            let max_r = (iw * 0.5).min(ih * 0.5);
+            let ir = [
+                (radii[0] - spread).clamp(0.0, max_r),
+                (radii[1] - spread).clamp(0.0, max_r),
+                (radii[2] - spread).clamp(0.0, max_r),
+                (radii[3] - spread).clamp(0.0, max_r),
+            ];
+            for py in y0..y1 {
+                let cy = py as f32 + 0.5;
+                for px in x0..x1 {
+                    let cx = px as f32 + 0.5;
+                    let outer_d = rounded_rect_sdf(cx, cy, x, y, w, h, radii);
+                    let outer_cov = (0.5 - outer_d).clamp(0.0, 1.0);
+                    if outer_cov <= 0.0 {
+                        continue;
+                    }
+                    let inner_d = if iw <= 0.0 || ih <= 0.0 {
+                        pad + 1.0
+                    } else {
+                        rounded_rect_sdf(cx, cy, ix, iy, iw, ih, ir)
+                    };
+                    let sh_alpha = if blur <= 0.1 {
+                        (inner_d + 0.5).clamp(0.0, 1.0)
+                    } else {
+                        let t = ((inner_d + pad) / (2.0 * sigma)).clamp(0.0, 1.0);
+                        t * t * (3.0 - 2.0 * t)
+                    };
+                    let a = sh_alpha * outer_cov;
+                    if a > 0.0 {
+                        self.blend_pixel(px, py, color.with_alpha(a));
+                    }
+                }
+            }
             return;
         }
         let sx = x + offset_x - spread;
         let sy = y + offset_y - spread;
         let sw = (w + spread * 2.0).max(0.0);
         let sh = (h + spread * 2.0).max(0.0);
-        let pad = blur.max(0.0);
-        let clip = self.current_clip();
         let x0 = ((sx - pad).floor() as i32).max(clip.x);
         let y0 = ((sy - pad).floor() as i32).max(clip.y);
         let x1 = ((sx + sw + pad).ceil() as i32).min(clip.x + clip.w);
@@ -640,11 +729,15 @@ impl Framebuffer {
             (radii[2] + spread).clamp(0.0, max_r),
             (radii[3] + spread).clamp(0.0, max_r),
         ];
-        let sigma = (blur * 0.5).max(0.5);
         for py in y0..y1 {
             let cy = py as f32 + 0.5;
             for px in x0..x1 {
                 let cx = px as f32 + 0.5;
+                let box_d = rounded_rect_sdf(cx, cy, x, y, w, h, radii);
+                let out_cov = (box_d + 0.5).clamp(0.0, 1.0);
+                if out_cov <= 0.0 {
+                    continue;
+                }
                 let dist = rounded_rect_sdf(cx, cy, sx, sy, sw, sh, sr);
                 let alpha = if blur <= 0.1 {
                     (0.5 - dist).clamp(0.0, 1.0)
@@ -652,8 +745,9 @@ impl Framebuffer {
                     let t = ((pad - dist) / (2.0 * sigma)).clamp(0.0, 1.0);
                     t * t * (3.0 - 2.0 * t)
                 };
-                if alpha > 0.0 {
-                    self.blend_pixel(px, py, color.with_alpha(alpha));
+                let a = alpha * out_cov;
+                if a > 0.0 {
+                    self.blend_pixel(px, py, color.with_alpha(a));
                 }
             }
         }

@@ -1464,11 +1464,42 @@ fn parse_conic_gradient(
     })
 }
 
+fn parse_stop_pos(g: &[Token]) -> Option<f32> {
+    match g.first() {
+        Some(Token::Percentage { value, .. }) => Some(*value / 100.0),
+        Some(Token::Dimension { value, unit, .. }) if unit.eq_ignore_ascii_case("deg") => {
+            Some(*value / 360.0)
+        }
+        Some(Token::Dimension { value, unit, .. }) if unit.eq_ignore_ascii_case("turn") => {
+            Some(*value)
+        }
+        Some(Token::Dimension { value, unit, .. }) if unit.eq_ignore_ascii_case("rad") => {
+            Some(*value / std::f32::consts::TAU)
+        }
+        Some(Token::Dimension { value, unit, .. }) if unit.eq_ignore_ascii_case("grad") => {
+            Some(*value / 400.0)
+        }
+        _ => None,
+    }
+}
+
 fn parse_gradient_stops(parts: &[&[Token]], current: Color) -> Vec<GradientStop> {
     let mut stops = Vec::new();
     for p in parts {
-        if let Some(stop) = parse_gradient_stop(trim_ws(p), current) {
-            stops.push(stop);
+        let groups = split_whitespace_groups(trim_ws(p));
+        if groups.is_empty() {
+            continue;
+        }
+        let Some(color) = parse_color_from_tokens(groups[0], current) else {
+            continue;
+        };
+        let pos1 = groups.get(1).and_then(|g| parse_stop_pos(g));
+        stops.push(GradientStop { color, position: pos1 });
+        if let Some(pos2) = groups.get(2).and_then(|g| parse_stop_pos(g)) {
+            stops.push(GradientStop {
+                color,
+                position: Some(pos2),
+            });
         }
     }
     stops
@@ -1480,16 +1511,7 @@ fn parse_gradient_stop(tokens: &[Token], current: Color) -> Option<GradientStop>
         return None;
     }
     let color = parse_color_from_tokens(groups[0], current)?;
-    let position = groups.get(1).and_then(|g| match g.first() {
-        Some(Token::Percentage { value, .. }) => Some(*value / 100.0),
-        Some(Token::Dimension { value, unit, .. }) if unit.eq_ignore_ascii_case("deg") => {
-            Some(*value / 360.0)
-        }
-        Some(Token::Dimension { value, unit, .. }) if unit.eq_ignore_ascii_case("turn") => {
-            Some(*value)
-        }
-        _ => None,
-    });
+    let position = groups.get(1).and_then(|g| parse_stop_pos(g));
     Some(GradientStop { color, position })
 }
 

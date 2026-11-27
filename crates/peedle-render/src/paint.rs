@@ -176,19 +176,21 @@ fn paint_box(
 
     if !matches!(b.kind, BoxKind::Text(_)) {
         for sh in &b.style.box_shadow {
-            fb.draw_box_shadow(
-                rx,
-                ry,
-                bb.width,
-                bb.height,
-                radii,
-                sh.offset_x,
-                sh.offset_y,
-                sh.blur_radius,
-                sh.spread_radius,
-                to_rgba(sh.color).with_alpha(alpha),
-                sh.inset,
-            );
+            if !sh.inset {
+                fb.draw_box_shadow(
+                    rx,
+                    ry,
+                    bb.width,
+                    bb.height,
+                    radii,
+                    sh.offset_x,
+                    sh.offset_y,
+                    sh.blur_radius,
+                    sh.spread_radius,
+                    to_rgba(sh.color).with_alpha(alpha),
+                    false,
+                );
+            }
         }
 
         if let Some(ref mask_u) = b.style.mask_image {
@@ -249,6 +251,24 @@ fn paint_box(
             BackgroundImage::RadialGradient { repeating, stops, .. } => {
                 let norm = normalize_stops(stops, alpha);
                 fb.fill_radial_gradient(rx, ry, bb.width, bb.height, radii, &norm, *repeating);
+            }
+            BackgroundImage::ConicGradient {
+                from_deg,
+                repeating,
+                stops,
+                ..
+            } => {
+                let norm = normalize_stops(stops, alpha);
+                fb.fill_conic_gradient(
+                    rx,
+                    ry,
+                    bb.width,
+                    bb.height,
+                    radii,
+                    *from_deg,
+                    &norm,
+                    *repeating,
+                );
             }
             BackgroundImage::Url(u) => {
                 if let Some(img) = images.get(u) {
@@ -364,6 +384,31 @@ fn paint_box(
                 }
             }
             _ => {}
+        }
+
+        let pb_in = b.dims.padding_box();
+        let in_radii = [
+            (radii[0] - b.dims.border.left.max(b.dims.border.top)).max(0.0),
+            (radii[1] - b.dims.border.right.max(b.dims.border.top)).max(0.0),
+            (radii[2] - b.dims.border.right.max(b.dims.border.bottom)).max(0.0),
+            (radii[3] - b.dims.border.left.max(b.dims.border.bottom)).max(0.0),
+        ];
+        for sh in &b.style.box_shadow {
+            if sh.inset {
+                fb.draw_box_shadow(
+                    pb_in.x + dx,
+                    pb_in.y + dy,
+                    pb_in.width,
+                    pb_in.height,
+                    in_radii,
+                    sh.offset_x,
+                    sh.offset_y,
+                    sh.blur_radius,
+                    sh.spread_radius,
+                    to_rgba(sh.color).with_alpha(alpha),
+                    true,
+                );
+            }
         }
 
         let widths = [

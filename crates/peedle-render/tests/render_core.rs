@@ -406,3 +406,57 @@ fn svg_current_color_use_symbol_and_evenodd_render() {
     let hole_px = ((40 * 100 + 40) * 4) as usize;
     assert_eq!((fb.data[hole_px], fb.data[hole_px + 1], fb.data[hole_px + 2]), (0, 0, 0));
 }
+
+#[test]
+fn conic_gradient_and_inset_box_shadow_render() {
+    let html = r##"<!DOCTYPE html>
+        <style>
+            body { margin: 0; background: #ffffff; }
+            #wheel {
+                width: 80px; height: 80px;
+                background-image: conic-gradient(#ff0000 0% 50%, #0000ff 50% 100%);
+            }
+            #well {
+                width: 80px; height: 60px;
+                background-color: #ffffff;
+                box-shadow: inset 0 10px 0 0 #10b981;
+            }
+        </style>
+        <div id="wheel"></div>
+        <div id="well"></div>
+    "##;
+    let doc = parse_html(html);
+    let mut sheets = Vec::new();
+    for nid in doc.descendants(doc.root) {
+        if let Some(el) = doc.element(nid) {
+            if el.tag_is("style") {
+                sheets.push(peedle_css::parse_stylesheet(&doc.text_content(nid)));
+            }
+        }
+    }
+    let styles = peedle_css::compute_styles(
+        &doc,
+        &sheets,
+        peedle_css::Viewport {
+            width: 100.0,
+            height: 160.0,
+            dark_mode: false,
+        },
+    );
+    let tree = peedle_layout::layout_document(&doc, &styles, &std::collections::HashMap::new(), 100.0, 160.0);
+    let fonts = FontSystem::load_system_fonts();
+    let images = peedle_render::ImageCache::new();
+    let canvases = std::collections::HashMap::new();
+    let mut fb = Framebuffer::new(100, 160);
+    peedle_render::paint_layout(&doc, &tree, &mut fb, &fonts, &images, &canvases, 0.0, 0.0);
+
+    let right_half = ((40 * 100 + 65) * 4) as usize;
+    assert!(fb.data[right_half] > 200 && fb.data[right_half + 2] < 50);
+    let left_half = ((40 * 100 + 15) * 4) as usize;
+    assert!(fb.data[left_half + 2] > 200 && fb.data[left_half] < 50);
+
+    let inset_top = ((84 * 100 + 40) * 4) as usize;
+    assert_eq!((fb.data[inset_top], fb.data[inset_top + 1], fb.data[inset_top + 2]), (16, 185, 129));
+    let inset_center = ((110 * 100 + 40) * 4) as usize;
+    assert_eq!((fb.data[inset_center], fb.data[inset_center + 1], fb.data[inset_center + 2]), (255, 255, 255));
+}
