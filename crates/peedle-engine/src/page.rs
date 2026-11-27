@@ -7,7 +7,7 @@ use peedle_net::HttpClient;
 use peedle_render::{paint_layout, DecodedImage, FontSystem, Framebuffer, ImageCache};
 use peedle_url::Url;
 
-use crate::internal_pages::render_internal_page;
+use crate::internal_pages::{render_history_html, render_internal_page};
 
 #[derive(Clone, Debug)]
 pub struct NetworkEntry {
@@ -147,6 +147,22 @@ impl Page {
         self.hovered_node = None;
         self.hovered_href = None;
         self.active_node = None;
+
+        if target == "peedle://history" {
+            let pairs: Vec<(String, String)> = self
+                .history
+                .iter()
+                .map(|h| (h.url.clone(), h.title.clone()))
+                .collect();
+            let html = render_history_html(&pairs);
+            self.url = target.to_string();
+            self.base_url = None;
+            self.load_html_string(&html, target);
+            if push_history {
+                self.push_history_entry();
+            }
+            return Ok(());
+        }
 
         if let Some((_title, html)) = render_internal_page(target) {
             self.url = target.to_string();
@@ -647,6 +663,36 @@ impl Page {
             self.sync_console_from_js();
         }
         true
+    }
+
+    pub fn hovered_cursor(&self) -> peedle_css::Cursor {
+        if self.hovered_href.is_some() {
+            return peedle_css::Cursor::Pointer;
+        }
+        let Some(nid) = self.hovered_node else {
+            return peedle_css::Cursor::Default;
+        };
+        let st = self.js_env.dom.borrow();
+        if let Some(cs) = st.styles.get(nid) {
+            if cs.cursor != peedle_css::Cursor::Auto {
+                return cs.cursor;
+            }
+        }
+        if let Some(el) = st.doc.element(nid) {
+            if el.is_html() {
+                if el.tag_is("button") || el.tag_is("summary") || el.tag_is("select") {
+                    return peedle_css::Cursor::Pointer;
+                }
+                if el.tag_is("input") || el.tag_is("textarea") {
+                    let ty = el.get_attr("type").unwrap_or("text").to_ascii_lowercase();
+                    if matches!(ty.as_str(), "submit" | "button" | "reset" | "checkbox" | "radio") {
+                        return peedle_css::Cursor::Pointer;
+                    }
+                    return peedle_css::Cursor::Text;
+                }
+            }
+        }
+        peedle_css::Cursor::Default
     }
 
     pub fn on_click(&mut self, vx: f32, vy: f32) -> Option<String> {

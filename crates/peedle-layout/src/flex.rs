@@ -506,12 +506,23 @@ pub fn layout_flex_container(
     };
     let min_h = resolve_dim(&style.min_height, &own_ctx_h, cb_height);
     let max_h = resolve_dim(&style.max_height, &own_ctx_h, cb_height);
+    let pb_v = engine.tree.get(id).dims.padding.vertical() + engine.tree.get(id).dims.border.vertical();
     let mut clamped_h = final_h;
     if let Some(mh) = min_h {
-        clamped_h = clamped_h.max(mh);
+        let mh_c = if style.box_sizing == peedle_css::BoxSizing::BorderBox {
+            (mh - pb_v).max(0.0)
+        } else {
+            mh
+        };
+        clamped_h = clamped_h.max(mh_c);
     }
     if let Some(xh) = max_h {
-        clamped_h = clamped_h.min(xh);
+        let xh_c = if style.box_sizing == peedle_css::BoxSizing::BorderBox {
+            (xh - pb_v).max(0.0)
+        } else {
+            xh
+        };
+        clamped_h = clamped_h.min(xh_c);
     }
     engine.tree.get_mut(id).dims.content.height = clamped_h;
 

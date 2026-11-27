@@ -1317,9 +1317,11 @@ fn define_observers_and_misc(rt: &mut JsRuntime, dom: SharedDom, global: ObjectI
         Rc::new(move |rt, _, args| {
             let html = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
             let parsed = parse_html(&html);
-            let frag_id = {
+            let parsed_title = parsed.title();
+            let (frag_id, head_id) = {
                 let mut st = d.borrow_mut();
                 let root = st.doc.create_fragment();
+                let head_frag = st.doc.create_fragment();
                 if let Some(body) = parsed.body() {
                     let inner = parsed.inner_html(body);
                     let nodes = peedle_html::parse_fragment_into(
@@ -1332,12 +1334,33 @@ fn define_observers_and_misc(rt: &mut JsRuntime, dom: SharedDom, global: ObjectI
                         st.doc.append_child(root, n);
                     }
                 }
-                root
+                (root, head_frag)
             };
             let wrapper = rt.create_object();
             let body_obj = wrap_node(rt, &d, frag_id);
+            let head_obj = wrap_node(rt, &d, head_id);
             let _ = rt.set_property(wrapper, "body", JsValue::Object(body_obj));
+            let _ = rt.set_property(wrapper, "head", JsValue::Object(head_obj));
             let _ = rt.set_property(wrapper, "documentElement", JsValue::Object(body_obj));
+            let _ = rt.set_property(wrapper, "title", JsValue::String(parsed_title));
+            if let Ok(qs) = rt.get_property(body_obj, "querySelector") {
+                let b = body_obj;
+                let qs_wrap = rt.create_native_function(
+                    "querySelector",
+                    1,
+                    Rc::new(move |rt, _, args| rt.call_function(qs.clone(), JsValue::Object(b), args)),
+                );
+                let _ = rt.set_property(wrapper, "querySelector", JsValue::Object(qs_wrap));
+            }
+            if let Ok(qsa) = rt.get_property(body_obj, "querySelectorAll") {
+                let b = body_obj;
+                let qsa_wrap = rt.create_native_function(
+                    "querySelectorAll",
+                    1,
+                    Rc::new(move |rt, _, args| rt.call_function(qsa.clone(), JsValue::Object(b), args)),
+                );
+                let _ = rt.set_property(wrapper, "querySelectorAll", JsValue::Object(qsa_wrap));
+            }
             Ok(JsValue::Object(wrapper))
         }),
     );
@@ -1518,4 +1541,52 @@ fn define_crypto(rt: &mut JsRuntime, global: ObjectId) {
     let _ = rt.set_property(subtle, "digest", JsValue::Object(digest_fn));
     let _ = rt.set_property(crypto_obj, "subtle", JsValue::Object(subtle));
     let _ = rt.set_property(global, "crypto", JsValue::Object(crypto_obj));
+
+    let xpath_res = rt.create_object();
+    let _ = rt.set_property(xpath_res, "ANY_TYPE", JsValue::Number(0.0));
+    let _ = rt.set_property(xpath_res, "NUMBER_TYPE", JsValue::Number(1.0));
+    let _ = rt.set_property(xpath_res, "STRING_TYPE", JsValue::Number(2.0));
+    let _ = rt.set_property(xpath_res, "BOOLEAN_TYPE", JsValue::Number(3.0));
+    let _ = rt.set_property(xpath_res, "UNORDERED_NODE_ITERATOR_TYPE", JsValue::Number(4.0));
+    let _ = rt.set_property(xpath_res, "ORDERED_NODE_ITERATOR_TYPE", JsValue::Number(5.0));
+    let _ = rt.set_property(xpath_res, "UNORDERED_NODE_SNAPSHOT_TYPE", JsValue::Number(6.0));
+    let _ = rt.set_property(xpath_res, "ORDERED_NODE_SNAPSHOT_TYPE", JsValue::Number(7.0));
+    let _ = rt.set_property(xpath_res, "ANY_UNORDERED_NODE_TYPE", JsValue::Number(8.0));
+    let _ = rt.set_property(xpath_res, "FIRST_ORDERED_NODE_TYPE", JsValue::Number(9.0));
+    let _ = rt.set_property(global, "XPathResult", JsValue::Object(xpath_res));
+
+    let xpath_proto = rt.create_object();
+    let eval_fn = rt.create_native_function(
+        "evaluate",
+        5,
+        Rc::new(|rt, _, _| {
+            let res = rt.create_object();
+            let next_fn = rt.create_native_function("iterateNext", 0, Rc::new(|_, _, _| Ok(JsValue::Null)));
+            let snap_fn = rt.create_native_function("snapshotItem", 1, Rc::new(|_, _, _| Ok(JsValue::Null)));
+            let _ = rt.set_property(res, "iterateNext", JsValue::Object(next_fn));
+            let _ = rt.set_property(res, "snapshotItem", JsValue::Object(snap_fn));
+            let _ = rt.set_property(res, "snapshotLength", JsValue::Number(0.0));
+            let _ = rt.set_property(res, "singleNodeValue", JsValue::Null);
+            let _ = rt.set_property(res, "resultType", JsValue::Number(4.0));
+            Ok(JsValue::Object(res))
+        }),
+    );
+    let create_expr_fn = rt.create_native_function(
+        "createExpression",
+        2,
+        Rc::new(move |rt, _, _| {
+            let expr = rt.create_object();
+            let _ = rt.set_property(expr, "evaluate", JsValue::Object(eval_fn));
+            Ok(JsValue::Object(expr))
+        }),
+    );
+    let _ = rt.set_property(xpath_proto, "evaluate", JsValue::Object(eval_fn));
+    let _ = rt.set_property(xpath_proto, "createExpression", JsValue::Object(create_expr_fn));
+    let xpath_ctor = rt.create_native_constructor(
+        "XPathEvaluator",
+        0,
+        xpath_proto,
+        Rc::new(move |rt, _, _| Ok(JsValue::Object(rt.create_object_with_proto(Some(xpath_proto))))),
+    );
+    let _ = rt.set_property(global, "XPathEvaluator", JsValue::Object(xpath_ctor));
 }

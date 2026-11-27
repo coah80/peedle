@@ -329,3 +329,94 @@ fn real_vue3_computed_todo_workflow() {
         Some("1 pending")
     );
 }
+
+#[test]
+fn real_d3_generates_svg_bar_chart() {
+    let d3_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/libs/d3.min.js");
+    if !d3_path.exists() {
+        return;
+    }
+    let d3_src = std::fs::read_to_string(&d3_path).unwrap();
+    let mut env = new_env(r#"<!DOCTYPE html><html><body><div id="chart"></div></body></html>"#);
+    env.eval(&d3_src).unwrap();
+    let out = env
+        .eval(
+            r#"
+        const data = [10, 25, 40, 15, 30];
+        const x = d3.scaleBand().domain(d3.range(data.length)).range([0, 200]).padding(0.1);
+        const y = d3.scaleLinear().domain([0, d3.max(data)]).range([100, 0]);
+        const svg = d3.select('#chart').append('svg').attr('width', 200).attr('height', 100);
+        svg.selectAll('rect')
+            .data(data)
+            .join('rect')
+            .attr('class', 'bar')
+            .attr('x', (d, i) => x(i))
+            .attr('y', d => y(d))
+            .attr('width', x.bandwidth())
+            .attr('height', d => 100 - y(d));
+        const rects = document.querySelectorAll('#chart svg rect.bar');
+        rects.length + ':' + rects[2].getAttribute('height') + ':' + d3.sum(data);
+    "#,
+        )
+        .unwrap();
+    assert_eq!(out.as_str(), Some("5:100:120"));
+}
+
+#[test]
+fn real_alpine_reactive_counter() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/libs/alpine.min.js");
+    if !path.exists() {
+        return;
+    }
+    let alpine_src = std::fs::read_to_string(&path).unwrap();
+    let mut env = new_env(
+        r#"<!DOCTYPE html><html><body>
+            <div id="box" x-data="{ count: 1, label: 'Peedle' }">
+                <span id="out" x-text="label + ':' + count"></span>
+                <button id="inc" @click="count++">Up</button>
+            </div>
+        </body></html>"#,
+    );
+    env.eval(&alpine_src).unwrap();
+    env.eval("if (window.Alpine && !window.Alpine._started) { Alpine.start(); }").unwrap();
+    let before = env
+        .eval("document.getElementById('out').textContent")
+        .unwrap();
+    assert_eq!(before.as_str(), Some("Peedle:1"));
+    env.eval("document.getElementById('inc').click();").unwrap();
+    let after = env
+        .eval("document.getElementById('out').textContent")
+        .unwrap();
+    assert_eq!(after.as_str(), Some("Peedle:2"));
+}
+
+#[test]
+fn real_htmx_boots_and_handles_events() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/libs/htmx.min.js");
+    if !path.exists() {
+        return;
+    }
+    let htmx_src = std::fs::read_to_string(&path).unwrap();
+    let mut env = new_env(
+        r#"<!DOCTYPE html><html><head></head><body>
+            <div id="panel"><button id="btn" class="action">Go</button><div id="target">old</div></div>
+        </body></html>"#,
+    );
+    env.eval(&htmx_src).unwrap();
+    env.dom.borrow_mut().ready_state = "complete".to_string();
+    env.dispatch_dom_event(None, "DOMContentLoaded", true, false).unwrap();
+    let out = env
+        .eval(
+            r#"
+        let fired = 0;
+        const btn = htmx.find('#btn');
+        htmx.on(btn, 'custom-ping', () => { fired += 1; });
+        htmx.addClass(btn, 'active');
+        htmx.trigger(btn, 'custom-ping');
+        htmx.swap('#target', '<span>swapped</span>', { swapStyle: 'innerHTML' });
+        htmx.version.split('.')[0] + ':' + fired + ':' + btn.classList.contains('active') + ':' + htmx.find('#target span').textContent;
+    "#,
+        )
+        .unwrap();
+    assert_eq!(out.as_str(), Some("2:1:true:swapped"));
+}

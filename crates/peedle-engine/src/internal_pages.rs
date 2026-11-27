@@ -8,12 +8,50 @@ pub fn render_internal_page(url: &str) -> Option<(String, String)> {
             "About Peedle".to_string(),
             ABOUT_HTML.to_string(),
         )),
+        "peedle://demo" => Some((
+            "Interactive Demo - Peedle".to_string(),
+            DEMO_HTML.to_string(),
+        )),
         "about:blank" => Some((
             "about:blank".to_string(),
             "<!DOCTYPE html><html><head><title>about:blank</title></head><body></body></html>".to_string(),
         )),
         _ => None,
     }
+}
+
+pub fn render_history_html(entries: &[(String, String)]) -> String {
+    let mut rows = String::new();
+    for (url, title) in entries.iter().rev() {
+        let esc_url = url
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        let esc_title = title
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        rows.push_str(&format!(
+            "<tr><td><a href=\"{}\">{}</a></td><td class=\"u\">{}</td></tr>",
+            esc_url, esc_title, esc_url
+        ));
+    }
+    if rows.is_empty() {
+        rows.push_str("<tr><td class=\"u\">No history entries yet.</td><td></td></tr>");
+    }
+    format!(
+        r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>History - Peedle</title><style>
+body {{ margin:0; padding:48px; background:#0f1117; color:#e6edf3; font-family:sans-serif; }}
+.card {{ max-width:780px; margin:0 auto; background:#171c26; border:1px solid #263042; border-radius:14px; padding:28px 32px; }}
+h1 {{ margin:0 0 16px 0; font-size:26px; color:#f8fafc; }}
+table {{ width:100%; border-collapse:collapse; }}
+td {{ padding:10px 8px; border-bottom:1px solid #263042; font-size:14px; }}
+a {{ color:#38bdf8; text-decoration:none; font-weight:600; }}
+td.u {{ color:#94a3b8; font-family:monospace; font-size:12px; }}
+</style></head><body><div class="card"><h1>Browsing History</h1><table>{}</table></div></body></html>"##,
+        rows
+    )
 }
 
 const NEWTAB_HTML: &str = r##"<!DOCTYPE html>
@@ -106,7 +144,7 @@ const NEWTAB_HTML: &str = r##"<!DOCTYPE html>
     <a class="tile" href="https://example.com"><div class="badge">E</div>Example</a>
     <a class="tile" href="https://news.ycombinator.com"><div class="badge">Y</div>Hacker News</a>
     <a class="tile" href="https://en.wikipedia.org/wiki/Web_browser"><div class="badge">W</div>Wikipedia</a>
-    <a class="tile" href="peedle://about"><div class="badge">P</div>About</a>
+    <a class="tile" href="peedle://demo"><div class="badge">D</div>Demo</a>
   </div>
 </body>
 </html>"##;
@@ -153,5 +191,100 @@ const ABOUT_HTML: &str = r##"<!DOCTYPE html>
       <tr><td class="k">Networking</td><td class="v">peedle-net (HTTP/1.1, rustls TLS, Cookies, WebSockets)</td></tr>
     </table>
   </div>
+</body>
+</html>"##;
+
+const DEMO_HTML: &str = r##"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Interactive Engine Demo</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 32px; background: #0f1117; color: #e6edf3; font-family: sans-serif; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+  h1 { margin: 0; font-size: 28px; color: #f8fafc; }
+  .pill { background: #1e293b; border: 1px solid #334155; border-radius: 999px; padding: 6px 14px; font-size: 12px; color: #38bdf8; font-family: monospace; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
+  .card { background: #171c26; border: 1px solid #263042; border-radius: 12px; padding: 20px; }
+  .label { font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
+  .metric { font-size: 32px; font-weight: 700; color: #f8fafc; margin-top: 6px; }
+  .accent { color: #38bdf8; }
+  .green { color: #4ade80; }
+  .panels { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; }
+  .controls { display: flex; gap: 10px; margin-top: 14px; align-items: center; }
+  button { background: #2563eb; color: #ffffff; border: 0; border-radius: 8px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  button.sec { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; }
+  canvas { display: block; border-radius: 8px; background: #0b0f17; margin-top: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <h1>Peedle Engine Demo</h1>
+    <div class="pill">100% Pure Rust Stack</div>
+  </div>
+  <div class="grid">
+    <div class="card"><div class="label">Conformance</div><div class="metric green">Acid 1/2/3</div></div>
+    <div class="card"><div class="label">TC39 Test262</div><div class="metric accent">99%+</div></div>
+    <div class="card"><div class="label">Interactive Counter</div><div class="metric" id="counter">0</div></div>
+  </div>
+  <div class="panels">
+    <div class="card">
+      <div class="label">Canvas2D Live Chart</div>
+      <canvas id="chart" width="480" height="190"></canvas>
+      <div class="controls">
+        <button id="btn-inc" type="button">Increment +1</button>
+        <button id="btn-step" class="sec" type="button">Rotate Data</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">Inline SVG Vector Gauge</div>
+      <svg width="280" height="190" viewBox="0 0 280 190">
+        <rect x="10" y="14" width="260" height="162" rx="12" fill="#0b0f17" stroke="#263042" stroke-width="1"/>
+        <circle cx="140" cy="95" r="56" fill="none" stroke="#1e293b" stroke-width="14"/>
+        <path d="M 84 95 A 56 56 0 1 1 196 95" fill="none" stroke="#38bdf8" stroke-width="14"/>
+        <circle cx="140" cy="95" r="10" fill="#4ade80"/>
+      </svg>
+    </div>
+  </div>
+</div>
+<script>
+  let count = 0;
+  let bars = [62, 88, 74, 96, 82, 100];
+  const labels = ['URL', 'HTML', 'CSS', 'Lay', 'JS', 'DOM'];
+  function drawChart() {
+    const cv = document.getElementById('chart');
+    const ctx = cv.getContext('2d');
+    ctx.fillStyle = '#0b0f17';
+    ctx.fillRect(0, 0, 480, 190);
+    ctx.strokeStyle = '#1e293b';
+    for (let y = 30; y <= 150; y += 40) {
+      ctx.beginPath();
+      ctx.moveTo(20, y);
+      ctx.lineTo(460, y);
+      ctx.stroke();
+    }
+    const colors = ['#38bdf8', '#818cf8', '#34d399', '#fbbf24', '#f472b6', '#22d3ee'];
+    for (let i = 0; i < bars.length; i++) {
+      const h = Math.round(bars[i] * 1.3);
+      const x = 36 + i * 72;
+      const y = 165 - h;
+      ctx.fillStyle = colors[i % colors.length];
+      ctx.fillRect(x, y, 42, h);
+    }
+  }
+  document.getElementById('btn-inc').addEventListener('click', () => {
+    count += 1;
+    document.getElementById('counter').textContent = String(count);
+    console.log('Counter clicked:', count);
+  });
+  document.getElementById('btn-step').addEventListener('click', () => {
+    bars.push(bars.shift());
+    drawChart();
+  });
+  drawChart();
+</script>
 </body>
 </html>"##;

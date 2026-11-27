@@ -105,7 +105,24 @@ fn import_subtree(src: &Document, id: NodeId, dst: &mut Document) -> NodeId {
     use crate::dom::NodeData;
     let new_id = match &src.node(id).data {
         NodeData::Element(e) => {
-            dst.create_element_ns(e.tag_name.clone(), e.namespace, e.attributes.clone())
+            let nid = dst.create_element_ns(e.tag_name.clone(), e.namespace, e.attributes.clone());
+            if let Some(src_tc) = e.template_contents {
+                let dst_tc = match dst.element(nid).and_then(|el| el.template_contents) {
+                    Some(tc) => tc,
+                    None => {
+                        let tc = dst.create_fragment();
+                        if let Some(el) = dst.element_mut(nid) {
+                            el.template_contents = Some(tc);
+                        }
+                        tc
+                    }
+                };
+                for child in src.children(src_tc) {
+                    let c = import_subtree(src, child, dst);
+                    dst.append_child(dst_tc, c);
+                }
+            }
+            nid
         }
         NodeData::Text(s) => dst.create_text(s.clone()),
         NodeData::Comment(s) => dst.create_comment(s.clone()),

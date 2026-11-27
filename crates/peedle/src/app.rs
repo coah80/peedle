@@ -9,7 +9,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use crate::chrome::{
     content_viewport_height, draw_chrome, hit_test_chrome, top_chrome_height, Bookmark, ChromeHit,
@@ -27,6 +27,7 @@ pub struct BrowserApp {
     cursor_x: f32,
     cursor_y: f32,
     modifiers: ModifiersState,
+    scrollbar_dragging: bool,
     width: u32,
     height: u32,
 }
@@ -45,6 +46,7 @@ impl BrowserApp {
             cursor_x: 0.0,
             cursor_y: 0.0,
             modifiers: ModifiersState::empty(),
+            scrollbar_dragging: false,
             width: 1280,
             height: 800,
         };
@@ -116,8 +118,10 @@ impl BrowserApp {
     }
 
     fn open_new_tab(&mut self, url: &str) {
-        let vh = content_viewport_height(self.height as f32, &self.chrome);
-        let mut page = Page::new(self.width as f32, vh);
+        let z = self.chrome.zoom.clamp(0.5, 2.0);
+        let vw = (self.width as f32 / z).max(200.0);
+        let vh = (content_viewport_height(self.height as f32, &self.chrome) / z).max(100.0);
+        let mut page = Page::new(vw, vh);
         if url != "peedle://newtab" {
             let _ = page.navigate(url);
         }
@@ -142,11 +146,67 @@ impl BrowserApp {
     }
 
     fn resize_all_tabs(&mut self) {
-        let w = self.width as f32;
-        let vh = content_viewport_height(self.height as f32, &self.chrome);
+        let z = self.chrome.zoom.clamp(0.5, 2.0);
+        let w = (self.width as f32 / z).max(200.0);
+        let vh = (content_viewport_height(self.height as f32, &self.chrome) / z).max(100.0);
         for tab in &mut self.tabs {
             tab.resize(w, vh);
         }
+    }
+
+    fn scroll_to_scrollbar_y(&mut self, y: f32) {
+        let top_h = top_chrome_height(&self.chrome);
+        let vh = content_viewport_height(self.height as f32, &self.chrome);
+        let ratio = ((y - top_h) / vh.max(1.0)).clamp(0.0, 1.0);
+        let page = self.active_page_mut();
+        let content_h = page.js_env.dom.borrow().layout.content_height;
+        let max_scroll = (content_h - page.viewport_h).max(0.0);
+        page.scroll_y = ratio * max_scroll;
+        page.scroll_by(0.0, 0.0);
+    }
+
+    fn update_cursor_icon(&self) {
+        let Some(ref win) = self.window else {
+            return;
+        };
+        let hit = hit_test_chrome(
+            self.cursor_x,
+            self.cursor_y,
+            self.width as f32,
+            self.height as f32,
+            self.tabs.len(),
+            &self.chrome,
+        );
+        let icon = match hit {
+            ChromeHit::Tab(_)
+            | ChromeHit::CloseTab(_)
+            | ChromeHit::NewTab
+            | ChromeHit::Back
+            | ChromeHit::Forward
+            | ChromeHit::Reload
+            | ChromeHit::ToggleBookmark
+            | ChromeHit::BookmarkItem(_)
+            | ChromeHit::ToggleDevTools
+            | ChromeHit::DevToolsTab(_) => CursorIcon::Pointer,
+            ChromeHit::Omnibox | ChromeHit::ConsoleInput | ChromeHit::FindInput => CursorIcon::Text,
+            ChromeHit::Content => match self.active_page().hovered_cursor() {
+                peedle_css::Cursor::Pointer => CursorIcon::Pointer,
+                peedle_css::Cursor::Text | peedle_css::Cursor::VerticalText => CursorIcon::Text,
+                peedle_css::Cursor::Move => CursorIcon::Move,
+                peedle_css::Cursor::Grab => CursorIcon::Grab,
+                peedle_css::Cursor::Grabbing => CursorIcon::Grabbing,
+                peedle_css::Cursor::NotAllowed | peedle_css::Cursor::NoDrop => CursorIcon::NotAllowed,
+                peedle_css::Cursor::Crosshair => CursorIcon::Crosshair,
+                peedle_css::Cursor::Wait => CursorIcon::Wait,
+                peedle_css::Cursor::Progress => CursorIcon::Progress,
+                peedle_css::Cursor::Help => CursorIcon::Help,
+                peedle_css::Cursor::ZoomIn => CursorIcon::ZoomIn,
+                peedle_css::Cursor::ZoomOut => CursorIcon::ZoomOut,
+                _ => CursorIcon::Default,
+            },
+            ChromeHit::Scrollbar | ChromeHit::None => CursorIcon::Default,
+        };
+        win.set_cursor(icon);
     }
 
     fn render(&mut self) {
@@ -155,7 +215,10 @@ impl BrowserApp {
         }
         let top_h = top_chrome_height(&self.chrome);
         let vh = content_viewport_height(self.height as f32, &self.chrome);
-        let mut page_fb = Framebuffer::new(self.width, vh.ceil() as u32);
+        let z = self.chrome.zoom.clamp(0.5, 2.0);
+        let pw = (self.width as f32 / z).ceil().max(1.0) as u32;
+        let ph = (vh / z).ceil().max(1.0) as u32;
+        let mut page_fb = Framebuffer::new(pw, ph);
         self.tabs[self.active_tab].render_to_framebuffer(&mut page_fb);
 
         let mut full_fb = Framebuffer::new(self.width, self.height);
@@ -171,8 +234,8 @@ impl BrowserApp {
             &page_fb.data,
             0.0,
             top_h,
-            page_fb.width as f32,
-            page_fb.height as f32,
+            self.width as f32,
+            vh,
             1.0,
         );
         full_fb.pop_clip();
@@ -240,15 +303,22 @@ impl ApplicationHandler for BrowserApp {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_x = position.x as f32;
                 self.cursor_y = position.y as f32;
-                let cx = self.cursor_x;
+                if self.scrollbar_dragging {
+                    self.scroll_to_scrollbar_y(self.cursor_y);
+                    self.request_redraw();
+                    return;
+                }
+                let z = self.chrome.zoom.clamp(0.5, 2.0);
+                let cx = self.cursor_x / z;
                 let top_h = top_chrome_height(&self.chrome);
                 if self.cursor_y >= top_h {
-                    let vy = self.cursor_y - top_h;
-                    let vh = content_viewport_height(self.height as f32, &self.chrome);
+                    let vy = (self.cursor_y - top_h) / z;
+                    let vh = content_viewport_height(self.height as f32, &self.chrome) / z;
                     if vy < vh && self.active_page_mut().on_mouse_move(cx, vy) {
                         self.request_redraw();
                     }
                 }
+                self.update_cursor_icon();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
@@ -257,6 +327,13 @@ impl ApplicationHandler for BrowserApp {
                 };
                 self.active_page_mut().scroll_by(dx, dy);
                 self.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.scrollbar_dragging = false;
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -322,9 +399,14 @@ impl ApplicationHandler for BrowserApp {
                     ChromeHit::FindInput => {
                         self.chrome.find_open = true;
                     }
+                    ChromeHit::Scrollbar => {
+                        self.scrollbar_dragging = true;
+                        self.scroll_to_scrollbar_y(self.cursor_y);
+                    }
                     ChromeHit::Content => {
-                        let cx = self.cursor_x;
-                        let vy = self.cursor_y - top_chrome_height(&self.chrome);
+                        let z = self.chrome.zoom.clamp(0.5, 2.0);
+                        let cx = self.cursor_x / z;
+                        let vy = (self.cursor_y - top_chrome_height(&self.chrome)) / z;
                         if self.active_page_mut().on_click(cx, vy).is_some() {
                             self.sync_omnibox();
                             self.sync_window_title();
@@ -339,7 +421,42 @@ impl ApplicationHandler for BrowserApp {
                     return;
                 }
                 let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
+                let alt = self.modifiers.alt_key();
+                if alt {
+                    match event.logical_key {
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            let _ = self.active_page_mut().go_back();
+                            self.sync_omnibox();
+                            self.sync_window_title();
+                            self.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            let _ = self.active_page_mut().go_forward();
+                            self.sync_omnibox();
+                            self.sync_window_title();
+                            self.request_redraw();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 if ctrl {
+                    if matches!(event.logical_key, Key::Named(NamedKey::Tab)) && self.tabs.len() > 1 {
+                        if self.modifiers.shift_key() {
+                            self.active_tab = if self.active_tab == 0 {
+                                self.tabs.len() - 1
+                            } else {
+                                self.active_tab - 1
+                            };
+                        } else {
+                            self.active_tab = (self.active_tab + 1) % self.tabs.len();
+                        }
+                        self.sync_omnibox();
+                        self.sync_window_title();
+                        self.request_redraw();
+                        return;
+                    }
                     if let Key::Character(ref ch) = event.logical_key {
                         match ch.to_ascii_lowercase().as_str() {
                             "t" => {
@@ -384,6 +501,43 @@ impl ApplicationHandler for BrowserApp {
                                 self.chrome.console_focused = false;
                                 self.request_redraw();
                                 return;
+                            }
+                            "h" => {
+                                let _ = self.active_page_mut().navigate("peedle://history");
+                                self.sync_omnibox();
+                                self.sync_window_title();
+                                self.request_redraw();
+                                return;
+                            }
+                            "=" | "+" => {
+                                self.chrome.zoom = (self.chrome.zoom + 0.1).min(2.0);
+                                self.resize_all_tabs();
+                                self.request_redraw();
+                                return;
+                            }
+                            "-" => {
+                                self.chrome.zoom = (self.chrome.zoom - 0.1).max(0.5);
+                                self.resize_all_tabs();
+                                self.request_redraw();
+                                return;
+                            }
+                            "0" => {
+                                self.chrome.zoom = 1.0;
+                                self.resize_all_tabs();
+                                self.request_redraw();
+                                return;
+                            }
+                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                                if let Ok(n) = ch.parse::<usize>() {
+                                    let idx = n.saturating_sub(1);
+                                    if idx < self.tabs.len() {
+                                        self.active_tab = idx;
+                                        self.sync_omnibox();
+                                        self.sync_window_title();
+                                        self.request_redraw();
+                                        return;
+                                    }
+                                }
                             }
                             _ => {}
                         }

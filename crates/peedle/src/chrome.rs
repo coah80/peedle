@@ -35,6 +35,7 @@ pub enum ChromeHit {
     DevToolsTab(DevToolsTab),
     ConsoleInput,
     FindInput,
+    Scrollbar,
     Content,
     None,
 }
@@ -52,6 +53,7 @@ pub struct ChromeState {
     pub find_query: String,
     pub find_match_count: usize,
     pub find_match_index: usize,
+    pub zoom: f32,
 }
 
 impl Default for ChromeState {
@@ -75,7 +77,15 @@ impl Default for ChromeState {
                 },
                 Bookmark {
                     title: "Wikipedia".to_string(),
-                    url: "https://en.wikipedia.org/wiki/Web_browser".to_string(),
+                    url: "https://en.wikipedia.org/wiki/Rust_(programming_language)".to_string(),
+                },
+                Bookmark {
+                    title: "Demo".to_string(),
+                    url: "peedle://demo".to_string(),
+                },
+                Bookmark {
+                    title: "History".to_string(),
+                    url: "peedle://history".to_string(),
                 },
                 Bookmark {
                     title: "About Peedle".to_string(),
@@ -86,6 +96,7 @@ impl Default for ChromeState {
             find_query: String::new(),
             find_match_count: 0,
             find_match_index: 0,
+            zoom: 1.0,
         }
     }
 }
@@ -192,6 +203,10 @@ pub fn hit_test_chrome(
             }
             return ChromeHit::None;
         }
+    }
+
+    if x >= win_w - 12.0 && y >= top_h && y < top_h + content_viewport_height(win_h, chrome) {
+        return ChromeHit::Scrollbar;
     }
 
     ChromeHit::Content
@@ -310,6 +325,20 @@ pub fn draw_chrome(
     );
     if chrome.omnibox_focused {
         fb.fill_rect(end_x + 1.0, omni_y + 6.0, 1.5, 18.0, accent);
+    }
+
+    if (chrome.zoom - 1.0).abs() > 0.01 {
+        let ztxt = format!("{}%", (chrome.zoom * 100.0).round() as i32);
+        fb.fill_rounded_rect(dt_x - 84.0, omni_y + 5.0, 44.0, 20.0, [5.0; 4], RgbaColor::new(30, 58, 95, 255));
+        fonts.draw_text(
+            fb,
+            &ztxt,
+            dt_x - 77.0,
+            omni_y + 18.5,
+            FontFaceKey::MonoBold,
+            10.5,
+            accent,
+        );
     }
 
     let is_bookmarked = chrome.bookmarks.iter().any(|b| b.url == page.url);
