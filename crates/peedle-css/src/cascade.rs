@@ -2060,6 +2060,10 @@ fn apply_longhand(
                     "super" => VerticalAlign::Super,
                     _ => return,
                 };
+            } else if let Some(lpa) = resolve_lpa_for_style(trimmed, ctx, false) {
+                if let Some(px) = lpa.resolve(ctx) {
+                    style.vertical_align = VerticalAlign::Length(px);
+                }
             }
         }
         "background-color" => {
@@ -2118,11 +2122,23 @@ fn apply_longhand(
         "background-position" => {
             let g = split_whitespace_groups(trimmed);
             if let Some(first) = g.first() {
-                style.background_position_x = parse_bg_pos_axis(first, ctx, true);
-                style.background_position_y = g
-                    .get(1)
-                    .map(|t| parse_bg_pos_axis(t, ctx, false))
-                    .unwrap_or(LengthPercentageAuto::Percent(50.0));
+                let first_kw = single_ident_lower(first);
+                let second_kw = g.get(1).and_then(|t| single_ident_lower(t));
+                let first_is_y = matches!(first_kw.as_deref(), Some("top" | "bottom"));
+                let second_is_x = matches!(second_kw.as_deref(), Some("left" | "right"));
+                if g.len() == 1 && first_is_y {
+                    style.background_position_x = LengthPercentageAuto::Percent(50.0);
+                    style.background_position_y = parse_bg_pos_axis(first, ctx, false);
+                } else if g.len() >= 2 && (first_is_y || second_is_x) {
+                    style.background_position_x = parse_bg_pos_axis(g[1], ctx, true);
+                    style.background_position_y = parse_bg_pos_axis(first, ctx, false);
+                } else {
+                    style.background_position_x = parse_bg_pos_axis(first, ctx, true);
+                    style.background_position_y = g
+                        .get(1)
+                        .map(|t| parse_bg_pos_axis(t, ctx, false))
+                        .unwrap_or(LengthPercentageAuto::Percent(50.0));
+                }
             }
         }
         "background-attachment" => {

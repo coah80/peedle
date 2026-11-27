@@ -354,7 +354,7 @@ impl OverflowWrap {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum VerticalAlign {
     #[default]
     Baseline,
@@ -365,6 +365,7 @@ pub enum VerticalAlign {
     TextBottom,
     Sub,
     Super,
+    Length(f32),
 }
 
 impl VerticalAlign {
@@ -378,6 +379,14 @@ impl VerticalAlign {
             VerticalAlign::TextBottom => "text-bottom",
             VerticalAlign::Sub => "sub",
             VerticalAlign::Super => "super",
+            VerticalAlign::Length(_) => "0px",
+        }
+    }
+
+    pub fn to_css_string(self) -> String {
+        match self {
+            VerticalAlign::Length(px) => format_px(px),
+            other => other.as_css_str().to_string(),
         }
     }
 }
@@ -1472,7 +1481,7 @@ input, textarea, select {
     background-color: #ffffff;
     color: #000000;
 }
-input[type=hidden] { display: none; }
+input[type=hidden i] { display: none; }
 textarea { white-space: pre-wrap; }
 fieldset { border: 2px groove #c0c0c0; padding: 0.35em 0.75em 0.625em; margin: 0 2px; }
 details:not([open]) > :not(summary) { display: none; }

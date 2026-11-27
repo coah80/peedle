@@ -515,15 +515,62 @@ impl Page {
     }
 
     pub fn recompute_if_needed(&mut self) {
-        {
+        let font_reqs: Vec<(String, String)> = {
             let mut st = self.js_env.dom.borrow_mut();
             st.dark_mode = self.dark_mode;
+            let visited_urls: std::collections::HashSet<String> =
+                st.subdoc_urls.values().cloned().collect();
+            if !visited_urls.is_empty() {
+                let mut changed = false;
+                let ids: Vec<NodeId> = st.doc.descendants(st.doc.root);
+                for nid in ids {
+                    let href_opt = st
+                        .doc
+                        .element(nid)
+                        .filter(|e| e.is_html() && e.tag_is("a") && !e.visited)
+                        .and_then(|e| e.get_attr("href").map(|s| s.to_string()));
+                    if let Some(href) = href_opt {
+                        let resolved = self.resolve_subresource_url(&href).unwrap_or_else(|| href.clone());
+                        if visited_urls.contains(&href) || visited_urls.contains(&resolved) {
+                            if let Some(el) = st.doc.element_mut(nid) {
+                                el.visited = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    st.dirty_style = true;
+                }
+            }
             st.ensure_layout();
+            let mut out = Vec::new();
+            for ff in &st.styles.font_faces {
+                if let Some(ref fam) = ff.font_family {
+                    for src in &ff.src {
+                        if let Some(resolved) = self.resolve_subresource_url(src) {
+                            if !self.failed_images.contains(&resolved) {
+                                out.push((fam.clone(), resolved));
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+        for (fam, url) in font_reqs {
+            self.failed_images.insert(url.clone());
+            if let Ok(resp) = self.client.get(&url) {
+                if resp.status < 400 {
+                    let _ = self.fonts.register_web_font(&fam, &resp.body);
+                }
+            }
         }
         self.clamp_scroll();
     }
 
     pub fn render_to_framebuffer(&mut self, fb: &mut Framebuffer) {
+        self.fetch_missing_images();
         self.recompute_if_needed();
         let st = self.js_env.dom.borrow();
         paint_layout(

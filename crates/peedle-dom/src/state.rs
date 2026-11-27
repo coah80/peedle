@@ -295,10 +295,20 @@ impl DomState {
             self.dirty_layout = true;
         }
         if self.dirty_layout {
+            let mut effective_sizes = self.image_sizes.clone();
+            for &host_id in self.sub_documents.keys() {
+                if let Some(el) = self.doc.element(host_id) {
+                    if el.is_html() && el.tag_is("object") {
+                        if let Some(d) = el.get_attr("data") {
+                            effective_sizes.entry(d.to_string()).or_insert((0, 0));
+                        }
+                    }
+                }
+            }
             self.layout = layout_document(
                 &self.doc,
                 &self.styles,
-                &self.image_sizes,
+                &effective_sizes,
                 self.viewport_w,
                 self.viewport_h,
             );

@@ -240,10 +240,11 @@ fn paint_box(
                             peedle_css::BackgroundRepeat::RepeatY => (false, true),
                             _ => (true, true),
                         };
+                        let pb = b.dims.padding_box();
                         let (area_x, area_y, area_w, area_h) = if b.style.background_attachment_fixed {
                             (0.0f32, 0.0f32, fb.width as f32, fb.height as f32)
                         } else {
-                            (rx, ry, bb.width, bb.height)
+                            (pb.x + dx, pb.y + dy, pb.width, pb.height)
                         };
                         let ctx_x = CalcContext {
                             font_size: b.style.font_size,
@@ -513,6 +514,9 @@ fn paint_replaced(
     h: f32,
     alpha: f32,
 ) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
     match rep {
         ReplacedKind::Image { url, .. } => {
             if let Some(img) = images.get(url) {

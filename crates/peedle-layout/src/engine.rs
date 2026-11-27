@@ -124,6 +124,7 @@ pub struct LayoutEngine {
     pub viewport_h: f32,
     pub root_font_size: f32,
     float_ctx: FloatContext,
+    positioned_cb_stack: Vec<LayoutBoxId>,
 }
 
 pub fn layout_document(
@@ -154,6 +155,7 @@ pub fn layout_document(
         viewport_h,
         root_font_size,
         float_ctx: FloatContext::default(),
+        positioned_cb_stack: Vec::new(),
     };
 
     if let Some(root_el) = doc.document_element() {
@@ -309,12 +311,15 @@ impl LayoutEngine {
                 }
 
                 let child_source = el.shadow_root.unwrap_or(node_id);
-                let mut li_counter = 0usize;
-                for child in doc.children(child_source) {
-                    if doc.element(child).map_or(false, |e| e.tag_is("li")) {
-                        li_counter += 1;
+                let skip_fallback_children = el.is_html() && el.tag_is("iframe");
+                if !skip_fallback_children {
+                    let mut li_counter = 0usize;
+                    for child in doc.children(child_source) {
+                        if doc.element(child).map_or(false, |e| e.tag_is("li")) {
+                            li_counter += 1;
+                        }
+                        raw_children.extend(self.build_box(doc, styles, image_sizes, child, li_counter));
                     }
-                    raw_children.extend(self.build_box(doc, styles, image_sizes, child, li_counter));
                 }
 
                 if let Some(after_style) = styles.after(node_id) {
@@ -379,7 +384,10 @@ impl LayoutEngine {
         children: Vec<LayoutBoxId>,
         parent_style: &ComputedStyle,
     ) -> Vec<LayoutBoxId> {
-        let has_block = children.iter().any(|&cid| self.is_block_level(cid));
+        let has_block = children.iter().any(|&cid| {
+            let cb = self.tree.get(cid);
+            cb.style.float == Float::None && self.is_block_level(cid)
+        });
         if !has_block {
             return children;
         }
@@ -562,6 +570,11 @@ impl LayoutEngine {
             b.dims.content = Rect::new(content_x, content_y, content_w, 0.0);
         }
 
+        let is_positioned_cb = style.position != Position::Static;
+        if is_positioned_cb {
+            self.positioned_cb_stack.push(id);
+        }
+
         match kind {
             BoxKind::Replaced(rep) => {
                 let (rw, rh) = self.resolve_replaced_size(&rep, &style, cb_width, cb_height);
@@ -582,7 +595,10 @@ impl LayoutEngine {
             }
             _ => {
                 let children = self.tree.get(id).children.clone();
-                let has_block_children = children.iter().any(|&cid| self.is_block_level(cid));
+                let has_block_children = children.iter().any(|&cid| {
+                    let cb = self.tree.get(cid);
+                    cb.style.float == Float::None && self.is_block_level(cid)
+                });
                 let explicit_h = self.resolve_explicit_height(&style, cb_height);
                 let is_root = self.tree.root == Some(id);
                 let child_cb_h = explicit_h.unwrap_or(if is_root { cb_height } else { -1.0 });
@@ -659,6 +675,10 @@ impl LayoutEngine {
                 }
                 self.tree.get_mut(id).dims.content.height = final_h.max(0.0);
             }
+        }
+
+        if is_positioned_cb {
+            self.positioned_cb_stack.pop();
         }
     }
 
@@ -888,6 +908,8 @@ impl LayoutEngine {
                            line_l: f32,
                            line_r: f32,
                            cur_end_x: f32,
+                           line_top_y: f32,
+                           cur_line_h: &mut f32,
                            align: TextAlign| {
             let used = (cur_end_x - line_l).max(0.0);
             let avail = (line_r - line_l).max(0.0);
@@ -906,6 +928,52 @@ impl LayoutEngine {
                     engine.translate_subtree(bid, shift, 0.0);
                 }
             }
+            let has_valign_offset = box_refs.iter().any(|&bid| {
+                matches!(
+                    engine.tree.get(bid).style.vertical_align,
+                    peedle_css::VerticalAlign::Length(_)
+                        | peedle_css::VerticalAlign::Bottom
+                        | peedle_css::VerticalAlign::Middle
+                )
+            });
+            if has_valign_offset && !box_refs.is_empty() {
+                let baseline_y = line_top_y + *cur_line_h;
+                let mut min_top = line_top_y;
+                let mut max_bot = line_top_y + *cur_line_h;
+                for &bid in box_refs.iter() {
+                    let va = engine.tree.get(bid).style.vertical_align;
+                    let mb = engine.tree.get(bid).dims.margin_box();
+                    let target_y = match va {
+                        peedle_css::VerticalAlign::Length(off) => baseline_y - off - mb.height,
+                        peedle_css::VerticalAlign::Bottom => baseline_y - mb.height,
+                        peedle_css::VerticalAlign::Middle => {
+                            line_top_y + (*cur_line_h - mb.height) * 0.5
+                        }
+                        _ => mb.y,
+                    };
+                    let dy = target_y - mb.y;
+                    if dy.abs() > 0.01 {
+                        engine.translate_subtree(bid, 0.0, dy);
+                    }
+                    let new_mb = engine.tree.get(bid).dims.margin_box();
+                    min_top = min_top.min(new_mb.y);
+                    max_bot = max_bot.max(new_mb.bottom());
+                }
+                if min_top < line_top_y - 0.01 {
+                    let down = line_top_y - min_top;
+                    for &(tid, fidx) in text_refs.iter() {
+                        if let Some(frag) = engine.tree.get_mut(tid).text_fragments.get_mut(fidx) {
+                            frag.y += down;
+                            frag.baseline += down;
+                        }
+                    }
+                    for &bid in box_refs.iter() {
+                        engine.translate_subtree(bid, 0.0, down);
+                    }
+                    max_bot += down;
+                }
+                *cur_line_h = (*cur_line_h).max(max_bot - line_top_y);
+            }
             text_refs.clear();
             box_refs.clear();
         };
@@ -917,6 +985,46 @@ impl LayoutEngine {
                 self.layout_out_of_flow(item_id, container_id);
                 continue;
             }
+            if item_style.float != Float::None {
+                self.layout_box(
+                    item_id,
+                    content_w,
+                    cb_height,
+                    content_x,
+                    cur_y,
+                    SizeConstraint::Available(content_w),
+                );
+                let mb = self.tree.get(item_id).dims.margin_box();
+                let (target_x, target_y) = self.float_ctx.place_float(
+                    item_style.float,
+                    cur_y,
+                    mb.width,
+                    mb.height,
+                    content_x,
+                    content_x + content_w,
+                );
+                self.translate_subtree(item_id, target_x - mb.x, target_y - mb.y);
+                let final_mb = self.tree.get(item_id).dims.margin_box();
+                self.float_ctx.floats.push(FloatRect {
+                    side: item_style.float,
+                    x: final_mb.x,
+                    y: final_mb.y,
+                    width: final_mb.width,
+                    height: final_mb.height,
+                });
+                let (nl, nr) = self.float_ctx.available_span(
+                    cur_y,
+                    line_h.max(base_line_h),
+                    content_x,
+                    content_x + content_w,
+                );
+                line_left = nl;
+                line_right = nr;
+                if cur_x < line_left {
+                    cur_x = line_left;
+                }
+                continue;
+            }
             match item_kind {
                 BoxKind::Replaced(ReplacedKind::Br) => {
                     finish_line(
@@ -926,6 +1034,8 @@ impl LayoutEngine {
                         line_left,
                         line_right,
                         cur_x,
+                        cur_y,
+                        &mut line_h,
                         container_style.text_align,
                     );
                     cur_y += line_h;
@@ -1022,6 +1132,8 @@ impl LayoutEngine {
                                 line_left,
                                 line_right,
                                 cur_x,
+                                cur_y,
+                                &mut line_h,
                                 container_style.text_align,
                             );
                             cur_y += line_h;
@@ -1095,6 +1207,8 @@ impl LayoutEngine {
                                 line_left,
                                 line_right,
                                 cur_x,
+                                cur_y,
+                                &mut line_h,
                                 container_style.text_align,
                             );
                             cur_y += line_h;
@@ -1152,6 +1266,8 @@ impl LayoutEngine {
                             line_left,
                             line_right,
                             cur_x,
+                            cur_y,
+                            &mut line_h,
                             container_style.text_align,
                         );
                         cur_y += line_h;
@@ -1198,6 +1314,8 @@ impl LayoutEngine {
                 line_left,
                 line_right,
                 cur_x,
+                cur_y,
+                &mut line_h,
                 container_style.text_align,
             );
             cur_y += line_h;
@@ -1260,12 +1378,14 @@ impl LayoutEngine {
         }
     }
 
-    pub fn layout_out_of_flow(&mut self, id: LayoutBoxId, container_id: LayoutBoxId) {
+    pub fn layout_out_of_flow(&mut self, id: LayoutBoxId, _container_id: LayoutBoxId) {
         let style = self.tree.get(id).style.clone();
         let cb = if style.position == Position::Fixed {
             Rect::new(0.0, 0.0, self.viewport_w, self.viewport_h)
+        } else if let Some(&cb_id) = self.positioned_cb_stack.last() {
+            self.tree.get(cb_id).dims.padding_box()
         } else {
-            self.tree.get(container_id).dims.padding_box()
+            Rect::new(0.0, 0.0, self.viewport_w, self.viewport_h)
         };
         let ctx_w = self.calc_ctx(&style, cb.width);
         let ctx_h = self.calc_ctx(&style, cb.height);

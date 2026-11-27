@@ -2223,6 +2223,7 @@ pub fn load_subdocument_with_scripts(dom: &SharedDom, host_id: NodeId) -> Vec<St
         Skip,
     }
 
+    let mut resolved_loaded_url: Option<String> = None;
     let payload = if let Some(ref raw) = url_attr {
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed == "about:blank" {
@@ -2236,6 +2237,7 @@ pub fn load_subdocument_with_scripts(dom: &SharedDom, host_id: NodeId) -> Vec<St
             if let Some(u) = resolved {
                 match client.get(&u) {
                     Ok(resp) if resp.status < 400 => {
+                        resolved_loaded_url = Some(u.clone());
                         let ct = resp.content_type().to_ascii_lowercase();
                         let path_part = u.split('?').next().unwrap_or(&u).to_ascii_lowercase();
                         let is_img_bin = (ct.starts_with("image/") && !ct.contains("svg"))
@@ -2277,6 +2279,9 @@ pub fn load_subdocument_with_scripts(dom: &SharedDom, host_id: NodeId) -> Vec<St
     };
 
     let mut st = dom.borrow_mut();
+    if let Some(loaded_u) = resolved_loaded_url {
+        st.subdoc_urls.insert(host_id, loaded_u);
+    }
     match payload {
         SubdocPayload::Skip => {
             st.sub_documents.remove(&host_id);

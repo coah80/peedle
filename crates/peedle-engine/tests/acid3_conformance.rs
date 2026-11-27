@@ -10,10 +10,10 @@ use peedle_engine::Page;
 
 fn mime_for_acid_file(name: &str) -> &'static str {
     match name {
-        "acid3.html" | "empty.html" | "reference.html" => "text/html; charset=utf-8",
+        "acid3.html" | "empty.html" | "reference.html" | "support-b.png" => "text/html; charset=utf-8",
         "empty.css" => "text/html; charset=utf-8",
         "empty.txt" => "text/plain; charset=utf-8",
-        "empty.png" | "test.html" => "image/png",
+        "empty.png" | "test.html" | "support-c.png" => "image/png",
         "empty.xml" => "application/xml; charset=utf-8",
         "svg.xml" => "image/svg+xml; charset=utf-8",
         "xhtml.1" | "xhtml.2" | "xhtml.3" => "application/xhtml+xml; charset=utf-8",

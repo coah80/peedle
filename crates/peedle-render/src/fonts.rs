@@ -15,11 +15,13 @@ pub enum FontFaceKey {
     SerifBold,
     MonoRegular,
     MonoBold,
+    Custom(usize),
 }
 
 #[derive(Clone)]
 pub struct FontSystem {
     faces: HashMap<FontFaceKey, Arc<Font>>,
+    custom_names: Vec<(String, FontFaceKey)>,
     glyph_cache: Arc<Mutex<HashMap<(FontFaceKey, char, u32), (Metrics, Vec<u8>)>>>,
 }
 
@@ -107,14 +109,35 @@ impl FontSystem {
 
         Self {
             faces,
+            custom_names: Vec::new(),
             glyph_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn register_web_font(&mut self, family: &str, bytes: &[u8]) -> bool {
+        let norm = family.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+        if norm.is_empty() {
+            return false;
+        }
+        if self.custom_names.iter().any(|(n, _)| n == &norm) {
+            return true;
+        }
+        if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+            let key = FontFaceKey::Custom(self.custom_names.len());
+            self.faces.insert(key, Arc::new(font));
+            self.custom_names.push((norm, key));
+            return true;
+        }
+        false
     }
 
     pub fn select_face(&self, families: &[String], weight: u16, italic: bool) -> FontFaceKey {
         let bold = weight >= 600;
         for fam in families {
             let low = fam.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+            if let Some((_, key)) = self.custom_names.iter().find(|(n, _)| n == &low) {
+                return *key;
+            }
             if low.contains("mono")
                 || low.contains("courier")
                 || low.contains("consolas")
