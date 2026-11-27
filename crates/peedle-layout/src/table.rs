@@ -31,7 +31,7 @@ pub fn layout_table(
 
     let mut num_cols = 0usize;
     for (_, cells) in &row_entries {
-        let cols_in_row: usize = cells.iter().map(|(_, cs)| *cs).sum();
+        let cols_in_row: usize = cells.iter().map(|(_, cs)| if *cs == 0 { 1 } else { *cs }).sum();
         num_cols = num_cols.max(cols_in_row);
     }
 
@@ -45,6 +45,9 @@ pub fn layout_table(
     for (_, cells) in &row_entries {
         let mut col = 0usize;
         for &(cid, colspan) in cells {
+            if colspan == 0 {
+                continue;
+            }
             if colspan == 1 && col < num_cols {
                 let cs = engine.tree.get(cid).style.clone();
                 let cctx = engine.calc_ctx(&cs, table_w);
@@ -118,9 +121,10 @@ pub fn layout_table(
         let mut row_h = 0.0f32;
 
         for &(cid, colspan) in cells {
-            let end_col = (col + colspan).min(num_cols);
+            let eff_span = if colspan == 0 { num_cols } else { colspan };
+            let end_col = (col + eff_span).min(num_cols);
             let cell_w: f32 = col_widths[col..end_col].iter().sum::<f32>()
-                + sx * (colspan.saturating_sub(1) as f32);
+                + sx * (eff_span.saturating_sub(1) as f32);
             engine.layout_box(
                 cid,
                 table_w,
@@ -188,6 +192,12 @@ fn collect_table_rows_and_cells(
             BoxKind::Text(ref t) if t.trim().is_empty() => {}
             BoxKind::TableCell { colspan, .. } => {
                 anon_cells.push((cid, colspan.max(1)));
+            }
+            _ if engine.tree.get(cid).style.display == peedle_css::Display::TableCaption => {
+                if !anon_cells.is_empty() {
+                    out.push((None, std::mem::take(&mut anon_cells)));
+                }
+                out.push((None, vec![(cid, 0)]));
             }
             _ => {
                 anon_cells.push((cid, 1));

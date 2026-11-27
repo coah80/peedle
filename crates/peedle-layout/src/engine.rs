@@ -1596,30 +1596,74 @@ impl LayoutEngine {
                 let ctx_g = self.calc_ctx(&style, cb_width);
                 let gap = style.column_gap.resolve_or(&ctx_g, 0.0).max(0.0);
                 let mut total = 0.0f32;
-                let mut count = 0usize;
+                let mut px_count = 0usize;
+                let mut total_tracks = 0usize;
                 for tr in &style.grid_template_columns {
                     match tr {
                         peedle_css::GridTrackSize::Px(v) => {
                             total += *v;
-                            count += 1;
+                            px_count += 1;
+                            total_tracks += 1;
                         }
                         peedle_css::GridTrackSize::Repeat(peedle_css::GridRepeatCount::Count(n), inner) => {
                             for _ in 0..*n {
                                 for it in inner {
+                                    total_tracks += 1;
                                     if let peedle_css::GridTrackSize::Px(v) = it {
                                         total += *v;
-                                        count += 1;
+                                        px_count += 1;
                                     }
                                 }
                             }
                         }
-                        _ => {}
+                        _ => {
+                            total_tracks += 1;
+                        }
                     }
                 }
-                if count > 0 {
-                    total + gap * (count.saturating_sub(1) as f32)
+                if px_count > 0 && px_count == total_tracks {
+                    total + gap * (px_count.saturating_sub(1) as f32)
                 } else {
-                    cb_width
+                    let kids = self.tree.get(id).children.clone();
+                    let cols = total_tracks.max(1);
+                    let mut col_widths = vec![0.0f32; cols];
+                    let mut col_idx = 0usize;
+                    let mut non_empty_kids = 0usize;
+                    let mut inline_sum = 0.0f32;
+                    for cid in kids {
+                        let cs = self.tree.get(cid).style.clone();
+                        if matches!(cs.position, Position::Absolute | Position::Fixed) {
+                            continue;
+                        }
+                        let cw = self.measure_intrinsic_width(cid, cb_width);
+                        let extra = if matches!(self.tree.get(cid).kind, BoxKind::Text(_)) {
+                            0.0
+                        } else {
+                            let cctx = self.calc_ctx(&cs, cb_width);
+                            cs.padding_left.resolve_or(&cctx, 0.0)
+                                + cs.padding_right.resolve_or(&cctx, 0.0)
+                                + cs.border_left_width
+                                + cs.border_right_width
+                                + cs.margin_left.resolve_or(&cctx, 0.0)
+                                + cs.margin_right.resolve_or(&cctx, 0.0)
+                        };
+                        let w = cw + extra;
+                        let c = col_idx % cols;
+                        col_widths[c] = col_widths[c].max(w);
+                        col_idx += 1;
+                        non_empty_kids += 1;
+                        inline_sum += w;
+                    }
+                    if total_tracks > 0 {
+                        let active = col_widths.iter().filter(|&&w| w > 0.0).count();
+                        let sum: f32 = col_widths.iter().sum();
+                        let gaps = gap * (active.saturating_sub(1) as f32);
+                        (sum + gaps).max(total)
+                    } else if non_empty_kids > 0 {
+                        inline_sum + gap * (non_empty_kids.saturating_sub(1) as f32)
+                    } else {
+                        0.0
+                    }
                 }
             }
             _ => {

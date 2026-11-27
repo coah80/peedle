@@ -5,7 +5,7 @@ pub mod images;
 pub mod paint;
 pub mod svg;
 
-pub use canvas2d::Canvas2D;
+pub use canvas2d::{Canvas2D, CanvasTextAlign, CanvasTextBaseline};
 pub use fonts::{FontFaceKey, FontSystem};
 pub use framebuffer::{Affine2D, ClipRect, Framebuffer, RgbaColor};
 pub use images::{DecodedImage, ImageCache};

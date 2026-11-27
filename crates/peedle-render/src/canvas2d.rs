@@ -1,6 +1,21 @@
 use crate::fonts::{FontFaceKey, FontSystem};
 use crate::framebuffer::{Affine2D, Framebuffer, RgbaColor};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasTextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasTextBaseline {
+    Alphabetic,
+    Top,
+    Middle,
+    Bottom,
+}
+
 #[derive(Clone, Debug)]
 pub struct CanvasState {
     pub fill_style: RgbaColor,
@@ -9,6 +24,8 @@ pub struct CanvasState {
     pub global_alpha: f32,
     pub font_size: f32,
     pub font_key: FontFaceKey,
+    pub text_align: CanvasTextAlign,
+    pub text_baseline: CanvasTextBaseline,
     pub transform: Affine2D,
 }
 
@@ -21,6 +38,8 @@ impl Default for CanvasState {
             global_alpha: 1.0,
             font_size: 10.0,
             font_key: FontFaceKey::SansRegular,
+            text_align: CanvasTextAlign::Left,
+            text_baseline: CanvasTextBaseline::Alphabetic,
             transform: Affine2D::identity(),
         }
     }
@@ -313,7 +332,19 @@ impl Canvas2D {
     }
 
     pub fn fill_text(&mut self, fonts: &FontSystem, text: &str, x: f32, y: f32) {
-        let (tx, ty) = self.state.transform.apply(x, y);
+        let (mut tx, mut ty) = self.state.transform.apply(x, y);
+        let tw = fonts.measure_text(text, self.state.font_key, self.state.font_size);
+        match self.state.text_align {
+            CanvasTextAlign::Left => {}
+            CanvasTextAlign::Center => tx -= tw * 0.5,
+            CanvasTextAlign::Right => tx -= tw,
+        }
+        match self.state.text_baseline {
+            CanvasTextBaseline::Alphabetic => {}
+            CanvasTextBaseline::Top => ty += self.state.font_size * 0.8,
+            CanvasTextBaseline::Middle => ty += self.state.font_size * 0.35,
+            CanvasTextBaseline::Bottom => ty -= self.state.font_size * 0.2,
+        }
         let color = self.state.fill_style.with_alpha(self.state.global_alpha);
         fonts.draw_text(
             &mut self.fb,

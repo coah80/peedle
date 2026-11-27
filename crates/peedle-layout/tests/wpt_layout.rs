@@ -430,3 +430,50 @@ fn wpt_micro_clearfix_pseudo_after_table() {
     assert!(wrap.height >= 119.0, "micro-clearfix wrapper must enclose float: {:?}", wrap);
     assert!(after.y >= 119.0, "sibling after micro-clearfix must sit below float: {:?}", after);
 }
+
+#[test]
+fn wpt_inline_grid_button_shrinks_to_fit() {
+    let (doc, tree) = run_layout(
+        r#"<div id="row">
+            <a id="b1"><span>Bell</span><span>Notifications</span></a>
+            <a id="b2"><span>Fork</span><span>0</span></a>
+            <a id="b3"><span>Star</span><span>0</span></a>
+        </div>"#,
+        r#"
+            body { margin: 0; font-size: 14px; }
+            #row { display: flex; flex-wrap: wrap; gap: 8px; width: 800px; }
+            #row a {
+                display: inline-grid;
+                grid-template-columns: min-content minmax(0, auto);
+                column-gap: 6px;
+                padding: 4px 10px;
+            }
+        "#,
+        900.0,
+        400.0,
+    );
+    let b1 = tree.bounding_rect(doc.get_element_by_id("b1").unwrap()).unwrap();
+    let b2 = tree.bounding_rect(doc.get_element_by_id("b2").unwrap()).unwrap();
+    let b3 = tree.bounding_rect(doc.get_element_by_id("b3").unwrap()).unwrap();
+    assert!(b1.width < 250.0, "inline-grid button must shrink-to-fit: {:?}", b1);
+    assert!((b1.y - b2.y).abs() < 1.5 && (b2.y - b3.y).abs() < 1.5, "buttons must sit on one row: b1={:?} b2={:?} b3={:?}", b1, b2, b3);
+}
+
+#[test]
+fn wpt_table_caption_stacks_below_figure_content() {
+    let (doc, tree) = run_layout(
+        r#"<figure id="fig"><div id="pic"></div><figcaption id="cap">Caption text</figcaption></figure>"#,
+        r#"
+            body { margin: 0; }
+            #fig { display: table; }
+            #pic { width: 220px; height: 140px; }
+            #cap { display: table-caption; }
+        "#,
+        800.0,
+        600.0,
+    );
+    let pic = tree.bounding_rect(doc.get_element_by_id("pic").unwrap()).unwrap();
+    let cap = tree.bounding_rect(doc.get_element_by_id("cap").unwrap()).unwrap();
+    assert!(cap.y >= pic.bottom() - 1.0, "table-caption must stack below content: pic={:?} cap={:?}", pic, cap);
+    assert!(cap.width <= pic.width + 2.0, "caption must match figure width: pic={:?} cap={:?}", pic, cap);
+}
