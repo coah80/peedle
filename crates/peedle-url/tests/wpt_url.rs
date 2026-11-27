@@ -115,5 +115,5 @@ fn wpt_urltestdata_conformance() {
     for f in &failures {
         eprintln!("  {}", f);
     }
-    assert!(pct >= 80.0, "WPT URL pass rate too low: {:.1}%", pct);
+    assert_eq!(passed, total, "WPT URL pass rate regressed: {}/{}", passed, total);
 }

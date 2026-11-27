@@ -1,3 +1,5 @@
+use unicode_normalization::UnicodeNormalization;
+
 const BASE: u32 = 36;
 const TMIN: u32 = 1;
 const TMAX: u32 = 26;
@@ -149,20 +151,74 @@ pub fn punycode_decode(input: &str) -> Result<String, ()> {
     Ok(output.into_iter().collect())
 }
 
+fn is_uts46_ignored(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{1806}'
+            | '\u{180B}'..='\u{180D}'
+            | '\u{200B}'
+            | '\u{2060}'
+            | '\u{2064}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+    )
+}
+
+fn is_uts46_disallowed(c: char) -> bool {
+    let cp = c as u32;
+    matches!(
+        cp,
+        0x0000..=0x001F
+            | 0x007F..=0x009F
+            | 0x00A0
+            | 0x1680
+            | 0x2000..=0x200A
+            | 0x2028..=0x2029
+            | 0x202F
+            | 0x205F
+            | 0x3000
+            | 0xFDD0..=0xFDEF
+            | 0xFFFC..=0xFFFF
+    ) || (cp & 0xFFFF) >= 0xFFFE
+}
+
+fn map_uts46_char(c: char, out: &mut String) -> Result<(), ()> {
+    if is_uts46_ignored(c) {
+        return Ok(());
+    }
+    if is_uts46_disallowed(c) {
+        return Err(());
+    }
+    match c {
+        '\u{3002}' | '\u{FF0E}' | '\u{FF61}' => out.push('.'),
+        '\u{FF01}'..='\u{FF5E}' => {
+            let mapped = char::from_u32(c as u32 - 0xFEE0).ok_or(())?;
+            out.push(mapped.to_ascii_lowercase());
+        }
+        '\u{00DF}' => out.push('\u{00DF}'),
+        _ => {
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn domain_to_ascii(domain: &str, be_strict: bool) -> Result<String, ()> {
-    use unicode_normalization::UnicodeNormalization;
     if domain.is_empty() {
         return Ok(String::new());
     }
-    let normalized: String = domain
-        .chars()
-        .map(|c| match c {
-            '\u{3002}' | '\u{FF0E}' | '\u{FF61}' => '.',
-            _ => c,
-        })
-        .collect::<String>()
-        .nfc()
-        .collect();
+    let mut mapped = String::with_capacity(domain.len());
+    for c in domain.chars() {
+        map_uts46_char(c, &mut mapped)?;
+    }
+    let normalized: String = mapped.nfkc().collect();
+    if normalized.chars().any(is_uts46_disallowed) {
+        return Err(());
+    }
 
     let mut out_labels = Vec::new();
     for label in normalized.split('.') {
@@ -174,6 +230,9 @@ pub fn domain_to_ascii(domain: &str, be_strict: bool) -> Result<String, ()> {
         let ascii_label = if lower.is_ascii() {
             if lower.starts_with("xn--") {
                 let decoded = punycode_decode(&lower[4..])?;
+                if decoded.chars().any(is_uts46_disallowed) {
+                    return Err(());
+                }
                 let reencoded = punycode_encode(&decoded)?;
                 if reencoded != &lower[4..] && be_strict {
                     return Err(());

@@ -24,7 +24,7 @@ pub fn should_percent_encode(b: u8, set: EncodeSet) -> bool {
         }
         EncodeSet::Path => {
             is_c0_or_non_ascii(b)
-                || matches!(b, b' ' | b'"' | b'#' | b'<' | b'>' | b'?' | b'`' | b'{' | b'}')
+                || matches!(b, b' ' | b'"' | b'#' | b'<' | b'>' | b'?' | b'^' | b'`' | b'{' | b'}')
         }
         EncodeSet::UserInfo => {
             should_percent_encode(b, EncodeSet::Path)

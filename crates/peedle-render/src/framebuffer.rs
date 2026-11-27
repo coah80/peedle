@@ -1,0 +1,772 @@
+use image::{ImageBuffer, Rgba};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RgbaColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl RgbaColor {
+    pub const TRANSPARENT: Self = Self { r: 0, g: 0, b: 0, a: 0 };
+    pub const BLACK: Self = Self { r: 0, g: 0, b: 0, a: 255 };
+    pub const WHITE: Self = Self { r: 255, g: 255, b: 255, a: 255 };
+
+    pub const fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self { r, g, b, a }
+    }
+
+    pub fn with_alpha(self, alpha: f32) -> Self {
+        let a = ((self.a as f32) * alpha.clamp(0.0, 1.0)).round() as u8;
+        Self { a, ..self }
+    }
+
+    pub fn to_xrgb_u32(self) -> u32 {
+        ((self.r as u32) << 16) | ((self.g as u32) << 8) | (self.b as u32)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClipRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl ClipRect {
+    pub fn intersect(self, other: Self) -> Self {
+        let x1 = self.x.max(other.x);
+        let y1 = self.y.max(other.y);
+        let x2 = (self.x + self.w).min(other.x + other.w);
+        let y2 = (self.y + self.h).min(other.y + other.h);
+        Self {
+            x: x1,
+            y: y1,
+            w: (x2 - x1).max(0),
+            h: (y2 - y1).max(0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Affine2D {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl Default for Affine2D {
+    fn default() -> Self {
+        Self::identity()
+    }
+}
+
+impl Affine2D {
+    pub const fn identity() -> Self {
+        Self {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    pub fn translate(tx: f32, ty: f32) -> Self {
+        Self {
+            e: tx,
+            f: ty,
+            ..Self::identity()
+        }
+    }
+
+    pub fn scale(sx: f32, sy: f32) -> Self {
+        Self {
+            a: sx,
+            d: sy,
+            ..Self::identity()
+        }
+    }
+
+    pub fn rotate(rad: f32) -> Self {
+        let (sin, cos) = rad.sin_cos();
+        Self {
+            a: cos,
+            b: sin,
+            c: -sin,
+            d: cos,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    pub fn mul(self, rhs: Self) -> Self {
+        Self {
+            a: self.a * rhs.a + self.c * rhs.b,
+            b: self.b * rhs.a + self.d * rhs.b,
+            c: self.a * rhs.c + self.c * rhs.d,
+            d: self.b * rhs.c + self.d * rhs.d,
+            e: self.a * rhs.e + self.c * rhs.f + self.e,
+            f: self.b * rhs.e + self.d * rhs.f + self.f,
+        }
+    }
+
+    pub fn apply(self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Framebuffer {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+    clip_stack: Vec<ClipRect>,
+}
+
+impl Framebuffer {
+    pub fn new(width: u32, height: u32) -> Self {
+        let size = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        Self {
+            width,
+            height,
+            data: vec![0u8; size],
+            clip_stack: vec![ClipRect {
+                x: 0,
+                y: 0,
+                w: width as i32,
+                h: height as i32,
+            }],
+        }
+    }
+
+    pub fn clear(&mut self, color: RgbaColor) {
+        for px in self.data.chunks_exact_mut(4) {
+            px[0] = color.r;
+            px[1] = color.g;
+            px[2] = color.b;
+            px[3] = color.a;
+        }
+    }
+
+    pub fn current_clip(&self) -> ClipRect {
+        *self.clip_stack.last().unwrap()
+    }
+
+    pub fn push_clip(&mut self, rect: ClipRect) {
+        let merged = self.current_clip().intersect(rect);
+        self.clip_stack.push(merged);
+    }
+
+    pub fn pop_clip(&mut self) {
+        if self.clip_stack.len() > 1 {
+            self.clip_stack.pop();
+        }
+    }
+
+    #[inline]
+    pub fn blend_pixel(&mut self, x: i32, y: i32, color: RgbaColor) {
+        if color.a == 0 {
+            return;
+        }
+        let clip = self.current_clip();
+        if x < clip.x || y < clip.y || x >= clip.x + clip.w || y >= clip.y + clip.h {
+            return;
+        }
+        let idx = ((y as u32 * self.width + x as u32) * 4) as usize;
+        if idx + 3 >= self.data.len() {
+            return;
+        }
+        if color.a == 255 {
+            self.data[idx] = color.r;
+            self.data[idx + 1] = color.g;
+            self.data[idx + 2] = color.b;
+            self.data[idx + 3] = 255;
+            return;
+        }
+        let sa = color.a as u32;
+        let inv = 255 - sa;
+        let dr = self.data[idx] as u32;
+        let dg = self.data[idx + 1] as u32;
+        let db = self.data[idx + 2] as u32;
+        let da = self.data[idx + 3] as u32;
+        self.data[idx] = ((color.r as u32 * sa + dr * inv + 127) / 255) as u8;
+        self.data[idx + 1] = ((color.g as u32 * sa + dg * inv + 127) / 255) as u8;
+        self.data[idx + 2] = ((color.b as u32 * sa + db * inv + 127) / 255) as u8;
+        self.data[idx + 3] = (sa + (da * inv + 127) / 255).min(255) as u8;
+    }
+
+    pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: RgbaColor) {
+        if color.a == 0 || w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let clip = self.current_clip();
+        let x0 = (x.floor() as i32).max(clip.x);
+        let y0 = (y.floor() as i32).max(clip.y);
+        let x1 = ((x + w).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((y + h).ceil() as i32).min(clip.y + clip.h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        if color.a == 255 {
+            for py in y0..y1 {
+                let row = (py as u32 * self.width) as usize;
+                for px in x0..x1 {
+                    let idx = (row + px as usize) * 4;
+                    self.data[idx] = color.r;
+                    self.data[idx + 1] = color.g;
+                    self.data[idx + 2] = color.b;
+                    self.data[idx + 3] = 255;
+                }
+            }
+        } else {
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    self.blend_pixel(px, py, color);
+                }
+            }
+        }
+    }
+
+    pub fn fill_rounded_rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: [f32; 4],
+        color: RgbaColor,
+    ) {
+        if color.a == 0 || w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        if radii.iter().all(|&r| r <= 0.01) {
+            self.fill_rect(x, y, w, h, color);
+            return;
+        }
+        let clip = self.current_clip();
+        let x0 = (x.floor() as i32).max(clip.x);
+        let y0 = (y.floor() as i32).max(clip.y);
+        let x1 = ((x + w).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((y + h).ceil() as i32).min(clip.y + clip.h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let max_r = (w * 0.5).min(h * 0.5);
+        let r = [
+            radii[0].clamp(0.0, max_r),
+            radii[1].clamp(0.0, max_r),
+            radii[2].clamp(0.0, max_r),
+            radii[3].clamp(0.0, max_r),
+        ];
+        for py in y0..y1 {
+            let cy = py as f32 + 0.5;
+            for px in x0..x1 {
+                let cx = px as f32 + 0.5;
+                let dist = rounded_rect_sdf(cx, cy, x, y, w, h, r);
+                let cov = (0.5 - dist).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    self.blend_pixel(px, py, color.with_alpha(cov));
+                }
+            }
+        }
+    }
+
+    pub fn stroke_rounded_rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: [f32; 4],
+        widths: [f32; 4],
+        colors: [RgbaColor; 4],
+    ) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let uniform = widths[0] == widths[1]
+            && widths[1] == widths[2]
+            && widths[2] == widths[3]
+            && colors[0] == colors[1]
+            && colors[1] == colors[2]
+            && colors[2] == colors[3];
+
+        if uniform && widths[0] > 0.0 && radii.iter().any(|&r| r > 0.01) {
+            let bw = widths[0];
+            let clip = self.current_clip();
+            let x0 = (x.floor() as i32).max(clip.x);
+            let y0 = (y.floor() as i32).max(clip.y);
+            let x1 = ((x + w).ceil() as i32).min(clip.x + clip.w);
+            let y1 = ((y + h).ceil() as i32).min(clip.y + clip.h);
+            let max_r = (w * 0.5).min(h * 0.5);
+            let ro = [
+                radii[0].clamp(0.0, max_r),
+                radii[1].clamp(0.0, max_r),
+                radii[2].clamp(0.0, max_r),
+                radii[3].clamp(0.0, max_r),
+            ];
+            let ri = [
+                (ro[0] - bw).max(0.0),
+                (ro[1] - bw).max(0.0),
+                (ro[2] - bw).max(0.0),
+                (ro[3] - bw).max(0.0),
+            ];
+            let iw = (w - bw * 2.0).max(0.0);
+            let ih = (h - bw * 2.0).max(0.0);
+            for py in y0..y1 {
+                let cy = py as f32 + 0.5;
+                for px in x0..x1 {
+                    let cx = px as f32 + 0.5;
+                    let d_out = rounded_rect_sdf(cx, cy, x, y, w, h, ro);
+                    if d_out > 0.5 {
+                        continue;
+                    }
+                    let d_in = if iw > 0.0 && ih > 0.0 {
+                        rounded_rect_sdf(cx, cy, x + bw, y + bw, iw, ih, ri)
+                    } else {
+                        1.0
+                    };
+                    let cov_out = (0.5 - d_out).clamp(0.0, 1.0);
+                    let cov_in = (0.5 - d_in).clamp(0.0, 1.0);
+                    let cov = (cov_out - cov_in).clamp(0.0, 1.0);
+                    if cov > 0.0 {
+                        self.blend_pixel(px, py, colors[0].with_alpha(cov));
+                    }
+                }
+            }
+            return;
+        }
+
+        if widths[0] > 0.0 {
+            self.fill_rect(x, y, w, widths[0], colors[0]);
+        }
+        if widths[1] > 0.0 {
+            self.fill_rect(x + w - widths[1], y, widths[1], h, colors[1]);
+        }
+        if widths[2] > 0.0 {
+            self.fill_rect(x, y + h - widths[2], w, widths[2], colors[2]);
+        }
+        if widths[3] > 0.0 {
+            self.fill_rect(x, y, widths[3], h, colors[3]);
+        }
+    }
+
+    pub fn fill_linear_gradient(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: [f32; 4],
+        angle_deg: f32,
+        stops: &[(RgbaColor, f32)],
+        repeating: bool,
+    ) {
+        if w <= 0.0 || h <= 0.0 || stops.is_empty() {
+            return;
+        }
+        let clip = self.current_clip();
+        let x0 = (x.floor() as i32).max(clip.x);
+        let y0 = (y.floor() as i32).max(clip.y);
+        let x1 = ((x + w).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((y + h).ceil() as i32).min(clip.y + clip.h);
+        let rad = (angle_deg - 90.0).to_radians();
+        let dx = rad.cos();
+        let dy = rad.sin();
+        let cx0 = x + w * 0.5;
+        let cy0 = y + h * 0.5;
+        let half_len = ((w * dx.abs()) + (h * dy.abs())) * 0.5;
+        let len = (half_len * 2.0).max(1.0);
+        let max_r = (w * 0.5).min(h * 0.5);
+        let r = [
+            radii[0].clamp(0.0, max_r),
+            radii[1].clamp(0.0, max_r),
+            radii[2].clamp(0.0, max_r),
+            radii[3].clamp(0.0, max_r),
+        ];
+        let has_radius = r.iter().any(|&v| v > 0.01);
+
+        for py in y0..y1 {
+            let cy = py as f32 + 0.5;
+            for px in x0..x1 {
+                let cx = px as f32 + 0.5;
+                let cov = if has_radius {
+                    (0.5 - rounded_rect_sdf(cx, cy, x, y, w, h, r)).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                if cov <= 0.0 {
+                    continue;
+                }
+                let proj = (cx - cx0) * dx + (cy - cy0) * dy;
+                let mut t = (proj + half_len) / len;
+                if repeating {
+                    let span = (stops.last().unwrap().1 - stops[0].1).max(0.0001);
+                    t = stops[0].1 + (t - stops[0].1).rem_euclid(span);
+                }
+                let c = sample_gradient(stops, t);
+                self.blend_pixel(px, py, c.with_alpha(cov));
+            }
+        }
+    }
+
+    pub fn fill_radial_gradient(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: [f32; 4],
+        stops: &[(RgbaColor, f32)],
+        repeating: bool,
+    ) {
+        if w <= 0.0 || h <= 0.0 || stops.is_empty() {
+            return;
+        }
+        let clip = self.current_clip();
+        let x0 = (x.floor() as i32).max(clip.x);
+        let y0 = (y.floor() as i32).max(clip.y);
+        let x1 = ((x + w).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((y + h).ceil() as i32).min(clip.y + clip.h);
+        let cx0 = x + w * 0.5;
+        let cy0 = y + h * 0.5;
+        let rx = (w * 0.5).max(1.0);
+        let ry = (h * 0.5).max(1.0);
+        let max_r = rx.min(ry);
+        let r = [
+            radii[0].clamp(0.0, max_r),
+            radii[1].clamp(0.0, max_r),
+            radii[2].clamp(0.0, max_r),
+            radii[3].clamp(0.0, max_r),
+        ];
+        let has_radius = r.iter().any(|&v| v > 0.01);
+
+        for py in y0..y1 {
+            let cy = py as f32 + 0.5;
+            for px in x0..x1 {
+                let cx = px as f32 + 0.5;
+                let cov = if has_radius {
+                    (0.5 - rounded_rect_sdf(cx, cy, x, y, w, h, r)).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                if cov <= 0.0 {
+                    continue;
+                }
+                let nx = (cx - cx0) / rx;
+                let ny = (cy - cy0) / ry;
+                let mut t = (nx * nx + ny * ny).sqrt();
+                if repeating {
+                    let span = (stops.last().unwrap().1 - stops[0].1).max(0.0001);
+                    t = stops[0].1 + (t - stops[0].1).rem_euclid(span);
+                }
+                let c = sample_gradient(stops, t);
+                self.blend_pixel(px, py, c.with_alpha(cov));
+            }
+        }
+    }
+
+    pub fn draw_box_shadow(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: [f32; 4],
+        offset_x: f32,
+        offset_y: f32,
+        blur: f32,
+        spread: f32,
+        color: RgbaColor,
+        inset: bool,
+    ) {
+        if color.a == 0 || inset {
+            return;
+        }
+        let sx = x + offset_x - spread;
+        let sy = y + offset_y - spread;
+        let sw = (w + spread * 2.0).max(0.0);
+        let sh = (h + spread * 2.0).max(0.0);
+        let pad = blur.max(0.0);
+        let clip = self.current_clip();
+        let x0 = ((sx - pad).floor() as i32).max(clip.x);
+        let y0 = ((sy - pad).floor() as i32).max(clip.y);
+        let x1 = ((sx + sw + pad).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((sy + sh + pad).ceil() as i32).min(clip.y + clip.h);
+        let max_r = (sw * 0.5).min(sh * 0.5);
+        let sr = [
+            (radii[0] + spread).clamp(0.0, max_r),
+            (radii[1] + spread).clamp(0.0, max_r),
+            (radii[2] + spread).clamp(0.0, max_r),
+            (radii[3] + spread).clamp(0.0, max_r),
+        ];
+        let sigma = (blur * 0.5).max(0.5);
+        for py in y0..y1 {
+            let cy = py as f32 + 0.5;
+            for px in x0..x1 {
+                let cx = px as f32 + 0.5;
+                let dist = rounded_rect_sdf(cx, cy, sx, sy, sw, sh, sr);
+                let alpha = if blur <= 0.1 {
+                    (0.5 - dist).clamp(0.0, 1.0)
+                } else {
+                    let t = ((pad - dist) / (2.0 * sigma)).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t)
+                };
+                if alpha > 0.0 {
+                    self.blend_pixel(px, py, color.with_alpha(alpha));
+                }
+            }
+        }
+    }
+
+    pub fn draw_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: RgbaColor) {
+        if color.a == 0 || width <= 0.0 {
+            return;
+        }
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 0.001 {
+            let r = width * 0.5;
+            self.fill_rounded_rect(x0 - r, y0 - r, width, width, [r; 4], color);
+            return;
+        }
+        let half = width * 0.5;
+        let clip = self.current_clip();
+        let min_x = ((x0.min(x1) - half - 1.0).floor() as i32).max(clip.x);
+        let min_y = ((y0.min(y1) - half - 1.0).floor() as i32).max(clip.y);
+        let max_x = ((x0.max(x1) + half + 1.0).ceil() as i32).min(clip.x + clip.w);
+        let max_y = ((y0.max(y1) + half + 1.0).ceil() as i32).min(clip.y + clip.h);
+        let inv_len_sq = 1.0 / (len * len);
+        for py in min_y..max_y {
+            let cy = py as f32 + 0.5;
+            for px in min_x..max_x {
+                let cx = px as f32 + 0.5;
+                let t = (((cx - x0) * dx + (cy - y0) * dy) * inv_len_sq).clamp(0.0, 1.0);
+                let proj_x = x0 + t * dx;
+                let proj_y = y0 + t * dy;
+                let dist = ((cx - proj_x).powi(2) + (cy - proj_y).powi(2)).sqrt() - half;
+                let cov = (0.5 - dist).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    self.blend_pixel(px, py, color.with_alpha(cov));
+                }
+            }
+        }
+    }
+
+    pub fn fill_polygon(&mut self, contours: &[Vec<(f32, f32)>], color: RgbaColor, even_odd: bool) {
+        if color.a == 0 || contours.is_empty() {
+            return;
+        }
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for c in contours {
+            for &(_, y) in c {
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+        if !min_y.is_finite() || !max_y.is_finite() {
+            return;
+        }
+        let clip = self.current_clip();
+        let y0 = (min_y.floor() as i32).max(clip.y);
+        let y1 = (max_y.ceil() as i32).min(clip.y + clip.h);
+
+        let mut intersections: Vec<(f32, i32)> = Vec::new();
+        for py in y0..y1 {
+            let scan_y = py as f32 + 0.5;
+            intersections.clear();
+            for poly in contours {
+                if poly.len() < 2 {
+                    continue;
+                }
+                for i in 0..poly.len() {
+                    let (x1, y1p) = poly[i];
+                    let (x2, y2p) = poly[(i + 1) % poly.len()];
+                    if (y1p <= scan_y && y2p > scan_y) || (y2p <= scan_y && y1p > scan_y) {
+                        let t = (scan_y - y1p) / (y2p - y1p);
+                        let ix = x1 + t * (x2 - x1);
+                        let dir = if y2p > y1p { 1 } else { -1 };
+                        intersections.push((ix, dir));
+                    }
+                }
+            }
+            if intersections.is_empty() {
+                continue;
+            }
+            intersections.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if even_odd {
+                let mut i = 0;
+                while i + 1 < intersections.len() {
+                    let sx = (intersections[i].0.floor() as i32).max(clip.x);
+                    let ex = (intersections[i + 1].0.ceil() as i32).min(clip.x + clip.w);
+                    for px in sx..ex {
+                        self.blend_pixel(px, py, color);
+                    }
+                    i += 2;
+                }
+            } else {
+                let mut winding = 0i32;
+                let mut span_start = 0.0f32;
+                for &(ix, dir) in &intersections {
+                    let prev = winding;
+                    winding += dir;
+                    if prev == 0 && winding != 0 {
+                        span_start = ix;
+                    } else if prev != 0 && winding == 0 {
+                        let sx = (span_start.floor() as i32).max(clip.x);
+                        let ex = (ix.ceil() as i32).min(clip.x + clip.w);
+                        for px in sx..ex {
+                            self.blend_pixel(px, py, color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn blit_rgba(
+        &mut self,
+        src_w: u32,
+        src_h: u32,
+        src: &[u8],
+        dst_x: f32,
+        dst_y: f32,
+        dst_w: f32,
+        dst_h: f32,
+        opacity: f32,
+    ) {
+        if src_w == 0 || src_h == 0 || dst_w <= 0.0 || dst_h <= 0.0 || opacity <= 0.0 {
+            return;
+        }
+        let clip = self.current_clip();
+        let x0 = (dst_x.floor() as i32).max(clip.x);
+        let y0 = (dst_y.floor() as i32).max(clip.y);
+        let x1 = ((dst_x + dst_w).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((dst_y + dst_h).ceil() as i32).min(clip.y + clip.h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        for py in y0..y1 {
+            let v = ((py as f32 + 0.5 - dst_y) / dst_h).clamp(0.0, 0.9999);
+            let sy = ((v * src_h as f32) as u32).min(src_h - 1);
+            for px in x0..x1 {
+                let u = ((px as f32 + 0.5 - dst_x) / dst_w).clamp(0.0, 0.9999);
+                let sx = ((u * src_w as f32) as u32).min(src_w - 1);
+                let sidx = ((sy * src_w + sx) * 4) as usize;
+                if sidx + 3 < src.len() {
+                    let c = RgbaColor::new(src[sidx], src[sidx + 1], src[sidx + 2], src[sidx + 3])
+                        .with_alpha(opacity);
+                    self.blend_pixel(px, py, c);
+                }
+            }
+        }
+    }
+
+    pub fn blit_alpha_mask(
+        &mut self,
+        dst_x: i32,
+        dst_y: i32,
+        mask_w: usize,
+        mask_h: usize,
+        mask: &[u8],
+        color: RgbaColor,
+    ) {
+        if color.a == 0 || mask_w == 0 || mask_h == 0 {
+            return;
+        }
+        for my in 0..mask_h {
+            let py = dst_y + my as i32;
+            for mx in 0..mask_w {
+                let cov = mask[my * mask_w + mx];
+                if cov == 0 {
+                    continue;
+                }
+                let a = ((color.a as u32 * cov as u32 + 127) / 255) as u8;
+                self.blend_pixel(dst_x + mx as i32, py, RgbaColor::new(color.r, color.g, color.b, a));
+            }
+        }
+    }
+
+    pub fn to_xrgb_slice(&self, out: &mut [u32]) {
+        let count = (self.width as usize * self.height as usize).min(out.len());
+        for i in 0..count {
+            let idx = i * 4;
+            let r = self.data[idx] as u32;
+            let g = self.data[idx + 1] as u32;
+            let b = self.data[idx + 2] as u32;
+            out[i] = (r << 16) | (g << 8) | b;
+        }
+    }
+
+    pub fn save_png(&self, path: &std::path::Path) -> Result<(), String> {
+        let img: ImageBuffer<Rgba<u8>, _> =
+            ImageBuffer::from_raw(self.width, self.height, self.data.clone())
+                .ok_or_else(|| "framebuffer size mismatch".to_string())?;
+        img.save(path).map_err(|e| e.to_string())
+    }
+
+    pub fn encode_png(&self) -> Result<Vec<u8>, String> {
+        let img: ImageBuffer<Rgba<u8>, _> =
+            ImageBuffer::from_raw(self.width, self.height, self.data.clone())
+                .ok_or_else(|| "framebuffer size mismatch".to_string())?;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|e| e.to_string())?;
+        Ok(cursor.into_inner())
+    }
+}
+
+fn rounded_rect_sdf(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, r: [f32; 4]) -> f32 {
+    let cx = x + w * 0.5;
+    let cy = y + h * 0.5;
+    let dx = px - cx;
+    let dy = py - cy;
+    let radius = if dx >= 0.0 {
+        if dy >= 0.0 { r[2] } else { r[1] }
+    } else if dy >= 0.0 {
+        r[3]
+    } else {
+        r[0]
+    };
+    let qx = dx.abs() - (w * 0.5 - radius);
+    let qy = dy.abs() - (h * 0.5 - radius);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    let inside = qx.max(qy).min(0.0);
+    outside + inside - radius
+}
+
+fn sample_gradient(stops: &[(RgbaColor, f32)], t: f32) -> RgbaColor {
+    if stops.len() == 1 || t <= stops[0].1 {
+        return stops[0].0;
+    }
+    if t >= stops.last().unwrap().1 {
+        return stops.last().unwrap().0;
+    }
+    for win in stops.windows(2) {
+        let (c0, p0) = win[0];
+        let (c1, p1) = win[1];
+        if t >= p0 && t <= p1 {
+            let span = (p1 - p0).max(0.0001);
+            let f = ((t - p0) / span).clamp(0.0, 1.0);
+            return RgbaColor::new(
+                (c0.r as f32 + (c1.r as f32 - c0.r as f32) * f).round() as u8,
+                (c0.g as f32 + (c1.g as f32 - c0.g as f32) * f).round() as u8,
+                (c0.b as f32 + (c1.b as f32 - c0.b as f32) * f).round() as u8,
+                (c0.a as f32 + (c1.a as f32 - c0.a as f32) * f).round() as u8,
+            );
+        }
+    }
+    stops.last().unwrap().0
+}

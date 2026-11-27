@@ -204,6 +204,12 @@ fn ends_in_number(input: &str) -> bool {
     if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) {
         return true;
     }
+    if last.len() >= 2
+        && (last.starts_with("0x") || last.starts_with("0X"))
+        && last[2..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return true;
+    }
     parse_ipv4_number(last).is_ok()
 }
 
@@ -372,6 +378,9 @@ pub fn parse_host(input: &str, is_opaque: bool) -> Result<Host, UrlError> {
     }
     let decoded = percent_decode_str(input);
     let ascii_domain = domain_to_ascii(&decoded, false).map_err(|_| UrlError::InvalidHost)?;
+    if ascii_domain.is_empty() {
+        return Err(UrlError::InvalidHost);
+    }
     if ascii_domain.chars().any(is_forbidden_domain_char) {
         return Err(UrlError::InvalidHost);
     }
@@ -824,9 +833,21 @@ impl Url {
                 }
                 State::OpaquePath => {
                     if c == Some('?') {
+                        if let UrlPath::Opaque(ref mut s) = url.path {
+                            if s.ends_with(' ') {
+                                s.pop();
+                                s.push_str("%20");
+                            }
+                        }
                         url.query = Some(String::new());
                         state = State::Query;
                     } else if c == Some('#') {
+                        if let UrlPath::Opaque(ref mut s) = url.path {
+                            if s.ends_with(' ') {
+                                s.pop();
+                                s.push_str("%20");
+                            }
+                        }
                         url.fragment = Some(String::new());
                         state = State::Fragment;
                     } else if let Some(ch) = c {
@@ -997,7 +1018,9 @@ impl Url {
             "blob" => {
                 if let UrlPath::Opaque(ref inner) = self.path {
                     if let Ok(parsed) = Url::parse(inner) {
-                        return parsed.origin();
+                        if matches!(parsed.scheme.as_str(), "http" | "https") {
+                            return parsed.origin();
+                        }
                     }
                 }
                 "null".to_string()
