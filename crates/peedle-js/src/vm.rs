@@ -1087,6 +1087,7 @@ impl JsRuntime {
                 is_async: tmpl.is_async,
                 is_generator: tmpl.is_generator,
                 is_arrow: tmpl.is_arrow,
+                is_method: tmpl.is_method,
                 is_class_ctor: false,
                 is_derived_ctor: false,
                 strict: tmpl.strict,

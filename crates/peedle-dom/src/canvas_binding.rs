@@ -1,12 +1,18 @@
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use peedle_css::{parse_color, Color};
 use peedle_html::NodeId;
 use peedle_js::{JsRuntime, JsValue, ObjectId};
-use peedle_render::{Canvas2D, RgbaColor};
+use peedle_render::{Canvas2D, FontSystem, RgbaColor};
 
 use crate::events::define_getter_setter;
 use crate::state::{Canvas2DHandle, SharedDom};
+
+fn shared_fonts() -> &'static FontSystem {
+    static FONTS: OnceLock<FontSystem> = OnceLock::new();
+    FONTS.get_or_init(FontSystem::load_system_fonts)
+}
 
 fn parse_canvas_color(s: &str) -> RgbaColor {
     if let Some(Color { r, g, b, a }) = parse_color(s) {
@@ -92,7 +98,27 @@ pub fn define_canvas2d_proto(rt: &mut JsRuntime, dom: SharedDom, proto: ObjectId
             Ok(JsValue::Undefined)
         }),
     );
-    define_getter_setter(rt, proto, "strokeStyle", None, Some(set_stroke));
+    let d_sg = dom.clone();
+    let get_stroke = rt.create_native_function(
+        "get strokeStyle",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = this.as_object().and_then(|o| rt.get_host_data::<Canvas2DHandle>(o)).map(|h| h.0) else {
+                return Ok(JsValue::String("#000000".into()));
+            };
+            let s = d_sg
+                .borrow()
+                .canvases
+                .get(&nid)
+                .map(|cv| {
+                    let c = cv.state.stroke_style;
+                    format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
+                })
+                .unwrap_or_else(|| "#000000".to_string());
+            Ok(JsValue::String(s))
+        }),
+    );
+    define_getter_setter(rt, proto, "strokeStyle", Some(get_stroke), Some(set_stroke));
 
     let d = dom.clone();
     let set_lw = rt.create_native_function(
@@ -111,7 +137,19 @@ pub fn define_canvas2d_proto(rt: &mut JsRuntime, dom: SharedDom, proto: ObjectId
             Ok(JsValue::Undefined)
         }),
     );
-    define_getter_setter(rt, proto, "lineWidth", None, Some(set_lw));
+    let d_lwg = dom.clone();
+    let get_lw = rt.create_native_function(
+        "get lineWidth",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = this.as_object().and_then(|o| rt.get_host_data::<Canvas2DHandle>(o)).map(|h| h.0) else {
+                return Ok(JsValue::Number(1.0));
+            };
+            let v = d_lwg.borrow().canvases.get(&nid).map_or(1.0, |cv| cv.state.line_width as f64);
+            Ok(JsValue::Number(v))
+        }),
+    );
+    define_getter_setter(rt, proto, "lineWidth", Some(get_lw), Some(set_lw));
 
     let d = dom.clone();
     let set_alpha = rt.create_native_function(
@@ -128,7 +166,57 @@ pub fn define_canvas2d_proto(rt: &mut JsRuntime, dom: SharedDom, proto: ObjectId
             Ok(JsValue::Undefined)
         }),
     );
-    define_getter_setter(rt, proto, "globalAlpha", None, Some(set_alpha));
+    let d_ag = dom.clone();
+    let get_alpha = rt.create_native_function(
+        "get globalAlpha",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = this.as_object().and_then(|o| rt.get_host_data::<Canvas2DHandle>(o)).map(|h| h.0) else {
+                return Ok(JsValue::Number(1.0));
+            };
+            let v = d_ag.borrow().canvases.get(&nid).map_or(1.0, |cv| cv.state.global_alpha as f64);
+            Ok(JsValue::Number(v))
+        }),
+    );
+    define_getter_setter(rt, proto, "globalAlpha", Some(get_alpha), Some(set_alpha));
+
+    let d = dom.clone();
+    let set_font = rt.create_native_function(
+        "set font",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = this.as_object().and_then(|o| rt.get_host_data::<Canvas2DHandle>(o)).map(|h| h.0) else {
+                return Ok(JsValue::Undefined);
+            };
+            let s = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            for tok in s.split_ascii_whitespace() {
+                if let Some(px) = tok.strip_suffix("px") {
+                    if let Ok(sz) = px.parse::<f32>() {
+                        if sz > 0.0 {
+                            if let Some(cv) = d.borrow_mut().canvases.get_mut(&nid) {
+                                cv.state.font_size = sz;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let d_fg = dom.clone();
+    let get_font = rt.create_native_function(
+        "get font",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = this.as_object().and_then(|o| rt.get_host_data::<Canvas2DHandle>(o)).map(|h| h.0) else {
+                return Ok(JsValue::String("10px sans-serif".into()));
+            };
+            let sz = d_fg.borrow().canvases.get(&nid).map_or(10.0, |cv| cv.state.font_size);
+            Ok(JsValue::String(format!("{}px sans-serif", sz)))
+        }),
+    );
+    define_getter_setter(rt, proto, "font", Some(get_font), Some(set_font));
 
     macro_rules! cv_method {
         ($name:expr, $arity:expr, $body:expr) => {{
@@ -350,6 +438,89 @@ pub fn define_canvas2d_proto(rt: &mut JsRuntime, dom: SharedDom, proto: ObjectId
         Ok(JsValue::Undefined)
     });
 
+    cv_method!("setTransform", 6, |rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, args: &[JsValue]| {
+        let a = arg_f32(rt, args, 0, 1.0);
+        let b = arg_f32(rt, args, 1, 0.0);
+        let c = arg_f32(rt, args, 2, 0.0);
+        let d = arg_f32(rt, args, 3, 1.0);
+        let e = arg_f32(rt, args, 4, 0.0);
+        let f = arg_f32(rt, args, 5, 0.0);
+        if let Some(cv) = dm.borrow_mut().canvases.get_mut(&nid) {
+            cv.set_transform(a, b, c, d, e, f);
+        }
+        Ok(JsValue::Undefined)
+    });
+
+    cv_method!("resetTransform", 0, |_rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, _args: &[JsValue]| {
+        if let Some(cv) = dm.borrow_mut().canvases.get_mut(&nid) {
+            cv.reset_transform();
+        }
+        Ok(JsValue::Undefined)
+    });
+
+    cv_method!("transform", 6, |rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, args: &[JsValue]| {
+        let a = arg_f32(rt, args, 0, 1.0);
+        let b = arg_f32(rt, args, 1, 0.0);
+        let c = arg_f32(rt, args, 2, 0.0);
+        let d = arg_f32(rt, args, 3, 1.0);
+        let e = arg_f32(rt, args, 4, 0.0);
+        let f = arg_f32(rt, args, 5, 0.0);
+        if let Some(cv) = dm.borrow_mut().canvases.get_mut(&nid) {
+            cv.state.transform = cv.state.transform.mul(peedle_render::Affine2D { a, b, c, d, e, f });
+        }
+        Ok(JsValue::Undefined)
+    });
+
+    cv_method!("clip", 0, |_rt: &mut JsRuntime, _dm: &SharedDom, _nid: NodeId, _args: &[JsValue]| {
+        Ok(JsValue::Undefined)
+    });
+
+    cv_method!("setLineDash", 1, |_rt: &mut JsRuntime, _dm: &SharedDom, _nid: NodeId, _args: &[JsValue]| {
+        Ok(JsValue::Undefined)
+    });
+
+    cv_method!("getLineDash", 0, |rt: &mut JsRuntime, _dm: &SharedDom, _nid: NodeId, _args: &[JsValue]| {
+        Ok(JsValue::Object(rt.create_array(Vec::new())))
+    });
+
+    cv_method!("fillText", 3, |rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, args: &[JsValue]| {
+        let text = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+        let x = arg_f32(rt, args, 1, 0.0);
+        let y = arg_f32(rt, args, 2, 0.0);
+        if let Some(cv) = dm.borrow_mut().canvases.get_mut(&nid) {
+            cv.fill_text(shared_fonts(), &text, x, y);
+        }
+        Ok(JsValue::Undefined)
+    });
+
+    cv_method!("strokeText", 3, |rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, args: &[JsValue]| {
+        let text = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+        let x = arg_f32(rt, args, 1, 0.0);
+        let y = arg_f32(rt, args, 2, 0.0);
+        if let Some(cv) = dm.borrow_mut().canvases.get_mut(&nid) {
+            cv.fill_text(shared_fonts(), &text, x, y);
+        }
+        Ok(JsValue::Undefined)
+    });
+
+    cv_method!("drawImage", 3, |_rt: &mut JsRuntime, _dm: &SharedDom, _nid: NodeId, _args: &[JsValue]| {
+        Ok(JsValue::Undefined)
+    });
+
+    cv_method!("createLinearGradient", 4, |rt: &mut JsRuntime, _dm: &SharedDom, _nid: NodeId, _args: &[JsValue]| {
+        let g = rt.create_object();
+        let add = rt.create_native_function("addColorStop", 2, Rc::new(|_, _, _| Ok(JsValue::Undefined)));
+        let _ = rt.set_property(g, "addColorStop", JsValue::Object(add));
+        Ok(JsValue::Object(g))
+    });
+
+    cv_method!("createRadialGradient", 6, |rt: &mut JsRuntime, _dm: &SharedDom, _nid: NodeId, _args: &[JsValue]| {
+        let g = rt.create_object();
+        let add = rt.create_native_function("addColorStop", 2, Rc::new(|_, _, _| Ok(JsValue::Undefined)));
+        let _ = rt.set_property(g, "addColorStop", JsValue::Object(add));
+        Ok(JsValue::Object(g))
+    });
+
     cv_method!("getImageData", 4, |rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, args: &[JsValue]| {
         let sx = arg_f32(rt, args, 0, 0.0) as i32;
         let sy = arg_f32(rt, args, 1, 0.0) as i32;
@@ -369,10 +540,13 @@ pub fn define_canvas2d_proto(rt: &mut JsRuntime, dom: SharedDom, proto: ObjectId
         Ok(JsValue::Object(obj))
     });
 
-    cv_method!("measureText", 1, |rt: &mut JsRuntime, _dm: &SharedDom, _nid: NodeId, args: &[JsValue]| {
+    cv_method!("measureText", 1, |rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, args: &[JsValue]| {
         let s = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+        let sz = dm.borrow().canvases.get(&nid).map_or(10.0, |cv| cv.state.font_size);
         let obj = rt.create_object();
-        let _ = rt.set_property(obj, "width", JsValue::Number(s.chars().count() as f64 * 7.0));
+        let _ = rt.set_property(obj, "width", JsValue::Number(s.chars().count() as f64 * (sz as f64 * 0.6)));
+        let _ = rt.set_property(obj, "actualBoundingBoxAscent", JsValue::Number(sz as f64 * 0.8));
+        let _ = rt.set_property(obj, "actualBoundingBoxDescent", JsValue::Number(sz as f64 * 0.2));
         Ok(JsValue::Object(obj))
     });
 }

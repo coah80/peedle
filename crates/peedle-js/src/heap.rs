@@ -38,6 +38,7 @@ pub struct JsFunction {
     pub is_async: bool,
     pub is_generator: bool,
     pub is_arrow: bool,
+    pub is_method: bool,
     pub is_class_ctor: bool,
     pub is_derived_ctor: bool,
     pub strict: bool,

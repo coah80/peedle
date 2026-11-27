@@ -2179,7 +2179,9 @@ impl JsRuntime {
                 } else {
                     if let JsValue::Object(fid) = val {
                         if let ObjectKind::Function(ref mut f) = self.heap.get_obj_mut(fid).kind {
-                            f.home_object = Some(oid);
+                            if f.is_method {
+                                f.home_object = Some(oid);
+                            }
                         }
                     }
                     self.heap.get_obj_mut(oid).set_own_prop(
@@ -2196,7 +2198,9 @@ impl JsRuntime {
                 };
                 if let JsValue::Object(fid) = val {
                     if let ObjectKind::Function(ref mut f) = self.heap.get_obj_mut(fid).kind {
-                        f.home_object = Some(oid);
+                        if f.is_method {
+                            f.home_object = Some(oid);
+                        }
                     }
                 }
                 self.heap.get_obj_mut(oid).set_own_prop(
@@ -2217,7 +2221,9 @@ impl JsRuntime {
                         ObjectKind::Function(f) if f.name.is_empty()
                     );
                     if let ObjectKind::Function(ref mut f) = self.heap.get_obj_mut(fid).kind {
-                        f.home_object = Some(oid);
+                        if f.is_method {
+                            f.home_object = Some(oid);
+                        }
                     }
                     if is_anon {
                         let fn_name = match &key {
@@ -3384,6 +3390,7 @@ impl JsRuntime {
                 is_async: false,
                 is_generator: false,
                 is_arrow: false,
+                is_method: false,
                 strict: true,
                 source: String::new(),
             })
@@ -3398,6 +3405,7 @@ impl JsRuntime {
                 is_async: false,
                 is_generator: false,
                 is_arrow: false,
+                is_method: false,
                 strict: true,
                 source: String::new(),
             })

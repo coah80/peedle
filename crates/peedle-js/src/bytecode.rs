@@ -11,6 +11,7 @@ pub struct FuncTemplate {
     pub is_async: bool,
     pub is_generator: bool,
     pub is_arrow: bool,
+    pub is_method: bool,
     pub strict: bool,
     pub source: String,
 }

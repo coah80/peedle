@@ -1589,4 +1589,260 @@ fn define_crypto(rt: &mut JsRuntime, global: ObjectId) {
         Rc::new(move |rt, _, _| Ok(JsValue::Object(rt.create_object_with_proto(Some(xpath_proto))))),
     );
     let _ = rt.set_property(global, "XPathEvaluator", JsValue::Object(xpath_ctor));
+
+    define_intl(rt, global);
+}
+
+fn format_intl_number(val: f64, min_frac: usize, max_frac: usize, use_grouping: bool) -> String {
+    if !val.is_finite() {
+        return if val.is_nan() {
+            "NaN".to_string()
+        } else if val.is_sign_negative() {
+            "-∞".to_string()
+        } else {
+            "∞".to_string()
+        };
+    }
+    let neg = val < 0.0;
+    let abs = val.abs();
+    let mut s = format!("{:.*}", max_frac, abs);
+    if max_frac > 0 {
+        if let Some(dot) = s.find('.') {
+            let mut end = s.len();
+            while end > dot + 1 + min_frac && s.as_bytes()[end - 1] == b'0' {
+                end -= 1;
+            }
+            if end == dot + 1 && min_frac == 0 {
+                end = dot;
+            }
+            s.truncate(end);
+        }
+    }
+    let (int_part, frac_part) = match s.find('.') {
+        Some(dot) => (&s[..dot], Some(&s[dot..])),
+        None => (s.as_str(), None),
+    };
+    let grouped = if use_grouping && int_part.len() > 3 {
+        let mut out = String::with_capacity(int_part.len() + int_part.len() / 3);
+        let bytes = int_part.as_bytes();
+        let rem = bytes.len() % 3;
+        for (i, &b) in bytes.iter().enumerate() {
+            if i > 0 && (i >= rem) && ((i - rem) % 3 == 0) {
+                out.push(',');
+            }
+            out.push(b as char);
+        }
+        out
+    } else {
+        int_part.to_string()
+    };
+    let mut res = String::new();
+    if neg {
+        res.push('-');
+    }
+    res.push_str(&grouped);
+    if let Some(fp) = frac_part {
+        res.push_str(fp);
+    }
+    res
+}
+
+fn define_intl(rt: &mut JsRuntime, global: ObjectId) {
+    let obj_proto = rt.intrinsics.object_proto;
+    let intl = rt.create_object();
+
+    let nf_proto = rt.create_object_with_proto(Some(obj_proto));
+    let nf_format = rt.create_native_function(
+        "format",
+        1,
+        Rc::new(|rt, this, args| {
+            let num = args.first().map(|v| rt.to_number(v)).transpose()?.unwrap_or(f64::NAN);
+            let (min_f, max_f, grouping, style) = if let Some(oid) = this.as_object() {
+                let min_f = rt
+                    .get_property(oid, "_minFrac")
+                    .ok()
+                    .and_then(|v| v.as_number())
+                    .map(|n| (n as usize).min(20))
+                    .unwrap_or(0);
+                let max_f = rt
+                    .get_property(oid, "_maxFrac")
+                    .ok()
+                    .and_then(|v| v.as_number())
+                    .map(|n| (n as usize).min(20))
+                    .unwrap_or(3);
+                let grouping = rt
+                    .get_property(oid, "_grouping")
+                    .ok()
+                    .map(|v| rt.to_boolean(&v))
+                    .unwrap_or(true);
+                let style = rt
+                    .get_property(oid, "_style")
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "decimal".to_string());
+                (min_f, max_f.max(min_f), grouping, style)
+            } else {
+                (0, 3, true, "decimal".to_string())
+            };
+            let formatted = if style == "percent" {
+                format!("{}%", format_intl_number(num * 100.0, min_f, max_f, grouping))
+            } else {
+                format_intl_number(num, min_f, max_f, grouping)
+            };
+            Ok(JsValue::String(formatted))
+        }),
+    );
+    let nf_resolved = rt.create_native_function(
+        "resolvedOptions",
+        0,
+        Rc::new(|rt, this, _| {
+            let out = rt.create_object();
+            let loc = this
+                .as_object()
+                .and_then(|o| rt.get_property(o, "_locale").ok())
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| "en-US".to_string());
+            let _ = rt.set_property(out, "locale", JsValue::String(loc));
+            let _ = rt.set_property(out, "numberingSystem", JsValue::String("latn".into()));
+            Ok(JsValue::Object(out))
+        }),
+    );
+    let _ = rt.set_property(nf_proto, "format", JsValue::Object(nf_format));
+    let _ = rt.set_property(nf_proto, "resolvedOptions", JsValue::Object(nf_resolved));
+    let nf_ctor = rt.create_native_constructor(
+        "NumberFormat",
+        0,
+        nf_proto,
+        Rc::new(move |rt, _, args| {
+            let inst = rt.create_object_with_proto(Some(nf_proto));
+            let loc = args
+                .first()
+                .filter(|v| !v.is_undefined())
+                .and_then(|v| rt.to_string(v).ok())
+                .unwrap_or_else(|| "en-US".to_string());
+            let _ = rt.set_property(inst, "_locale", JsValue::String(loc));
+            let mut min_f = 0.0;
+            let mut max_f = 3.0;
+            let mut grouping = true;
+            let mut style = "decimal".to_string();
+            if let Some(opts) = args.get(1).and_then(|v| v.as_object()) {
+                if let Ok(v) = rt.get_property(opts, "minimumFractionDigits") {
+                    if let Some(n) = v.as_number() {
+                        min_f = n.clamp(0.0, 20.0);
+                    }
+                }
+                if let Ok(v) = rt.get_property(opts, "maximumFractionDigits") {
+                    if let Some(n) = v.as_number() {
+                        max_f = n.clamp(0.0, 20.0);
+                    }
+                }
+                if let Ok(v) = rt.get_property(opts, "useGrouping") {
+                    if !v.is_undefined() {
+                        grouping = rt.to_boolean(&v);
+                    }
+                }
+                if let Ok(v) = rt.get_property(opts, "style") {
+                    if let Some(s) = v.as_str() {
+                        style = s.to_string();
+                    }
+                }
+            }
+            let _ = rt.set_property(inst, "_minFrac", JsValue::Number(min_f));
+            let _ = rt.set_property(inst, "_maxFrac", JsValue::Number(max_f.max(min_f)));
+            let _ = rt.set_property(inst, "_grouping", JsValue::Boolean(grouping));
+            let _ = rt.set_property(inst, "_style", JsValue::String(style));
+            let bound = rt.create_native_function(
+                "format",
+                1,
+                Rc::new(move |rt, _, fargs| {
+                    rt.call_function(JsValue::Object(nf_format), JsValue::Object(inst), fargs)
+                }),
+            );
+            let _ = rt.set_property(inst, "format", JsValue::Object(bound));
+            Ok(JsValue::Object(inst))
+        }),
+    );
+    let _ = rt.set_property(intl, "NumberFormat", JsValue::Object(nf_ctor));
+
+    let dtf_proto = rt.create_object_with_proto(Some(obj_proto));
+    let dtf_format = rt.create_native_function(
+        "format",
+        1,
+        Rc::new(|rt, _, args| {
+            let ms = args.first().map(|v| rt.to_number(v)).transpose()?.unwrap_or(0.0) as i64;
+            let days = ms.div_euclid(86_400_000) + 719_468;
+            let era = days.div_euclid(146_097);
+            let doe = (days - era * 146_097) as u64;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+            let y = yoe as i64 + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = if m <= 2 { y + 1 } else { y };
+            Ok(JsValue::String(format!("{:04}-{:02}-{:02}", year, m, d)))
+        }),
+    );
+    let dtf_resolved = rt.create_native_function(
+        "resolvedOptions",
+        0,
+        Rc::new(|rt, _, _| {
+            let out = rt.create_object();
+            let _ = rt.set_property(out, "locale", JsValue::String("en-US".into()));
+            let _ = rt.set_property(out, "timeZone", JsValue::String("UTC".into()));
+            Ok(JsValue::Object(out))
+        }),
+    );
+    let _ = rt.set_property(dtf_proto, "format", JsValue::Object(dtf_format));
+    let _ = rt.set_property(dtf_proto, "resolvedOptions", JsValue::Object(dtf_resolved));
+    let dtf_ctor = rt.create_native_constructor(
+        "DateTimeFormat",
+        0,
+        dtf_proto,
+        Rc::new(move |rt, _, _| Ok(JsValue::Object(rt.create_object_with_proto(Some(dtf_proto))))),
+    );
+    let _ = rt.set_property(intl, "DateTimeFormat", JsValue::Object(dtf_ctor));
+
+    let col_proto = rt.create_object_with_proto(Some(obj_proto));
+    let col_cmp = rt.create_native_function(
+        "compare",
+        2,
+        Rc::new(|rt, _, args| {
+            let a = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let b = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            Ok(JsValue::Number(match a.cmp(&b) {
+                std::cmp::Ordering::Less => -1.0,
+                std::cmp::Ordering::Equal => 0.0,
+                std::cmp::Ordering::Greater => 1.0,
+            }))
+        }),
+    );
+    let _ = rt.set_property(col_proto, "compare", JsValue::Object(col_cmp));
+    let col_ctor = rt.create_native_constructor(
+        "Collator",
+        0,
+        col_proto,
+        Rc::new(move |rt, _, _| Ok(JsValue::Object(rt.create_object_with_proto(Some(col_proto))))),
+    );
+    let _ = rt.set_property(intl, "Collator", JsValue::Object(col_ctor));
+
+    let pr_proto = rt.create_object_with_proto(Some(obj_proto));
+    let pr_sel = rt.create_native_function(
+        "select",
+        1,
+        Rc::new(|rt, _, args| {
+            let n = args.first().map(|v| rt.to_number(v)).transpose()?.unwrap_or(0.0);
+            Ok(JsValue::String(if (n - 1.0).abs() < f64::EPSILON { "one" } else { "other" }.into()))
+        }),
+    );
+    let _ = rt.set_property(pr_proto, "select", JsValue::Object(pr_sel));
+    let pr_ctor = rt.create_native_constructor(
+        "PluralRules",
+        0,
+        pr_proto,
+        Rc::new(move |rt, _, _| Ok(JsValue::Object(rt.create_object_with_proto(Some(pr_proto))))),
+    );
+    let _ = rt.set_property(intl, "PluralRules", JsValue::Object(pr_ctor));
+
+    let _ = rt.set_property(global, "Intl", JsValue::Object(intl));
 }

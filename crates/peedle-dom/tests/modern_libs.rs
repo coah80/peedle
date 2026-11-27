@@ -420,3 +420,112 @@ fn real_htmx_boots_and_handles_events() {
         .unwrap();
     assert_eq!(out.as_str(), Some("2:1:true:swapped"));
 }
+
+#[test]
+fn real_redux_store_subscribe_and_dom_sync() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/libs/redux.min.js");
+    if !path.exists() {
+        return;
+    }
+    let redux_src = std::fs::read_to_string(&path).unwrap();
+    let mut env = new_env(r#"<!DOCTYPE html><html><body><div id="count">0</div><button id="add">+</button></body></html>"#);
+    env.eval(&redux_src).unwrap();
+    let out = env
+        .eval(
+            r#"
+        function counter(state = { value: 0, log: [] }, action) {
+            if (action.type === 'INC') {
+                return { value: state.value + action.by, log: state.log.concat(action.by) };
+            }
+            return state;
+        }
+        const store = Redux.createStore(counter);
+        const el = document.getElementById('count');
+        store.subscribe(() => {
+            el.textContent = String(store.getState().value);
+        });
+        document.getElementById('add').addEventListener('click', () => {
+            store.dispatch({ type: 'INC', by: 5 });
+        });
+        store.dispatch({ type: 'INC', by: 2 });
+        document.getElementById('add').click();
+        el.textContent + ':' + store.getState().log.join(',');
+    "#,
+        )
+        .unwrap();
+    assert_eq!(out.as_str(), Some("7:2,5"));
+}
+
+#[test]
+fn real_prismjs_highlights_javascript_into_dom() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/libs/prism.min.js");
+    if !path.exists() {
+        return;
+    }
+    let prism_src = std::fs::read_to_string(&path).unwrap();
+    let mut env = new_env(
+        r#"<!DOCTYPE html><html><body><pre><code id="snippet" class="language-javascript">const answer = 42; return answer + "!";</code></pre></body></html>"#,
+    );
+    env.eval(&prism_src).unwrap();
+    let out = env
+        .eval(
+            r#"
+        const code = document.getElementById('snippet');
+        Prism.highlightElement(code);
+        const kw = Array.from(code.querySelectorAll('.token.keyword')).map(n => n.textContent).join(',');
+        const num = code.querySelector('.token.number').textContent;
+        const str = code.querySelector('.token.string').textContent;
+        kw + '|' + num + '|' + str;
+    "#,
+        )
+        .unwrap();
+    assert_eq!(out.as_str(), Some("const,return|42|\"!\""));
+}
+
+#[test]
+fn real_chartjs_renders_bar_chart_to_canvas2d() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/libs/chart.umd.min.js");
+    if !path.exists() {
+        return;
+    }
+    let chart_src = std::fs::read_to_string(&path).unwrap();
+    let mut env = new_env(
+        r#"<!DOCTYPE html><html><body><div style="width:400px;height:240px"><canvas id="cv" width="400" height="240"></canvas></div></body></html>"#,
+    );
+    env.eval(&chart_src).unwrap();
+    let out = env
+        .eval(
+            r#"
+        const canvas = document.getElementById('cv');
+        const chart = new Chart(canvas, {
+            type: 'bar',
+            data: {
+                labels: ['URL', 'HTML', 'CSS', 'JS'],
+                datasets: [{
+                    label: 'Conformance',
+                    data: [100, 100, 99, 99],
+                    backgroundColor: ['#38bdf8', '#818cf8', '#34d399', '#fbbf24']
+                }]
+            },
+            options: {
+                responsive: false,
+                animation: false
+            }
+        });
+        chart.update('none');
+        const meta = chart.getDatasetMeta(0);
+        chart.config.type + ':' + meta.data.length + ':' + (chart.width > 0);
+    "#,
+        )
+        .unwrap();
+    assert_eq!(out.as_str(), Some("bar:4:true"));
+    let st = env.dom.borrow();
+    let cv_id = st.doc.get_element_by_id("cv").unwrap();
+    let cv = st.canvases.get(&cv_id).expect("chartjs must draw onto Canvas2D");
+    let non_transparent = cv.fb.data.chunks_exact(4).filter(|p| p[3] > 0).count();
+    assert!(
+        non_transparent > 500,
+        "expected Chart.js to rasterize bars onto Canvas2D, got {} painted pixels",
+        non_transparent
+    );
+}

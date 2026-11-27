@@ -89,6 +89,7 @@ impl Compiler {
             is_async: func.is_async,
             is_generator: func.is_generator,
             is_arrow: func.is_arrow,
+            is_method: false,
             strict: func.strict,
             source: func.source.clone(),
         }))
@@ -1826,7 +1827,9 @@ impl Compiler {
                             }
                         },
                         ObjectProp::Method { key, kind, func } => {
-                            let tmpl = Compiler::compile_function(func)?;
+                            let mut tmpl_val = (*Compiler::compile_function(func)?).clone();
+                            tmpl_val.is_method = true;
+                            let tmpl = Rc::new(tmpl_val);
                             let fidx = self.chunk.add_const(ConstValue::Func(tmpl));
                             match key {
                                 PropKey::Ident(s) | PropKey::String(s) => {
