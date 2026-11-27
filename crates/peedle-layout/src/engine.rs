@@ -1623,7 +1623,7 @@ impl LayoutEngine {
                 }
                 if px_count > 0 && px_count == total_tracks {
                     total + gap * (px_count.saturating_sub(1) as f32)
-                } else {
+                } else if style.display == Display::InlineGrid {
                     let kids = self.tree.get(id).children.clone();
                     let cols = total_tracks.max(1);
                     let mut col_widths = vec![0.0f32; cols];
@@ -1664,6 +1664,8 @@ impl LayoutEngine {
                     } else {
                         0.0
                     }
+                } else {
+                    cb_width
                 }
             }
             _ => {

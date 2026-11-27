@@ -181,14 +181,14 @@ const ABOUT_HTML: &str = r##"<!DOCTYPE html>
   <div class="card">
     <h1>Peedle 0.1.0</h1>
     <table>
-      <tr><td class="k">URL Engine</td><td class="v">peedle-url (WHATWG URL, 100% WPT parser &amp; setters)</td></tr>
-      <tr><td class="k">HTML Engine</td><td class="v">peedle-html (WHATWG HTML5, 100% html5lib tree-construction)</td></tr>
-      <tr><td class="k">CSS Engine</td><td class="v">peedle-css (CSS3/4 Cascade, Nesting, Selectors L4, Acid1/Acid2)</td></tr>
-      <tr><td class="k">Layout Engine</td><td class="v">peedle-layout (Block, Inline, Float, Flex, Grid, Table)</td></tr>
-      <tr><td class="k">JS Engine</td><td class="v">peedle-js (ES2024 Bytecode VM, GC, RegExp, Promises, Proxy, 99.4% Test262)</td></tr>
-      <tr><td class="k">DOM &amp; Web APIs</td><td class="v">peedle-dom (DOM L4, Traversal, Range, XML/SVG, Acid3 100/100)</td></tr>
-      <tr><td class="k">Renderer</td><td class="v">peedle-render (Software AA 2D, Fontdue, SVG, Canvas2D)</td></tr>
-      <tr><td class="k">Networking</td><td class="v">peedle-net (HTTP/1.1, rustls TLS, Cookies, WebSockets)</td></tr>
+      <tr><td class="k">URL Engine</td><td class="v">peedle-url (WHATWG URL, WPT 915/915 parser &amp; 284/284 setters = 100%)</td></tr>
+      <tr><td class="k">HTML Engine</td><td class="v">peedle-html (WHATWG HTML5, html5lib 1,765/1,765 tree = 100%)</td></tr>
+      <tr><td class="k">CSS Engine</td><td class="v">peedle-css (CSS3/4 Cascade, RuleIndex, Nesting, Selectors L4, Acid1/2)</td></tr>
+      <tr><td class="k">Layout Engine</td><td class="v">peedle-layout (Block, Inline, Float, Flex, Grid, Table, WPT 19/19)</td></tr>
+      <tr><td class="k">JS Engine</td><td class="v">peedle-js (ES2025 Bytecode VM, GC, BigInt, Modules, ShadowRealm, Atomics, Test262 42,559/42,632 = 99.83%)</td></tr>
+      <tr><td class="k">DOM &amp; Web APIs</td><td class="v">peedle-dom (DOM L4, Traversal, Range, Intl, Acid3 100/100, 14 modern libs)</td></tr>
+      <tr><td class="k">Renderer</td><td class="v">peedle-render (Software AA 2D, Fontdue, SVG, Gradients, Canvas2D)</td></tr>
+      <tr><td class="k">Networking</td><td class="v">peedle-net (HTTP/1.1 Keep-Alive, rustls TLS, Gzip/Brotli, Cookies, WebSockets)</td></tr>
     </table>
   </div>
 </body>
@@ -227,7 +227,7 @@ const DEMO_HTML: &str = r##"<!DOCTYPE html>
   </div>
   <div class="grid">
     <div class="card"><div class="label">Conformance</div><div class="metric green">Acid 1/2/3</div></div>
-    <div class="card"><div class="label">TC39 Test262</div><div class="metric accent">99%+</div></div>
+    <div class="card"><div class="label">TC39 Test262</div><div class="metric accent">99.83%</div></div>
     <div class="card"><div class="label">Interactive Counter</div><div class="metric" id="counter">0</div></div>
   </div>
   <div class="panels">
@@ -267,12 +267,17 @@ const DEMO_HTML: &str = r##"<!DOCTYPE html>
       ctx.stroke();
     }
     const colors = ['#38bdf8', '#818cf8', '#34d399', '#fbbf24', '#f472b6', '#22d3ee'];
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
     for (let i = 0; i < bars.length; i++) {
-      const h = Math.round(bars[i] * 1.3);
+      const h = Math.round(bars[i] * 1.25);
       const x = 36 + i * 72;
-      const y = 165 - h;
+      const y = 160 - h;
       ctx.fillStyle = colors[i % colors.length];
       ctx.fillRect(x, y, 42, h);
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(labels[i], x + 21, 166);
     }
   }
   document.getElementById('btn-inc').addEventListener('click', () => {
