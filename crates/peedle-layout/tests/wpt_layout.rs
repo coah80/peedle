@@ -159,3 +159,88 @@ fn wpt_text_overflow_ellipsis_and_word_break() {
     let brk_rect = tree.bounding_rect(doc.get_element_by_id("brk").unwrap()).unwrap();
     assert!(brk_rect.height > 28.0, "expected word-break wrapping, got {:?}", brk_rect);
 }
+
+#[test]
+fn wpt_css_grid_template_areas_and_shorthand() {
+    let (doc, tree) = run_layout(
+        r#"<div id="page">
+            <div id="main">Main content</div>
+            <div id="nav">Sidebar</div>
+            <div id="foot">Footer</div>
+        </div>"#,
+        r#"
+            body { margin: 0; }
+            #page {
+                display: grid;
+                width: 820px;
+                column-gap: 20px;
+                grid-template: auto 1fr / 200px minmax(0, 1fr);
+                grid-template-areas: 'sidebar content' 'footer footer';
+            }
+            #nav { grid-area: sidebar; height: 100px; }
+            #main { grid-area: content; height: 240px; }
+            #foot { grid-area: footer; height: 40px; }
+        "#,
+        900.0,
+        700.0,
+    );
+    let nav = tree.bounding_rect(doc.get_element_by_id("nav").unwrap()).unwrap();
+    let main = tree.bounding_rect(doc.get_element_by_id("main").unwrap()).unwrap();
+    let foot = tree.bounding_rect(doc.get_element_by_id("foot").unwrap()).unwrap();
+    assert!((nav.x - 0.0).abs() < 1.5 && (nav.width - 200.0).abs() < 1.5, "nav={:?}", nav);
+    assert!((main.x - 220.0).abs() < 1.5 && (main.width - 600.0).abs() < 1.5, "main={:?}", main);
+    assert!((foot.y - 240.0).abs() < 1.5 && (foot.width - 820.0).abs() < 1.5, "foot={:?}", foot);
+}
+
+#[test]
+fn wpt_flex_column_bfc_float_isolation_and_indefinite_pct() {
+    let (doc, tree) = run_layout(
+        r#"<div id="col">
+            <div id="hdr"><a id="logo" href="/">Logo</a></div>
+            <main id="body">
+                <div id="row1"><div class="flt">V</div><div class="txt">First</div></div>
+                <div id="row2"><div class="flt">V</div><div class="txt">Second</div></div>
+            </main>
+        </div>"#,
+        r#"
+            body { margin: 0; }
+            #col { display: flex; flex-direction: column; width: 600px; }
+            #hdr { display: flex; align-items: center; }
+            #logo { display: block; height: 100%; }
+            #row1, #row2 { clear: both; }
+            .flt { float: left; width: 40px; height: 30px; }
+        "#,
+        800.0,
+        800.0,
+    );
+    let logo = tree.bounding_rect(doc.get_element_by_id("logo").unwrap()).unwrap();
+    let row1 = tree.bounding_rect(doc.get_element_by_id("row1").unwrap()).unwrap();
+    let row2 = tree.bounding_rect(doc.get_element_by_id("row2").unwrap()).unwrap();
+    assert!(logo.height < 60.0, "height:100% in auto flex must not explode to viewport: {:?}", logo);
+    assert!(row1.y < 80.0, "first cleared row must not be pushed down by pass-1 floats: {:?}", row1);
+    assert!(row2.y >= row1.y + 29.0 && row2.y < 140.0, "row2={:?}", row2);
+}
+
+#[test]
+fn wpt_flex_intrinsic_ignores_absolute_dropdown() {
+    let (doc, tree) = run_layout(
+        r#"<header id="bar">
+            <h1 id="title">Rust (programming language)</h1>
+            <div id="menu">
+                <span>60 languages</span>
+                <div id="popup">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+            </div>
+        </header>"#,
+        r#"
+            body { margin: 0; }
+            #bar { display: flex; width: 700px; }
+            #title { flex-grow: 1; margin: 0; }
+            #menu { position: relative; flex-shrink: 0; }
+            #popup { position: absolute; width: 650px; }
+        "#,
+        800.0,
+        600.0,
+    );
+    let title = tree.bounding_rect(doc.get_element_by_id("title").unwrap()).unwrap();
+    assert!(title.width > 400.0, "absolute popup must not shrink flex sibling: {:?}", title);
+}

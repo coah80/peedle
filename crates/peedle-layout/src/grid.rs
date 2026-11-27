@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use peedle_css::{
     AlignItems, GridPlacement, GridRepeatCount, GridTrackSize, LengthPercentageAuto, Position,
 };
@@ -16,15 +18,28 @@ pub fn layout_grid_container(
     let content_y = engine.tree.get(id).dims.content.y;
     let content_w = engine.tree.get(id).dims.content.width;
     let explicit_h = engine.resolve_explicit_height(&style, cb_height);
+    let child_cb_h = explicit_h.unwrap_or(-1.0);
 
     let ctx_w = engine.calc_ctx(&style, content_w);
-    let ctx_h = engine.calc_ctx(&style, explicit_h.unwrap_or(cb_height));
+    let ctx_h = engine.calc_ctx(&style, child_cb_h.max(0.0));
     let col_gap = style.column_gap.resolve_or(&ctx_w, 0.0).max(0.0);
-    let row_gap = style.row_gap.resolve_or(&ctx_h, 0.0).max(0.0);
+    let row_gap = if child_cb_h < 0.0 && matches!(style.row_gap, LengthPercentageAuto::Percent(_)) {
+        0.0
+    } else {
+        style.row_gap.resolve_or(&ctx_h, 0.0).max(0.0)
+    };
+
+    let area_map = build_area_map(&style.grid_template_areas);
+    let area_cols = style
+        .grid_template_areas
+        .iter()
+        .map(|r| r.len())
+        .max()
+        .unwrap_or(0);
+    let area_rows = style.grid_template_areas.len();
 
     let col_tracks = expand_tracks(&style.grid_template_columns, content_w, col_gap);
-    let num_cols = col_tracks.len().max(1);
-    let col_widths = resolve_track_sizes(&col_tracks, content_w, col_gap, num_cols);
+    let num_cols = col_tracks.len().max(area_cols).max(1);
 
     let children = engine.tree.get(id).children.clone();
     let mut flow_children = Vec::new();
@@ -45,6 +60,16 @@ pub fn layout_grid_container(
 
     for cid in flow_children {
         let cs = engine.tree.get(cid).style.clone();
+        if let Some(ref area_name) = cs.grid_area {
+            if let Some(&(ar, ars, ac, acs)) = area_map.get(area_name) {
+                let col = ac.min(num_cols - 1);
+                let c_span = acs.min(num_cols - col).max(1);
+                mark_occupied(&mut occupied, ar, col, ars.max(1), c_span, num_cols);
+                placements.push((cid, ar, ars.max(1), col, c_span));
+                continue;
+            }
+        }
+
         let (c_start, c_span) = resolve_placement(cs.grid_column_start, cs.grid_column_end, num_cols);
         let (r_start, r_span) = resolve_placement(cs.grid_row_start, cs.grid_row_end, 100);
 
@@ -86,13 +111,38 @@ pub fn layout_grid_container(
         placements.push((cid, row, r_span, col, c_span.min(num_cols - col)));
     }
 
-    let num_rows = occupied.len().max(1);
+    let mut col_intrinsic = vec![0.0f32; num_cols];
+    for &(cid, _, _, col, c_span) in &placements {
+        if c_span == 1 && col < num_cols {
+            let needs_intrinsic = matches!(
+                col_tracks.get(col),
+                Some(GridTrackSize::MinContent | GridTrackSize::MaxContent | GridTrackSize::Auto)
+            );
+            if needs_intrinsic {
+                let cs = engine.tree.get(cid).style.clone();
+                let cctx = engine.calc_ctx(&cs, content_w);
+                let extra = cs.padding_left.resolve_or(&cctx, 0.0)
+                    + cs.padding_right.resolve_or(&cctx, 0.0)
+                    + cs.border_left_width
+                    + cs.border_right_width
+                    + cs.margin_left.resolve_or(&cctx, 0.0)
+                    + cs.margin_right.resolve_or(&cctx, 0.0);
+                let iw = engine.measure_intrinsic_width(cid, content_w) + extra;
+                col_intrinsic[col] = col_intrinsic[col].max(iw);
+            }
+        }
+    }
+    let col_widths = resolve_track_sizes(&col_tracks, &col_intrinsic, content_w, col_gap, num_cols);
+
+    let num_rows = occupied.len().max(area_rows).max(1);
     let mut row_heights = vec![0.0f32; num_rows];
-    let explicit_row_tracks = expand_tracks(&style.grid_template_rows, explicit_h.unwrap_or(cb_height), row_gap);
+    let mut explicit_row_fixed = vec![None; num_rows];
+    let explicit_row_tracks = expand_tracks(&style.grid_template_rows, child_cb_h.max(0.0), row_gap);
     for (r, track) in explicit_row_tracks.iter().enumerate() {
         if r < num_rows {
-            if let Some(h) = fixed_track_size(track, explicit_h.unwrap_or(cb_height)) {
+            if let Some(h) = fixed_track_size_checked(track, child_cb_h) {
                 row_heights[r] = h;
+                explicit_row_fixed[r] = Some(h);
             }
         }
     }
@@ -111,16 +161,21 @@ pub fn layout_grid_container(
         let cctx = engine.calc_ctx(&cs, cell_w);
         let mh = cs.margin_left.resolve_or(&cctx, 0.0) + cs.margin_right.resolve_or(&cctx, 0.0);
         let mv = cs.margin_top.resolve_or(&cctx, 0.0) + cs.margin_bottom.resolve_or(&cctx, 0.0);
+        let item_cb_h = if r_span == 1 {
+            explicit_row_fixed[row].unwrap_or(child_cb_h)
+        } else {
+            child_cb_h
+        };
 
         let constraint = if cs.width == LengthPercentageAuto::Auto {
             SizeConstraint::DefiniteBorderBox((cell_w - mh).max(0.0))
         } else {
             SizeConstraint::Available((cell_w - mh).max(0.0))
         };
-        engine.layout_box(
+        engine.layout_box_in_bfc(
             cid,
             cell_w,
-            explicit_h.unwrap_or(cb_height),
+            item_cb_h,
             0.0,
             0.0,
             constraint,
@@ -176,7 +231,7 @@ pub fn layout_grid_container(
         let target_x = content_x + col_offsets[col] + ml + ox;
         let target_y = content_y + row_offsets[row] + mt + oy;
         engine.translate_subtree(cid, target_x - cur_bb.x, target_y - cur_bb.y);
-        engine.apply_relative_offset(cid, content_w, explicit_h.unwrap_or(cb_height));
+        engine.apply_relative_offset(cid, content_w, child_cb_h.max(0.0));
     }
 
     let total_h = row_heights.iter().sum::<f32>() + row_gap * (num_rows.saturating_sub(1) as f32);
@@ -184,6 +239,38 @@ pub fn layout_grid_container(
 
     for cid in abs_children {
         engine.layout_out_of_flow(cid, id);
+    }
+}
+
+fn build_area_map(rows: &[Vec<String>]) -> HashMap<String, (usize, usize, usize, usize)> {
+    let mut bounds: HashMap<String, (usize, usize, usize, usize)> = HashMap::new();
+    for (r, row) in rows.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            if cell.is_empty() || cell.chars().all(|ch| ch == '.') {
+                continue;
+            }
+            bounds
+                .entry(cell.clone())
+                .and_modify(|b| {
+                    b.0 = b.0.min(r);
+                    b.1 = b.1.max(r);
+                    b.2 = b.2.min(c);
+                    b.3 = b.3.max(c);
+                })
+                .or_insert((r, r, c, c));
+        }
+    }
+    bounds
+        .into_iter()
+        .map(|(k, (r0, r1, c0, c1))| (k, (r0, r1 - r0 + 1, c0, c1 - c0 + 1)))
+        .collect()
+}
+
+fn fixed_track_size_checked(t: &GridTrackSize, available: f32) -> Option<f32> {
+    match t {
+        GridTrackSize::Px(v) => Some(*v),
+        GridTrackSize::Percent(p) if available >= 0.0 => Some(available * p / 100.0),
+        _ => None,
     }
 }
 
@@ -238,6 +325,7 @@ fn fixed_track_size(t: &GridTrackSize, available: f32) -> Option<f32> {
 
 fn resolve_track_sizes(
     tracks: &[GridTrackSize],
+    col_intrinsic: &[f32],
     available: f32,
     gap: f32,
     num_cols: usize,
@@ -246,7 +334,23 @@ fn resolve_track_sizes(
     let mut fr_weights = vec![0.0f32; num_cols];
     let mut used = gap * (num_cols.saturating_sub(1) as f32);
 
-    for (i, t) in tracks.iter().take(num_cols).enumerate() {
+    let has_explicit_fr = tracks.iter().take(num_cols).any(|t| match t {
+        GridTrackSize::Fr(w) => *w > 0.0,
+        GridTrackSize::MinMax(_, max_t) => matches!(**max_t, GridTrackSize::Fr(w) if w > 0.0),
+        _ => false,
+    });
+
+    for i in 0..num_cols {
+        let Some(t) = tracks.get(i) else {
+            if has_explicit_fr {
+                let v = col_intrinsic[i].min(available);
+                sizes[i] = v;
+                used += v;
+            } else {
+                fr_weights[i] = 1.0;
+            }
+            continue;
+        };
         match t {
             GridTrackSize::Px(v) => {
                 sizes[i] = *v;
@@ -278,8 +382,19 @@ fn resolve_track_sizes(
                 sizes[i] = (*v).min(available);
                 used += sizes[i];
             }
-            GridTrackSize::Auto | GridTrackSize::MinContent | GridTrackSize::MaxContent => {
-                fr_weights[i] = 1.0;
+            GridTrackSize::MinContent | GridTrackSize::MaxContent => {
+                let v = col_intrinsic[i].min((available - used).max(0.0));
+                sizes[i] = v;
+                used += v;
+            }
+            GridTrackSize::Auto => {
+                if has_explicit_fr {
+                    let v = col_intrinsic[i].min((available - used).max(0.0));
+                    sizes[i] = v;
+                    used += v;
+                } else {
+                    fr_weights[i] = 1.0;
+                }
             }
             GridTrackSize::Repeat(_, _) => {
                 fr_weights[i] = 1.0;

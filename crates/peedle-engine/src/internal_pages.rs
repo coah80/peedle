@@ -147,8 +147,8 @@ const ABOUT_HTML: &str = r##"<!DOCTYPE html>
       <tr><td class="k">HTML Engine</td><td class="v">peedle-html (WHATWG HTML5, 100% html5lib tree-construction)</td></tr>
       <tr><td class="k">CSS Engine</td><td class="v">peedle-css (CSS3/4 Cascade, Nesting, Selectors L4, Acid1/Acid2)</td></tr>
       <tr><td class="k">Layout Engine</td><td class="v">peedle-layout (Block, Inline, Float, Flex, Grid, Table)</td></tr>
-      <tr><td class="k">JS Engine</td><td class="v">peedle-js (ES2024 Bytecode VM, GC, RegExp, Promises, Proxy, 99%+ Test262)</td></tr>
-      <tr><td class="k">DOM &amp; Web APIs</td><td class="v">peedle-dom (DOM L4, Traversal, Range, XML/SVG, Acid3 99-100/100)</td></tr>
+      <tr><td class="k">JS Engine</td><td class="v">peedle-js (ES2024 Bytecode VM, GC, RegExp, Promises, Proxy, 99.4% Test262)</td></tr>
+      <tr><td class="k">DOM &amp; Web APIs</td><td class="v">peedle-dom (DOM L4, Traversal, Range, XML/SVG, Acid3 100/100)</td></tr>
       <tr><td class="k">Renderer</td><td class="v">peedle-render (Software AA 2D, Fontdue, SVG, Canvas2D)</td></tr>
       <tr><td class="k">Networking</td><td class="v">peedle-net (HTTP/1.1, rustls TLS, Cookies, WebSockets)</td></tr>
     </table>

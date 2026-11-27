@@ -19,6 +19,11 @@ pub enum SizeConstraint {
     DefiniteBorderBox(f32),
 }
 
+enum InlineItem {
+    Box(LayoutBoxId),
+    Advance(f32),
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FloatRect {
     side: Float,
@@ -585,13 +590,19 @@ impl LayoutEngine {
                 b.dims.content.height = rh;
             }
             BoxKind::Flex => {
+                let saved = std::mem::take(&mut self.float_ctx);
                 layout_flex_container(self, id, cb_width, cb_height);
+                self.float_ctx = saved;
             }
             BoxKind::Grid => {
+                let saved = std::mem::take(&mut self.float_ctx);
                 layout_grid_container(self, id, cb_width, cb_height);
+                self.float_ctx = saved;
             }
             BoxKind::Table => {
+                let saved = std::mem::take(&mut self.float_ctx);
                 layout_table(self, id, cb_width, cb_height);
+                self.float_ctx = saved;
             }
             _ => {
                 let children = self.tree.get(id).children.clone();
@@ -607,7 +618,8 @@ impl LayoutEngine {
                     || style.display == Display::FlowRoot
                     || style.display == Display::InlineBlock
                     || style.float != Float::None
-                    || matches!(style.position, Position::Absolute | Position::Fixed);
+                    || matches!(style.position, Position::Absolute | Position::Fixed)
+                    || matches!(kind, BoxKind::TableCell { .. });
                 let saved_floats = if establishes_bfc {
                     Some(std::mem::take(&mut self.float_ctx))
                 } else {
@@ -680,6 +692,26 @@ impl LayoutEngine {
         if is_positioned_cb {
             self.positioned_cb_stack.pop();
         }
+    }
+
+    pub(crate) fn layout_box_in_bfc(
+        &mut self,
+        id: LayoutBoxId,
+        cb_width: f32,
+        cb_height: f32,
+        origin_x: f32,
+        origin_y: f32,
+        width_constraint: SizeConstraint,
+    ) {
+        let saved = std::mem::take(&mut self.float_ctx);
+        self.layout_box(id, cb_width, cb_height, origin_x, origin_y, width_constraint);
+        let float_bot = self.float_ctx.max_bottom();
+        let b = self.tree.get_mut(id);
+        let float_h = (float_bot - b.dims.content.y).max(0.0);
+        if b.style.height == LengthPercentageAuto::Auto && float_h > b.dims.content.height {
+            b.dims.content.height = float_h;
+        }
+        self.float_ctx = saved;
     }
 
     fn is_self_collapsing_empty(&self, id: LayoutBoxId, content_w: f32, cb_height: f32) -> bool {
@@ -888,8 +920,8 @@ impl LayoutEngine {
         cb_height: f32,
     ) -> f32 {
         let container_style = self.tree.get(container_id).style.clone();
-        let mut flat: Vec<LayoutBoxId> = Vec::new();
-        self.collect_inline_items(children, &mut flat);
+        let mut flat: Vec<InlineItem> = Vec::new();
+        self.collect_inline_items(children, content_w, &mut flat);
 
         let base_line_h = container_style.line_height.resolve(container_style.font_size);
         let mut cur_y = content_y;
@@ -978,7 +1010,14 @@ impl LayoutEngine {
             box_refs.clear();
         };
 
-        for item_id in flat {
+        for entry in flat {
+            let item_id = match entry {
+                InlineItem::Advance(dx) => {
+                    cur_x += dx;
+                    continue;
+                }
+                InlineItem::Box(id) => id,
+            };
             let item_kind = self.tree.get(item_id).kind.clone();
             let item_style = self.tree.get(item_id).style.clone();
             if matches!(item_style.position, Position::Absolute | Position::Fixed) {
@@ -1325,14 +1364,32 @@ impl LayoutEngine {
         (cur_y - content_y).max(0.0)
     }
 
-    fn collect_inline_items(&self, children: &[LayoutBoxId], out: &mut Vec<LayoutBoxId>) {
+    fn collect_inline_items(
+        &self,
+        children: &[LayoutBoxId],
+        cb_width: f32,
+        out: &mut Vec<InlineItem>,
+    ) {
         for &cid in children {
             let b = self.tree.get(cid);
             if b.kind == BoxKind::Inline && !matches!(b.style.position, Position::Absolute | Position::Fixed) {
+                let ctx = self.calc_ctx(&b.style, cb_width);
+                let start_extra = b.style.margin_left.resolve_or(&ctx, 0.0)
+                    + b.style.padding_left.resolve_or(&ctx, 0.0)
+                    + b.style.border_left_width;
+                let end_extra = b.style.margin_right.resolve_or(&ctx, 0.0)
+                    + b.style.padding_right.resolve_or(&ctx, 0.0)
+                    + b.style.border_right_width;
+                if start_extra.abs() > 0.01 {
+                    out.push(InlineItem::Advance(start_extra));
+                }
                 let sub = b.children.clone();
-                self.collect_inline_items(&sub, out);
+                self.collect_inline_items(&sub, cb_width, out);
+                if end_extra.abs() > 0.01 {
+                    out.push(InlineItem::Advance(end_extra));
+                }
             } else {
-                out.push(cid);
+                out.push(InlineItem::Box(cid));
             }
         }
     }
@@ -1524,15 +1581,25 @@ impl LayoutEngine {
                 }
             }
             _ => {
+                let is_flex_row = matches!(
+                    style.display,
+                    Display::Flex | Display::InlineFlex
+                ) && matches!(
+                    style.flex_direction,
+                    peedle_css::FlexDirection::Row | peedle_css::FlexDirection::RowReverse
+                );
                 let kids = self.tree.get(id).children.clone();
                 let mut sum_inline = 0.0f32;
                 let mut max_block = 0.0f32;
                 for cid in kids {
+                    let cs = self.tree.get(cid).style.clone();
+                    if matches!(cs.position, Position::Absolute | Position::Fixed) {
+                        continue;
+                    }
                     let cw = self.measure_intrinsic_width(cid, cb_width);
                     let extra = if matches!(self.tree.get(cid).kind, BoxKind::Text(_)) {
                         0.0
                     } else {
-                        let cs = self.tree.get(cid).style.clone();
                         let cctx = self.calc_ctx(&cs, cb_width);
                         cs.padding_left.resolve_or(&cctx, 0.0)
                             + cs.padding_right.resolve_or(&cctx, 0.0)
@@ -1541,7 +1608,7 @@ impl LayoutEngine {
                             + cs.margin_left.resolve_or(&cctx, 0.0)
                             + cs.margin_right.resolve_or(&cctx, 0.0)
                     };
-                    if self.is_block_level(cid) && style.display != Display::Flex {
+                    if self.is_block_level(cid) && !is_flex_row {
                         max_block = max_block.max(cw + extra);
                     } else {
                         sum_inline += cw + extra;
@@ -1560,7 +1627,7 @@ impl LayoutEngine {
         cb_height: f32,
     ) -> (f32, f32) {
         let ctx_w = self.calc_ctx(style, cb_width);
-        let ctx_h = self.calc_ctx(style, cb_height);
+        let ctx_h = self.calc_ctx(style, cb_height.max(0.0));
         let (iw, ih) = match rep {
             ReplacedKind::Image { intrinsic_w, intrinsic_h, .. } => (*intrinsic_w, *intrinsic_h),
             ReplacedKind::Canvas { width, height } => (*width, *height),
@@ -1580,7 +1647,11 @@ impl LayoutEngine {
             ReplacedKind::Br => (0.0, 0.0),
         };
         let ew = style.width.resolve(&ctx_w);
-        let eh = style.height.resolve(&ctx_h);
+        let eh = if cb_height < 0.0 && matches!(style.height, LengthPercentageAuto::Percent(_)) {
+            None
+        } else {
+            style.height.resolve(&ctx_h)
+        };
         match (ew, eh) {
             (Some(w), Some(h)) => (w.max(0.0), h.max(0.0)),
             (Some(w), None) => {

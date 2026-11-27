@@ -49,6 +49,7 @@ pub fn layout_flex_container(
     let content_y = engine.tree.get(id).dims.content.y;
     let content_w = engine.tree.get(id).dims.content.width;
     let explicit_h = engine.resolve_explicit_height(&style, cb_height);
+    let child_cb_h = explicit_h.unwrap_or(-1.0);
     let container_main = if is_row {
         content_w
     } else {
@@ -56,14 +57,20 @@ pub fn layout_flex_container(
     };
 
     let ctx_w = engine.calc_ctx(&style, content_w);
-    let ctx_h = engine.calc_ctx(&style, explicit_h.unwrap_or(cb_height));
+    let ctx_h = engine.calc_ctx(&style, child_cb_h.max(0.0));
     let main_gap = if is_row {
         style.column_gap.resolve_or(&ctx_w, 0.0).max(0.0)
+    } else if child_cb_h < 0.0 && matches!(style.row_gap, LengthPercentageAuto::Percent(_)) {
+        0.0
     } else {
         style.row_gap.resolve_or(&ctx_h, 0.0).max(0.0)
     };
     let cross_gap = if is_row {
-        style.row_gap.resolve_or(&ctx_h, 0.0).max(0.0)
+        if child_cb_h < 0.0 && matches!(style.row_gap, LengthPercentageAuto::Percent(_)) {
+            0.0
+        } else {
+            style.row_gap.resolve_or(&ctx_h, 0.0).max(0.0)
+        }
     } else {
         style.column_gap.resolve_or(&ctx_w, 0.0).max(0.0)
     };
@@ -79,7 +86,7 @@ pub fn layout_flex_container(
             continue;
         }
         let cctx_w = engine.calc_ctx(&cs, content_w);
-        let cctx_h = engine.calc_ctx(&cs, explicit_h.unwrap_or(cb_height));
+        let cctx_h = engine.calc_ctx(&cs, child_cb_h.max(0.0));
 
         let (m_ms, m_me, m_cs, m_ce, ms_auto, me_auto, cs_auto, ce_auto) = if is_row {
             (
@@ -105,16 +112,21 @@ pub fn layout_flex_container(
             )
         };
 
-        let basis_ctx = if is_row { cctx_w } else { cctx_h };
         let basis_opt = match &cs.flex_basis {
             LengthPercentageAuto::Auto => {
                 if is_row {
                     cs.width.resolve(&cctx_w)
                 } else {
-                    cs.height.resolve(&cctx_h)
+                    resolve_dim(&cs.height, &cctx_h, child_cb_h)
                 }
             }
-            other => other.resolve(&basis_ctx),
+            other => {
+                if is_row {
+                    other.resolve(&cctx_w)
+                } else {
+                    resolve_dim(other, &cctx_h, child_cb_h)
+                }
+            }
         };
 
         let (pad_b_main, pad_b_cross) = if is_row {
@@ -149,10 +161,10 @@ pub fn layout_flex_container(
             let intrinsic = engine.measure_intrinsic_width(cid, content_w);
             (intrinsic + pad_b_main).min(content_w.max(pad_b_main))
         } else {
-            engine.layout_box(
+            engine.layout_box_in_bfc(
                 cid,
                 content_w,
-                explicit_h.unwrap_or(cb_height),
+                child_cb_h,
                 0.0,
                 0.0,
                 SizeConstraint::Available(content_w),
@@ -164,12 +176,12 @@ pub fn layout_flex_container(
         let min_main = if is_row {
             cs.min_width.resolve(&cctx_w).unwrap_or(0.0)
         } else {
-            cs.min_height.resolve(&cctx_h).unwrap_or(0.0)
+            resolve_dim(&cs.min_height, &cctx_h, child_cb_h).unwrap_or(0.0)
         };
         let max_main = if is_row {
             cs.max_width.resolve(&cctx_w).unwrap_or(f32::INFINITY)
         } else {
-            cs.max_height.resolve(&cctx_h).unwrap_or(f32::INFINITY)
+            resolve_dim(&cs.max_height, &cctx_h, child_cb_h).unwrap_or(f32::INFINITY)
         };
         let hypothetical = base_size.clamp(min_main, max_main);
 
@@ -275,10 +287,10 @@ pub fn layout_flex_container(
         for &i in line {
             let cid = items[i].id;
             if is_row {
-                engine.layout_box(
+                engine.layout_box_in_bfc(
                     cid,
                     content_w,
-                    explicit_h.unwrap_or(cb_height),
+                    child_cb_h,
                     0.0,
                     0.0,
                     SizeConstraint::DefiniteBorderBox(items[i].main_size),
@@ -303,10 +315,10 @@ pub fn layout_flex_container(
                         + cs.border_right_width;
                     SizeConstraint::DefiniteBorderBox((iw + ph).min(content_w))
                 };
-                engine.layout_box(
+                engine.layout_box_in_bfc(
                     cid,
                     content_w,
-                    explicit_h.unwrap_or(cb_height),
+                    child_cb_h,
                     0.0,
                     0.0,
                     constraint,
@@ -467,7 +479,7 @@ pub fn layout_flex_container(
             let dx = target_bx - cur_bb.x;
             let dy = target_by - cur_bb.y;
             engine.translate_subtree(cid, dx, dy);
-            engine.apply_relative_offset(cid, content_w, explicit_h.unwrap_or(cb_height));
+            engine.apply_relative_offset(cid, content_w, child_cb_h.max(0.0));
 
             let final_bb = engine.tree.get(cid).dims.border_box();
             max_content_bottom = max_content_bottom.max(
@@ -485,20 +497,15 @@ pub fn layout_flex_container(
     }
 
     let final_h = explicit_h.unwrap_or(max_content_bottom.max(0.0));
-    let min_h = style.min_height.resolve(&CalcContext {
-        percentage_base: cb_height,
+    let own_ctx_h = CalcContext {
+        percentage_base: cb_height.max(0.0),
         font_size: style.font_size,
         root_font_size: engine.root_font_size,
         viewport_width: engine.viewport_w,
         viewport_height: engine.viewport_h,
-    });
-    let max_h = style.max_height.resolve(&CalcContext {
-        percentage_base: cb_height,
-        font_size: style.font_size,
-        root_font_size: engine.root_font_size,
-        viewport_width: engine.viewport_w,
-        viewport_height: engine.viewport_h,
-    });
+    };
+    let min_h = resolve_dim(&style.min_height, &own_ctx_h, cb_height);
+    let max_h = resolve_dim(&style.max_height, &own_ctx_h, cb_height);
     let mut clamped_h = final_h;
     if let Some(mh) = min_h {
         clamped_h = clamped_h.max(mh);
@@ -510,6 +517,14 @@ pub fn layout_flex_container(
 
     for cid in abs_children {
         engine.layout_out_of_flow(cid, id);
+    }
+}
+
+fn resolve_dim(val: &LengthPercentageAuto, ctx: &CalcContext, cb_size: f32) -> Option<f32> {
+    if cb_size < 0.0 && matches!(val, LengthPercentageAuto::Percent(_)) {
+        None
+    } else {
+        val.resolve(ctx)
     }
 }
 

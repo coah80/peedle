@@ -909,6 +909,7 @@ fn expand_shorthand(name: &str, value: &[Token]) -> Vec<(String, Vec<Token>)> {
         "grid-column" => expand_grid_span_pair(trimmed, "grid-column-start", "grid-column-end"),
         "grid-row" => expand_grid_span_pair(trimmed, "grid-row-start", "grid-row-end"),
         "grid-area" => expand_grid_area(trimmed),
+        "grid-template" => expand_grid_template(trimmed),
         _ => vec![(name.to_string(), trimmed.to_vec())],
     }
 }
@@ -1318,7 +1319,20 @@ fn expand_grid_area(tokens: &[Token]) -> Vec<(String, Vec<Token>)> {
         .split(|t| *t == Token::Delim('/'))
         .map(trim_ws)
         .collect();
-    let mut out = Vec::new();
+    if parts.len() == 1 {
+        if let [Token::Ident(name)] = parts[0] {
+            if !name.eq_ignore_ascii_case("auto") {
+                return vec![
+                    ("grid-area".into(), parts[0].to_vec()),
+                    ("grid-row-start".into(), tokenize("auto")),
+                    ("grid-column-start".into(), tokenize("auto")),
+                    ("grid-row-end".into(), tokenize("auto")),
+                    ("grid-column-end".into(), tokenize("auto")),
+                ];
+            }
+        }
+    }
+    let mut out = vec![("grid-area".into(), tokenize("auto"))];
     if let Some(p0) = parts.first() {
         out.push(("grid-row-start".into(), p0.to_vec()));
     }
@@ -1332,6 +1346,47 @@ fn expand_grid_area(tokens: &[Token]) -> Vec<(String, Vec<Token>)> {
         out.push(("grid-column-end".into(), p3.to_vec()));
     }
     out
+}
+
+fn expand_grid_template(tokens: &[Token]) -> Vec<(String, Vec<Token>)> {
+    let trimmed = trim_ws(tokens);
+    if trimmed.len() == 1 {
+        if let Token::Ident(s) = &trimmed[0] {
+            if s.eq_ignore_ascii_case("none") {
+                return vec![
+                    ("grid-template-rows".into(), tokenize("none")),
+                    ("grid-template-columns".into(), tokenize("none")),
+                    ("grid-template-areas".into(), tokenize("none")),
+                ];
+            }
+        }
+    }
+    if let Some(slash) = trimmed.iter().position(|t| *t == Token::Delim('/')) {
+        let row_part = trim_ws(&trimmed[..slash]);
+        let col_part = trim_ws(&trimmed[slash + 1..]);
+        let mut out = Vec::new();
+        let has_area_strings = row_part.iter().any(|t| matches!(t, Token::String(_)));
+        if has_area_strings {
+            let mut area_tokens = Vec::new();
+            let mut row_tokens = Vec::new();
+            for t in row_part {
+                if matches!(t, Token::String(_)) {
+                    area_tokens.push(t.clone());
+                } else {
+                    row_tokens.push(t.clone());
+                }
+            }
+            out.push(("grid-template-areas".into(), area_tokens));
+            if !trim_ws(&row_tokens).is_empty() {
+                out.push(("grid-template-rows".into(), row_tokens));
+            }
+        } else {
+            out.push(("grid-template-rows".into(), row_part.to_vec()));
+        }
+        out.push(("grid-template-columns".into(), col_part.to_vec()));
+        return out;
+    }
+    Vec::new()
 }
 
 fn apply_font_size(
@@ -2325,6 +2380,34 @@ fn apply_longhand(
         "grid-template-rows" => {
             style.grid_template_rows = parse_grid_tracks(trimmed, ctx);
         }
+        "grid-template-areas" => {
+            if ident.as_deref() == Some("none") {
+                style.grid_template_areas.clear();
+            } else {
+                let mut rows = Vec::new();
+                for t in trimmed {
+                    if let Token::String(s) = t {
+                        let cells: Vec<String> = s
+                            .split_ascii_whitespace()
+                            .map(|c| c.to_string())
+                            .collect();
+                        if !cells.is_empty() {
+                            rows.push(cells);
+                        }
+                    }
+                }
+                if !rows.is_empty() {
+                    style.grid_template_areas = rows;
+                }
+            }
+        }
+        "grid-area" => {
+            if ident.as_deref() == Some("auto") {
+                style.grid_area = None;
+            } else if let [Token::Ident(s)] = trimmed {
+                style.grid_area = Some(s.clone());
+            }
+        }
         "grid-auto-columns" => {
             style.grid_auto_columns = parse_grid_tracks(trimmed, ctx);
         }
@@ -2629,9 +2712,11 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, prop: &str) {
         "column-gap" => dst.column_gap = src.column_gap.clone(),
         "grid-template-columns" => dst.grid_template_columns = src.grid_template_columns.clone(),
         "grid-template-rows" => dst.grid_template_rows = src.grid_template_rows.clone(),
+        "grid-template-areas" => dst.grid_template_areas = src.grid_template_areas.clone(),
         "grid-auto-columns" => dst.grid_auto_columns = src.grid_auto_columns.clone(),
         "grid-auto-rows" => dst.grid_auto_rows = src.grid_auto_rows.clone(),
         "grid-auto-flow" => dst.grid_auto_flow = src.grid_auto_flow,
+        "grid-area" => dst.grid_area = src.grid_area.clone(),
         "grid-column-start" => dst.grid_column_start = src.grid_column_start,
         "grid-column-end" => dst.grid_column_end = src.grid_column_end,
         "grid-row-start" => dst.grid_row_start = src.grid_row_start,

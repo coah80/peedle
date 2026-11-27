@@ -98,7 +98,7 @@ pub fn layout_table(
             engine.layout_box(
                 cid,
                 table_w,
-                explicit_h.unwrap_or(cb_height),
+                explicit_h.unwrap_or(-1.0),
                 content_x + cursor_x,
                 content_y + cursor_y,
                 SizeConstraint::DefiniteBorderBox(cell_w),

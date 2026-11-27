@@ -994,9 +994,11 @@ pub struct ComputedStyle {
 
     pub grid_template_columns: Vec<GridTrackSize>,
     pub grid_template_rows: Vec<GridTrackSize>,
+    pub grid_template_areas: Vec<Vec<String>>,
     pub grid_auto_columns: Vec<GridTrackSize>,
     pub grid_auto_rows: Vec<GridTrackSize>,
     pub grid_auto_flow: GridAutoFlow,
+    pub grid_area: Option<String>,
     pub grid_column_start: GridPlacement,
     pub grid_column_end: GridPlacement,
     pub grid_row_start: GridPlacement,
@@ -1131,9 +1133,11 @@ impl Default for ComputedStyle {
 
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
+            grid_template_areas: Vec::new(),
             grid_auto_columns: Vec::new(),
             grid_auto_rows: Vec::new(),
             grid_auto_flow: GridAutoFlow::Row,
+            grid_area: None,
             grid_column_start: GridPlacement::Auto,
             grid_column_end: GridPlacement::Auto,
             grid_row_start: GridPlacement::Auto,
@@ -1419,7 +1423,6 @@ legend, center {
 html {
     font-size: 16px;
     color: #000000;
-    background-color: #ffffff;
 }
 body {
     margin: 8px;
