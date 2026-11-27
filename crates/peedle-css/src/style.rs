@@ -1397,7 +1397,7 @@ dd { margin-left: 40px; }
 a:any-link { color: #0000ee; text-decoration: underline; cursor: pointer; }
 a:visited { color: #551a8b; }
 a:active { color: #ff0000; }
-table { display: table; border-collapse: separate; border-spacing: 2px; box-sizing: border-box; }
+table { display: table; border-collapse: separate; border-spacing: 2px; box-sizing: border-box; text-align: start; }
 thead { display: table-header-group; vertical-align: middle; }
 tbody { display: table-row-group; vertical-align: middle; }
 tfoot { display: table-footer-group; vertical-align: middle; }

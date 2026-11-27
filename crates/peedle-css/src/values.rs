@@ -654,6 +654,14 @@ pub fn parse_color_value(tokens: &[Token]) -> Option<ColorValue> {
                 "lab" => parse_lab_fn(inner)?,
                 "lch" => parse_lch_fn(inner)?,
                 "color-mix" => parse_color_mix_fn(inner)?,
+                "light-dark" => {
+                    let parts = split_commas(inner);
+                    if parts.len() >= 2 {
+                        parse_color_from_tokens(parts[0], Color::BLACK)?
+                    } else {
+                        return None;
+                    }
+                }
                 _ => return None,
             };
             Some(ColorValue::Color(c))

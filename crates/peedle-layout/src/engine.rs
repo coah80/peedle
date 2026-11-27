@@ -288,16 +288,39 @@ impl LayoutEngine {
                 ) {
                     self.normalize_block_children(raw_children, &style)
                 } else if kind == BoxKind::Flex || kind == BoxKind::Grid {
-                    raw_children
-                        .into_iter()
-                        .filter(|&cid| {
-                            if let BoxKind::Text(ref t) = self.tree.get(cid).kind {
-                                !t.trim().is_empty()
-                            } else {
-                                true
+                    let mut wrapped = Vec::new();
+                    for cid in raw_children {
+                        if let BoxKind::Text(ref t) = self.tree.get(cid).kind {
+                            if t.trim().is_empty() {
+                                continue;
                             }
-                        })
-                        .collect()
+                            let mut anon_style = style.clone();
+                            anon_style.display = Display::Block;
+                            anon_style.background_color = peedle_css::Color::TRANSPARENT;
+                            anon_style.background_image = peedle_css::BackgroundImage::None;
+                            anon_style.border_top_width = 0.0;
+                            anon_style.border_right_width = 0.0;
+                            anon_style.border_bottom_width = 0.0;
+                            anon_style.border_left_width = 0.0;
+                            anon_style.padding_top = LengthPercentageAuto::px(0.0);
+                            anon_style.padding_right = LengthPercentageAuto::px(0.0);
+                            anon_style.padding_bottom = LengthPercentageAuto::px(0.0);
+                            anon_style.padding_left = LengthPercentageAuto::px(0.0);
+                            anon_style.margin_top = LengthPercentageAuto::px(0.0);
+                            anon_style.margin_right = LengthPercentageAuto::px(0.0);
+                            anon_style.margin_bottom = LengthPercentageAuto::px(0.0);
+                            anon_style.margin_left = LengthPercentageAuto::px(0.0);
+                            anon_style.width = LengthPercentageAuto::Auto;
+                            anon_style.height = LengthPercentageAuto::Auto;
+                            anon_style.box_shadow.clear();
+                            let anon = self.tree.alloc(None, BoxKind::AnonymousBlock, anon_style);
+                            self.tree.get_mut(anon).children.push(cid);
+                            wrapped.push(anon);
+                        } else {
+                            wrapped.push(cid);
+                        }
+                    }
+                    wrapped
                 } else {
                     raw_children
                 };
@@ -1095,6 +1118,36 @@ impl LayoutEngine {
                     .measure_str(s.trim(), &style.font_family, style.font_size, style.font_weight)
             }
             BoxKind::Replaced(ref rep) => self.resolve_replaced_size(rep, &style, cb_width, self.viewport_h).0,
+            BoxKind::Grid => {
+                let ctx_g = self.calc_ctx(&style, cb_width);
+                let gap = style.column_gap.resolve_or(&ctx_g, 0.0).max(0.0);
+                let mut total = 0.0f32;
+                let mut count = 0usize;
+                for tr in &style.grid_template_columns {
+                    match tr {
+                        peedle_css::GridTrackSize::Px(v) => {
+                            total += *v;
+                            count += 1;
+                        }
+                        peedle_css::GridTrackSize::Repeat(peedle_css::GridRepeatCount::Count(n), inner) => {
+                            for _ in 0..*n {
+                                for it in inner {
+                                    if let peedle_css::GridTrackSize::Px(v) = it {
+                                        total += *v;
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if count > 0 {
+                    total + gap * (count.saturating_sub(1) as f32)
+                } else {
+                    cb_width
+                }
+            }
             _ => {
                 let kids = self.tree.get(id).children.clone();
                 let mut sum_inline = 0.0f32;
