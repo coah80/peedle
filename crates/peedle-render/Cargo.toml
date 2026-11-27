@@ -10,6 +10,7 @@ peedle-layout.workspace = true
 fontdue.workspace = true
 image.workspace = true
 flate2.workspace = true
+wuff.workspace = true
 
 [dev-dependencies]
 peedle-net.workspace = true

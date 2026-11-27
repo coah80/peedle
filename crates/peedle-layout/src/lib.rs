@@ -9,4 +9,4 @@ pub mod text;
 pub use box_tree::{BoxKind, LayoutBox, LayoutBoxId, LayoutTree, ReplacedKind, TextFragment};
 pub use engine::{layout_document, LayoutEngine, SizeConstraint};
 pub use geometry::{Dimensions, EdgeSizes, Rect};
-pub use text::TextMeasurer;
+pub use text::{register_web_font_arc, register_web_font_arc_weighted, TextMeasurer};

@@ -111,6 +111,17 @@ pub enum Microtask {
         this: JsValue,
         args: Vec<JsValue>,
     },
+    PromiseReaction {
+        reaction: PromiseReaction,
+        fulfilled: bool,
+        arg: JsValue,
+    },
+    PromiseThenable {
+        then_fn: JsValue,
+        thenable: ObjectId,
+        resolve: ObjectId,
+        reject: ObjectId,
+    },
     Native(Box<dyn FnOnce(&mut JsRuntime)>),
 }
 
@@ -151,7 +162,8 @@ pub struct JsRuntime {
     pub realms: Vec<Realm>,
     pub current_realm_id: usize,
     pub symbols: WellKnownSymbols,
-    pub microtasks: Vec<Microtask>,
+    pub microtasks: std::collections::VecDeque<Microtask>,
+    pub active_microtask_roots: Vec<ObjectId>,
     pub console_lines: Vec<String>,
     pub active_frames: Vec<EnvId>,
     pub module_cache: HashMap<String, ObjectId>,
@@ -429,7 +441,8 @@ impl JsRuntime {
             realms: vec![realm0],
             current_realm_id: 0,
             symbols,
-            microtasks: Vec::new(),
+            microtasks: std::collections::VecDeque::new(),
+            active_microtask_roots: Vec::new(),
             console_lines: Vec::new(),
             active_frames: Vec::new(),
             module_cache: HashMap::new(),
@@ -2434,7 +2447,7 @@ impl JsRuntime {
     }
 
     pub fn queue_microtask(&mut self, cb: JsValue) {
-        self.microtasks.push(Microtask::Callback {
+        self.microtasks.push_back(Microtask::Callback {
             func: cb,
             this: JsValue::Undefined,
             args: Vec::new(),
@@ -2445,21 +2458,100 @@ impl JsRuntime {
     where
         F: FnOnce(&mut JsRuntime) + 'static,
     {
-        self.microtasks.push(Microtask::Native(Box::new(f)));
+        self.microtasks.push_back(Microtask::Native(Box::new(f)));
     }
 
     pub fn drain_microtasks(&mut self) {
         let mut guard = 0usize;
-        while !self.microtasks.is_empty() && guard < 100_000 {
+        while let Some(task) = self.microtasks.pop_front() {
             guard += 1;
-            let batch = std::mem::take(&mut self.microtasks);
-            for task in batch {
-                match task {
-                    Microtask::Callback { func, this, args } => {
-                        let _ = self.call_function(func, this, &args);
-                    }
-                    Microtask::Native(f) => f(self),
+            if guard > 100_000 {
+                break;
+            }
+            match task {
+                Microtask::Callback { func, this, args } => {
+                    let _ = self.call_function(func, this, &args);
                 }
+                Microtask::PromiseReaction {
+                    reaction,
+                    fulfilled,
+                    arg,
+                } => {
+                    let saved_roots = self.active_microtask_roots.len();
+                    if let Some(t) = reaction.target {
+                        self.active_microtask_roots.push(t);
+                    }
+                    if let Some(ref f) = reaction.resolve {
+                        trace_value(f, &mut self.active_microtask_roots);
+                    }
+                    if let Some(ref f) = reaction.reject {
+                        trace_value(f, &mut self.active_microtask_roots);
+                    }
+                    trace_value(&arg, &mut self.active_microtask_roots);
+                    let handler = if fulfilled {
+                        reaction.on_fulfilled
+                    } else {
+                        reaction.on_rejected
+                    };
+                    let resolve_target = |rt: &mut JsRuntime, v: JsValue| {
+                        if let Some(ref res_fn) = reaction.resolve {
+                            let _ = rt.call_function(res_fn.clone(), JsValue::Undefined, &[v]);
+                        } else if let Some(target) = reaction.target {
+                            rt.resolve_promise(target, v);
+                        }
+                    };
+                    let reject_target = |rt: &mut JsRuntime, r: JsValue| {
+                        if let Some(ref rej_fn) = reaction.reject {
+                            let _ = rt.call_function(rej_fn.clone(), JsValue::Undefined, &[r]);
+                        } else if let Some(target) = reaction.target {
+                            rt.reject_promise(target, r);
+                        }
+                    };
+                    match handler {
+                        Some(h) if self.is_callable(&h) => {
+                            match self.call_function(h, JsValue::Undefined, &[arg]) {
+                                Ok(v) => resolve_target(self, v),
+                                Err(e) => {
+                                    let ev = self.error_to_js_value(e);
+                                    reject_target(self, ev);
+                                }
+                            }
+                        }
+                        _ => {
+                            if fulfilled {
+                                resolve_target(self, arg);
+                            } else {
+                                reject_target(self, arg);
+                            }
+                        }
+                    }
+                    self.active_microtask_roots.truncate(saved_roots);
+                }
+                Microtask::PromiseThenable {
+                    then_fn,
+                    thenable,
+                    resolve,
+                    reject,
+                } => {
+                    let saved_roots = self.active_microtask_roots.len();
+                    self.active_microtask_roots.push(thenable);
+                    self.active_microtask_roots.push(resolve);
+                    self.active_microtask_roots.push(reject);
+                    if let Err(e) = self.call_function(
+                        then_fn,
+                        JsValue::Object(thenable),
+                        &[JsValue::Object(resolve), JsValue::Object(reject)],
+                    ) {
+                        let ev = self.error_to_js_value(e);
+                        let _ = self.call_function(
+                            JsValue::Object(reject),
+                            JsValue::Undefined,
+                            &[ev],
+                        );
+                    }
+                    self.active_microtask_roots.truncate(saved_roots);
+                }
+                Microtask::Native(f) => f(self),
             }
         }
     }
@@ -2563,13 +2655,46 @@ impl JsRuntime {
             root_objs.push(*p);
         }
         root_objs.extend_from_slice(&self.current_module_exports);
+        root_objs.extend_from_slice(&self.active_microtask_roots);
         for mt in &self.microtasks {
-            if let Microtask::Callback { func, this, args } = mt {
-                trace_value(func, &mut root_objs);
-                trace_value(this, &mut root_objs);
-                for a in args {
-                    trace_value(a, &mut root_objs);
+            match mt {
+                Microtask::Callback { func, this, args } => {
+                    trace_value(func, &mut root_objs);
+                    trace_value(this, &mut root_objs);
+                    for a in args {
+                        trace_value(a, &mut root_objs);
+                    }
                 }
+                Microtask::PromiseReaction { reaction, arg, .. } => {
+                    if let Some(ref f) = reaction.on_fulfilled {
+                        trace_value(f, &mut root_objs);
+                    }
+                    if let Some(ref f) = reaction.on_rejected {
+                        trace_value(f, &mut root_objs);
+                    }
+                    if let Some(t) = reaction.target {
+                        root_objs.push(t);
+                    }
+                    if let Some(ref f) = reaction.resolve {
+                        trace_value(f, &mut root_objs);
+                    }
+                    if let Some(ref f) = reaction.reject {
+                        trace_value(f, &mut root_objs);
+                    }
+                    trace_value(arg, &mut root_objs);
+                }
+                Microtask::PromiseThenable {
+                    then_fn,
+                    thenable,
+                    resolve,
+                    reject,
+                } => {
+                    trace_value(then_fn, &mut root_objs);
+                    root_objs.push(*thenable);
+                    root_objs.push(*resolve);
+                    root_objs.push(*reject);
+                }
+                Microtask::Native(_) => {}
             }
         }
         let mut root_envs = vec![self.global_env];
@@ -5572,19 +5697,11 @@ impl JsRuntime {
                             Ok(JsValue::Undefined)
                         }),
                     );
-                    self.queue_native_microtask(move |rt| {
-                        if let Err(e) = rt.call_function(
-                            then_fn,
-                            JsValue::Object(thenable_id),
-                            &[JsValue::Object(res_cb), JsValue::Object(rej_cb)],
-                        ) {
-                            let ev = rt.error_to_js_value(e);
-                            let _ = rt.call_function(
-                                JsValue::Object(rej_cb),
-                                JsValue::Undefined,
-                                &[ev],
-                            );
-                        }
+                    self.microtasks.push_back(Microtask::PromiseThenable {
+                        then_fn,
+                        thenable: thenable_id,
+                        resolve: res_cb,
+                        reject: rej_cb,
                     });
                     return;
                 }
@@ -5631,42 +5748,10 @@ impl JsRuntime {
         fulfilled: bool,
         arg: JsValue,
     ) {
-        self.queue_native_microtask(move |rt| {
-            let handler = if fulfilled {
-                reaction.on_fulfilled
-            } else {
-                reaction.on_rejected
-            };
-            let resolve_target = |rt: &mut JsRuntime, v: JsValue| {
-                if let Some(ref res_fn) = reaction.resolve {
-                    let _ = rt.call_function(res_fn.clone(), JsValue::Undefined, &[v]);
-                } else if let Some(target) = reaction.target {
-                    rt.resolve_promise(target, v);
-                }
-            };
-            let reject_target = |rt: &mut JsRuntime, r: JsValue| {
-                if let Some(ref rej_fn) = reaction.reject {
-                    let _ = rt.call_function(rej_fn.clone(), JsValue::Undefined, &[r]);
-                } else if let Some(target) = reaction.target {
-                    rt.reject_promise(target, r);
-                }
-            };
-            match handler {
-                Some(h) if rt.is_callable(&h) => match rt.call_function(h, JsValue::Undefined, &[arg]) {
-                    Ok(v) => resolve_target(rt, v),
-                    Err(e) => {
-                        let ev = rt.error_to_js_value(e);
-                        reject_target(rt, ev);
-                    }
-                },
-                _ => {
-                    if fulfilled {
-                        resolve_target(rt, arg);
-                    } else {
-                        reject_target(rt, arg);
-                    }
-                }
-            }
+        self.microtasks.push_back(Microtask::PromiseReaction {
+            reaction,
+            fulfilled,
+            arg,
         });
     }
 

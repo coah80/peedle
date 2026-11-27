@@ -24,7 +24,7 @@ pub enum FontFaceKey {
 #[derive(Clone)]
 pub struct FontSystem {
     faces: HashMap<FontFaceKey, Arc<Font>>,
-    custom_names: Vec<(String, FontFaceKey)>,
+    custom_names: Vec<(String, u16, bool, FontFaceKey)>,
     fallback_keys: Vec<FontFaceKey>,
     glyph_cache: Arc<Mutex<HashMap<(FontFaceKey, char, u32), (Metrics, Vec<u8>)>>>,
 }
@@ -181,30 +181,57 @@ impl FontSystem {
         }
     }
 
-    pub fn register_web_font(&mut self, family: &str, bytes: &[u8]) -> bool {
+    pub fn register_web_font(&mut self, family: &str, bytes: &[u8]) -> Option<Arc<Font>> {
+        self.register_web_font_styled(family, 400, false, bytes)
+    }
+
+    pub fn register_web_font_weighted(
+        &mut self,
+        family: &str,
+        weight: u16,
+        bytes: &[u8],
+    ) -> Option<Arc<Font>> {
+        self.register_web_font_styled(family, weight, false, bytes)
+    }
+
+    pub fn register_web_font_styled(
+        &mut self,
+        family: &str,
+        weight: u16,
+        italic: bool,
+        bytes: &[u8],
+    ) -> Option<Arc<Font>> {
         let norm = family.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
         if norm.is_empty() {
-            return false;
+            return None;
         }
-        if self.custom_names.iter().any(|(n, _)| n == &norm) {
-            return true;
-        }
-        let decoded = decode_woff1(bytes);
+        let decoded = decode_web_font(bytes);
         let font_bytes = decoded.as_deref().unwrap_or(bytes);
         if let Ok(font) = Font::from_bytes(font_bytes, FontSettings::default()) {
+            let arc = Arc::new(font);
             let key = FontFaceKey::Custom(self.custom_names.len());
-            self.faces.insert(key, Arc::new(font));
-            self.custom_names.push((norm, key));
-            return true;
+            self.faces.insert(key, Arc::clone(&arc));
+            self.custom_names.push((norm, weight, italic, key));
+            return Some(arc);
         }
-        false
+        None
     }
 
     pub fn select_face(&self, families: &[String], weight: u16, italic: bool) -> FontFaceKey {
         let bold = weight >= 600;
         for fam in families {
             let low = fam.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
-            if let Some((_, key)) = self.custom_names.iter().find(|(n, _)| n == &low) {
+            if let Some((_, _, _, key)) = self
+                .custom_names
+                .iter()
+                .filter(|(n, _, _, _)| n == &low)
+                .min_by_key(|(_, w, it, _)| {
+                    (
+                        if *it == italic { 0 } else { 1 },
+                        (*w as i32 - weight as i32).abs(),
+                    )
+                })
+            {
                 return *key;
             }
             if low.contains("mono")
@@ -269,8 +296,38 @@ impl FontSystem {
 
     fn resolve_glyph_font(&self, key: FontFaceKey, c: char) -> Option<(FontFaceKey, &Arc<Font>)> {
         let primary = self.font(key)?;
-        if c.is_ascii() || primary.lookup_glyph_index(c) != 0 {
+        if primary.lookup_glyph_index(c) != 0 {
             return Some((key, primary));
+        }
+        if let FontFaceKey::Custom(_) = key {
+            if let Some((fam, weight, italic, _)) =
+                self.custom_names.iter().find(|(_, _, _, k)| *k == key)
+            {
+                let mut best: Option<((i32, i32), FontFaceKey, &Arc<Font>)> = None;
+                for (n, w, it, k) in &self.custom_names {
+                    if *k != key && n == fam {
+                        if let Some(f) = self.faces.get(k) {
+                            if f.lookup_glyph_index(c) != 0 {
+                                let score = (
+                                    if *it == *italic { 0 } else { 1 },
+                                    (*w as i32 - *weight as i32).abs(),
+                                );
+                                if best.map_or(true, |(bs, _, _)| score < bs) {
+                                    best = Some((score, *k, f));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((_, bk, bf)) = best {
+                    return Some((bk, bf));
+                }
+            }
+            if let Some(sans) = self.faces.get(&FontFaceKey::SansRegular) {
+                if sans.lookup_glyph_index(c) != 0 {
+                    return Some((FontFaceKey::SansRegular, sans));
+                }
+            }
         }
         for &fk in &self.fallback_keys {
             if let Some(fb) = self.faces.get(&fk) {
@@ -344,6 +401,18 @@ impl FontSystem {
         }
         pen_x
     }
+}
+
+fn decode_web_font(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() >= 4 && &bytes[0..4] == b"wOF2" {
+        return wuff::decompress_woff2(bytes).ok();
+    }
+    if bytes.len() >= 4 && &bytes[0..4] == b"wOFF" {
+        return wuff::decompress_woff1(bytes)
+            .ok()
+            .or_else(|| decode_woff1(bytes));
+    }
+    None
 }
 
 fn decode_woff1(bytes: &[u8]) -> Option<Vec<u8>> {

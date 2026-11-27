@@ -1476,18 +1476,25 @@ button, input, select, textarea {
     box-sizing: border-box;
 }
 button, input[type=button], input[type=submit], input[type=reset] {
-    padding: 2px 8px;
-    border: 1px solid #767676;
-    background-color: #efefef;
-    color: #000000;
+    padding: 4px 10px;
+    border: 1px solid #94a3b8;
+    border-radius: 4px;
+    background-color: #f1f5f9;
+    color: #0f172a;
     cursor: pointer;
     text-align: center;
 }
 input, textarea, select {
-    padding: 2px 4px;
-    border: 1px solid #767676;
+    padding: 4px 8px;
+    border: 1px solid #b4bcc6;
+    border-radius: 4px;
     background-color: #ffffff;
-    color: #000000;
+    color: #0f172a;
+}
+input[type=checkbox i], input[type=radio i] {
+    padding: 0;
+    border: 0;
+    background-color: transparent;
 }
 input[type=hidden i] { display: none; }
 textarea { white-space: pre-wrap; }
@@ -1495,4 +1502,5 @@ fieldset { border: 2px groove #c0c0c0; padding: 0.35em 0.75em 0.625em; margin: 0
 details:not([open]) > :not(summary) { display: none; }
 summary { cursor: pointer; font-weight: bold; }
 center { text-align: center; }
+center > table, center > div { margin-left: auto; margin-right: auto; }
 ";

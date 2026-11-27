@@ -628,6 +628,7 @@ fn paint_box(
 
     let clips = !matches!(b.style.overflow_x, Overflow::Visible)
         || !matches!(b.style.overflow_y, Overflow::Visible);
+    let mut rounded_clipped = false;
     if clips {
         let pb = b.dims.padding_box();
         let clip_top = pb.y + dy;
@@ -640,6 +641,16 @@ fn paint_box(
             w: (pb.width * s).ceil() as i32,
             h: (pb.height * s).ceil() as i32,
         });
+        if sradii.iter().any(|&r| r > 0.5) && pb.width > 0.0 && pb.height > 0.0 {
+            fb.push_rounded_clip(
+                (pb.x + dx) * s,
+                clip_top * s,
+                pb.width * s,
+                pb.height * s,
+                sradii,
+            );
+            rounded_clipped = true;
+        }
     }
 
     let mut ordered_children = b.children.clone();
@@ -685,6 +696,9 @@ fn paint_box(
         );
     }
 
+    if rounded_clipped {
+        fb.pop_rounded_clip();
+    }
     if clips {
         fb.pop_clip();
     }
@@ -860,88 +874,36 @@ fn paint_replaced(
                 }
             }
             "submit" | "button" | "reset" => {
-                let has_author_chrome = style.background_color.a > 0
-                    || !matches!(style.background_image, BackgroundImage::None)
-                    || style.effective_border_top_width() > 0.0
-                    || style.effective_border_right_width() > 0.0
-                    || style.effective_border_bottom_width() > 0.0
-                    || style.effective_border_left_width() > 0.0;
-                if !has_author_chrome {
-                    fb.fill_rounded_rect(
-                        x * s,
-                        y * s,
-                        w * s,
-                        h * s,
-                        [4.0 * s; 4],
-                        RgbaColor::new(241, 245, 249, 255),
+                if !value.is_empty() {
+                    let fs = style.font_size.clamp(10.0, 24.0);
+                    let key = fonts.select_face(
+                        &style.font_family,
+                        style.font_weight,
+                        style.font_style == FontStyle::Italic,
                     );
-                    fb.stroke_rounded_rect(
-                        x * s,
-                        y * s,
-                        w * s,
-                        h * s,
-                        [4.0 * s; 4],
-                        [1.0 * s; 4],
-                        [RgbaColor::new(148, 163, 184, 255); 4],
+                    let tw = fonts.measure_text(value, key, fs);
+                    let tc = to_rgba(style.color).with_alpha(alpha);
+                    fonts.draw_text(
+                        fb,
+                        value,
+                        (x + (w - tw) * 0.5) * s,
+                        (y + (h + fs * 0.72) * 0.5) * s,
+                        key,
+                        fs * s,
+                        tc,
                     );
                 }
-                let label = if value.is_empty() { "Submit" } else { value.as_str() };
-                let fs = style.font_size.clamp(10.0, 24.0);
-                let key = fonts.select_face(
-                    &style.font_family,
-                    style.font_weight,
-                    style.font_style == FontStyle::Italic,
-                );
-                let tw = fonts.measure_text(label, key, fs);
-                let tc = if has_author_chrome {
-                    to_rgba(style.color).with_alpha(alpha)
-                } else {
-                    RgbaColor::new(15, 23, 42, 255).with_alpha(alpha)
-                };
-                fonts.draw_text(
-                    fb,
-                    label,
-                    (x + (w - tw) * 0.5) * s,
-                    (y + (h + fs * 0.72) * 0.5) * s,
-                    key,
-                    fs * s,
-                    tc,
-                );
             }
             _ => {
-                let has_author_chrome = style.background_color.a > 0
-                    || !matches!(style.background_image, BackgroundImage::None)
-                    || style.effective_border_top_width() > 0.0
-                    || style.effective_border_right_width() > 0.0
-                    || style.effective_border_bottom_width() > 0.0
-                    || style.effective_border_left_width() > 0.0;
                 let focused = node
                     .and_then(|nid| doc.element(nid))
                     .map_or(false, |e| e.focused);
-                if !has_author_chrome {
-                    let border_c = if focused {
-                        RgbaColor::new(37, 99, 235, 255)
-                    } else {
-                        RgbaColor::new(180, 188, 198, 255)
-                    };
-                    fb.fill_rounded_rect(x * s, y * s, w * s, h * s, [4.0 * s; 4], RgbaColor::WHITE);
-                    fb.stroke_rounded_rect(
-                        x * s,
-                        y * s,
-                        w * s,
-                        h * s,
-                        [4.0 * s; 4],
-                        [if focused { 2.0 } else { 1.0 } * s; 4],
-                        [border_c; 4],
-                    );
-                }
                 let fs = style.font_size.clamp(10.0, 24.0);
                 let key = fonts.select_face(
                     &style.font_family,
                     style.font_weight,
                     style.font_style == FontStyle::Italic,
                 );
-                let pad_x = if has_author_chrome { 0.0 } else { 8.0 };
                 let (shown, tc) = if !value.is_empty() {
                     let sv = if input_type == "password" {
                         "\u{2022}".repeat(value.chars().count())
@@ -955,7 +917,7 @@ fn paint_replaced(
                 let end_x_phys = fonts.draw_text(
                     fb,
                     &shown,
-                    (x + pad_x) * s,
+                    x * s,
                     (y + (h + fs * 0.72) * 0.5) * s,
                     key,
                     fs * s,
@@ -963,48 +925,29 @@ fn paint_replaced(
                 );
                 if focused {
                     let caret_x = if value.is_empty() {
-                        (x + pad_x) * s
+                        x * s
                     } else {
                         end_x_phys + 1.0 * s
                     };
                     fb.fill_rect(
                         caret_x,
-                        (y + (h - fs).max(4.0) * 0.5) * s,
+                        (y + (h - fs).max(2.0) * 0.5) * s,
                         1.5 * s,
-                        fs.min(h - 4.0).max(8.0) * s,
+                        fs.min(h.max(10.0)).max(8.0) * s,
                         to_rgba(style.color).with_alpha(alpha),
                     );
                 }
             }
         },
         ReplacedKind::Textarea { value, .. } => {
-            let has_author_chrome = style.background_color.a > 0
-                || !matches!(style.background_image, BackgroundImage::None)
-                || style.effective_border_top_width() > 0.0
-                || style.effective_border_right_width() > 0.0
-                || style.effective_border_bottom_width() > 0.0
-                || style.effective_border_left_width() > 0.0;
-            if !has_author_chrome {
-                fb.fill_rounded_rect(x * s, y * s, w * s, h * s, [4.0 * s; 4], RgbaColor::WHITE);
-                fb.stroke_rounded_rect(
-                    x * s,
-                    y * s,
-                    w * s,
-                    h * s,
-                    [4.0 * s; 4],
-                    [1.0 * s; 4],
-                    [RgbaColor::new(180, 188, 198, 255); 4],
-                );
-            }
             let fs = style.font_size.clamp(10.0, 22.0);
-            let pad_x = if has_author_chrome { 0.0 } else { 6.0 };
             for (idx, line) in value.lines().enumerate() {
-                let ly = y + fs + 4.0 + idx as f32 * (fs * 1.3);
+                let ly = y + fs + 2.0 + idx as f32 * (fs * 1.3);
                 if ly < y + h {
                     fonts.draw_text(
                         fb,
                         line,
-                        (x + pad_x) * s,
+                        x * s,
                         ly * s,
                         FontFaceKey::SansRegular,
                         fs * s,
@@ -1014,43 +957,17 @@ fn paint_replaced(
             }
         }
         ReplacedKind::Select { label } => {
-            let has_author_chrome = style.background_color.a > 0
-                || !matches!(style.background_image, BackgroundImage::None)
-                || style.effective_border_top_width() > 0.0
-                || style.effective_border_right_width() > 0.0
-                || style.effective_border_bottom_width() > 0.0
-                || style.effective_border_left_width() > 0.0;
-            if !has_author_chrome {
-                fb.fill_rounded_rect(
-                    x * s,
-                    y * s,
-                    w * s,
-                    h * s,
-                    [4.0 * s; 4],
-                    RgbaColor::new(248, 250, 252, 255),
-                );
-                fb.stroke_rounded_rect(
-                    x * s,
-                    y * s,
-                    w * s,
-                    h * s,
-                    [4.0 * s; 4],
-                    [1.0 * s; 4],
-                    [RgbaColor::new(180, 188, 198, 255); 4],
-                );
-            }
             let fs = style.font_size.clamp(10.0, 20.0);
-            let pad_x = if has_author_chrome { 2.0 } else { 8.0 };
             fonts.draw_text(
                 fb,
                 label,
-                (x + pad_x) * s,
+                (x + 2.0) * s,
                 (y + (h + fs * 0.72) * 0.5) * s,
                 FontFaceKey::SansRegular,
                 fs * s,
                 to_rgba(style.color).with_alpha(alpha),
             );
-            let ax = (x + w - 12.0) * s;
+            let ax = (x + w - 10.0) * s;
             let ay = (y + h * 0.44) * s;
             fb.draw_line_aa(
                 ax - 3.5 * s,

@@ -332,6 +332,7 @@ fn resolve_track_sizes(
 ) -> Vec<f32> {
     let mut sizes = vec![0.0f32; num_cols];
     let mut fr_weights = vec![0.0f32; num_cols];
+    let mut max_caps: Vec<Option<f32>> = vec![None; num_cols];
     let mut used = gap * (num_cols.saturating_sub(1) as f32);
 
     let has_explicit_fr = tracks.iter().take(num_cols).any(|t| match t {
@@ -371,9 +372,9 @@ fn resolve_track_sizes(
                 if let GridTrackSize::Fr(w) = **max_t {
                     fr_weights[i] = w.max(0.0);
                 } else if let Some(max_v) = fixed_track_size(max_t, available) {
-                    let extra = (max_v - min_v).max(0.0);
-                    sizes[i] += extra;
-                    used += extra;
+                    if max_v > min_v {
+                        max_caps[i] = Some(max_v);
+                    }
                 } else {
                     fr_weights[i] = 1.0;
                 }
@@ -399,6 +400,39 @@ fn resolve_track_sizes(
             GridTrackSize::Repeat(_, _) => {
                 fr_weights[i] = 1.0;
             }
+        }
+    }
+
+    let capped_indices: Vec<usize> = max_caps
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.map(|_| i))
+        .collect();
+    if !capped_indices.is_empty() {
+        let mut rem = (available - used).max(0.0);
+        let mut active = capped_indices;
+        while rem > 0.01 && !active.is_empty() {
+            let share = rem / active.len() as f32;
+            let mut next_active = Vec::new();
+            let mut spent = 0.0f32;
+            for i in active {
+                let cap = max_caps[i].unwrap();
+                let room = (cap - sizes[i]).max(0.0);
+                if room <= share + 0.01 {
+                    sizes[i] += room;
+                    spent += room;
+                } else {
+                    sizes[i] += share;
+                    spent += share;
+                    next_active.push(i);
+                }
+            }
+            used += spent;
+            rem = (rem - spent).max(0.0);
+            if spent <= 0.001 {
+                break;
+            }
+            active = next_active;
         }
     }
 

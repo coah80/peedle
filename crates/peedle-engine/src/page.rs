@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use peedle_css::parse_stylesheet;
+use peedle_css::{parse_stylesheet, LayerBlockRule, Rule, Stylesheet, Viewport};
 use peedle_dom::{BrowserJsEnv, SharedOriginStorage};
 use peedle_html::{parse_html, Document, NodeId};
 use peedle_net::HttpClient;
@@ -288,7 +288,7 @@ pub fn fetch_navigation_background(
         }
     }
 
-    let warm_queue = Mutex::new(VecDeque::from(warm_urls.into_iter().take(48).collect::<Vec<_>>()));
+    let warm_queue = Mutex::new(VecDeque::from(warm_urls.into_iter().take(160).collect::<Vec<_>>()));
     let img_queue = Mutex::new(VecDeque::from(img_urls.into_iter().take(72).collect::<Vec<_>>()));
     let decoded_out = Mutex::new(Vec::new());
     let log_out = Mutex::new(Vec::new());
@@ -906,11 +906,16 @@ impl Page {
             out
         };
 
-        let tasks: Vec<(NodeId, String)> = css_links.into_iter().take(28).collect();
+        let tasks: Vec<(NodeId, String)> = css_links.into_iter().take(128).collect();
         let queue = Mutex::new(VecDeque::from(tasks));
         let results = Mutex::new(Vec::new());
         let workers = queue.lock().unwrap().len().min(6);
         let client = &self.client;
+        let vp = Viewport {
+            width: self.viewport_w,
+            height: self.viewport_h,
+            dark_mode: self.dark_mode,
+        };
 
         if workers > 0 {
             std::thread::scope(|s| {
@@ -931,8 +936,21 @@ impl Page {
                                 || low.contains("css")
                                 || low.contains("text/plain")
                                 || low.contains("octet-stream");
+                            let mut extra_logs = Vec::new();
                             let parsed = if status < 400 && mime_ok {
-                                Some(parse_stylesheet(&resp.text()))
+                                let mut sheet = parse_stylesheet(&resp.text());
+                                let mut visited = HashSet::new();
+                                visited.insert(css_url.clone());
+                                expand_stylesheet_resources(
+                                    client,
+                                    &mut sheet,
+                                    &css_url,
+                                    &vp,
+                                    0,
+                                    &mut visited,
+                                    &mut extra_logs,
+                                );
+                                Some(sheet)
                             } else {
                                 None
                             };
@@ -944,7 +962,7 @@ impl Page {
                                 bytes,
                                 duration_ms: elapsed,
                             };
-                            results.lock().unwrap().push((nid, entry, parsed));
+                            results.lock().unwrap().push((nid, entry, extra_logs, parsed));
                         }
                     });
                 }
@@ -952,8 +970,9 @@ impl Page {
         }
 
         let mut sheets = HashMap::new();
-        for (nid, entry, parsed) in results.into_inner().unwrap() {
+        for (nid, entry, extra_logs, parsed) in results.into_inner().unwrap() {
             self.network_log.push(entry);
+            self.network_log.extend(extra_logs);
             if let Some(sheet) = parsed {
                 sheets.insert(nid, sheet);
             }
@@ -1142,7 +1161,7 @@ impl Page {
     }
 
     pub fn recompute_if_needed(&mut self) {
-        let font_reqs: Vec<(String, String)> = {
+        let font_reqs: Vec<(String, u16, bool, Vec<String>)> = {
             let mut st = self.js_env.dom.borrow_mut();
             st.dark_mode = self.dark_mode;
             let visited_urls: HashSet<String> = st.subdoc_urls.values().cloned().collect();
@@ -1172,27 +1191,79 @@ impl Page {
                 }
             }
             st.ensure_layout();
-            let mut out = Vec::new();
+            let mut out: Vec<(String, u16, bool, Vec<String>)> = Vec::new();
             for ff in &st.styles.font_faces {
                 if let Some(ref fam) = ff.font_family {
+                    let weight = parse_font_face_weight(ff.font_weight.as_deref());
+                    let italic = ff.font_style.as_deref().map_or(false, |s| {
+                        let low = s.trim().to_ascii_lowercase();
+                        low.contains("italic") || low.contains("oblique")
+                    });
+                    let mut urls = Vec::new();
                     for src in &ff.src {
                         if let Some(resolved) = self.resolve_subresource_url(src) {
                             if !self.failed_images.contains(&resolved) {
-                                out.push((fam.clone(), resolved));
+                                urls.push(resolved);
                             }
                         }
+                    }
+                    if !urls.is_empty() {
+                        out.push((fam.clone(), weight, italic, urls));
                     }
                 }
             }
             out
         };
-        for (fam, url) in font_reqs {
-            self.failed_images.insert(url.clone());
-            if let Ok(resp) = self.client.get_cached(&url) {
-                if resp.status < 400 {
-                    let _ = self.fonts.register_web_font(&fam, &resp.body);
+        let mut to_fetch: Vec<(String, u16, bool, Vec<String>)> = Vec::new();
+        for (fam, weight, italic, urls) in font_reqs.into_iter().take(80) {
+            for u in &urls {
+                self.failed_images.insert(u.clone());
+            }
+            to_fetch.push((fam, weight, italic, urls));
+        }
+        let mut registered_any = false;
+        if !to_fetch.is_empty() {
+            let queue = Mutex::new(VecDeque::from(to_fetch));
+            let fetched: Mutex<Vec<(String, u16, bool, Vec<u8>)>> = Mutex::new(Vec::new());
+            let workers = queue.lock().unwrap().len().min(6);
+            let client = &self.client;
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| loop {
+                        let item = queue.lock().unwrap().pop_front();
+                        let Some((fam, weight, italic, urls)) = item else {
+                            break;
+                        };
+                        for url in urls {
+                            if let Ok(resp) = client.get_cached(&url) {
+                                if resp.status < 400 && !resp.body.is_empty() {
+                                    fetched
+                                        .lock()
+                                        .unwrap()
+                                        .push((fam, weight, italic, resp.body));
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            for (fam, weight, italic, body) in fetched.into_inner().unwrap() {
+                if let Some(arc) = self
+                    .fonts
+                    .register_web_font_styled(&fam, weight, italic, &body)
+                {
+                    if !italic {
+                        peedle_layout::register_web_font_arc_weighted(&fam, weight, arc);
+                    }
+                    registered_any = true;
                 }
             }
+        }
+        if registered_any {
+            let mut st = self.js_env.dom.borrow_mut();
+            st.dirty_layout = true;
+            st.ensure_layout();
         }
         self.clamp_scroll();
     }
@@ -2258,4 +2329,137 @@ fn escape_text(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn parse_font_face_weight(raw: Option<&str>) -> u16 {
+    let Some(s) = raw else {
+        return 400;
+    };
+    let trimmed = s.trim().to_ascii_lowercase();
+    if trimmed == "bold" {
+        return 700;
+    }
+    if trimmed == "normal" {
+        return 400;
+    }
+    if let Some(first) = trimmed.split_ascii_whitespace().next() {
+        if let Ok(n) = first.parse::<u16>() {
+            return n.clamp(100, 900);
+        }
+    }
+    400
+}
+
+fn expand_stylesheet_resources(
+    client: &HttpClient,
+    sheet: &mut Stylesheet,
+    sheet_url: &str,
+    vp: &Viewport,
+    depth: usize,
+    visited: &mut HashSet<String>,
+    logs: &mut Vec<NetworkEntry>,
+) {
+    let base = Url::parse(sheet_url).ok();
+    let old_rules = std::mem::take(&mut sheet.rules);
+    sheet.rules = expand_rule_list(client, old_rules, &base, vp, depth, visited, logs);
+}
+
+fn expand_rule_list(
+    client: &HttpClient,
+    rules: Vec<Rule>,
+    base: &Option<Url>,
+    vp: &Viewport,
+    depth: usize,
+    visited: &mut HashSet<String>,
+    logs: &mut Vec<NetworkEntry>,
+) -> Vec<Rule> {
+    let mut out = Vec::with_capacity(rules.len());
+    for rule in rules {
+        match rule {
+            Rule::Import(imp) => {
+                if depth >= 4 {
+                    continue;
+                }
+                if let Some(ref mq) = imp.media {
+                    if !mq.matches(vp) {
+                        continue;
+                    }
+                }
+                let Some(resolved) = resolve_url_against(base, &imp.url) else {
+                    continue;
+                };
+                if !visited.insert(resolved.clone()) {
+                    continue;
+                }
+                let start = Instant::now();
+                if let Ok(resp) = client.get_cached(&resolved) {
+                    let elapsed = start.elapsed().as_millis() as u64;
+                    let ct = resp.content_type().to_string();
+                    let status = resp.status;
+                    let bytes = resp.body.len();
+                    logs.push(NetworkEntry {
+                        method: "GET".to_string(),
+                        url: resolved.clone(),
+                        status,
+                        content_type: ct.clone(),
+                        bytes,
+                        duration_ms: elapsed,
+                    });
+                    let low = ct.to_ascii_lowercase();
+                    let mime_ok = low.is_empty()
+                        || low.contains("css")
+                        || low.contains("text/plain")
+                        || low.contains("octet-stream");
+                    if status < 400 && mime_ok {
+                        let mut imported = parse_stylesheet(&resp.text());
+                        expand_stylesheet_resources(
+                            client,
+                            &mut imported,
+                            &resolved,
+                            vp,
+                            depth + 1,
+                            visited,
+                            logs,
+                        );
+                        if let Some(layer_name) = imp.layer {
+                            out.push(Rule::LayerBlock(LayerBlockRule {
+                                name: layer_name,
+                                rules: imported.rules,
+                            }));
+                        } else {
+                            out.extend(imported.rules);
+                        }
+                    }
+                }
+            }
+            Rule::FontFace(mut ff) => {
+                for src in &mut ff.src {
+                    if let Some(resolved) = resolve_url_against(base, src) {
+                        *src = resolved;
+                    }
+                }
+                out.push(Rule::FontFace(ff));
+            }
+            Rule::Media { query, rules } => {
+                let expanded = expand_rule_list(client, rules, base, vp, depth, visited, logs);
+                out.push(Rule::Media {
+                    query,
+                    rules: expanded,
+                });
+            }
+            Rule::Supports { condition, rules } => {
+                let expanded = expand_rule_list(client, rules, base, vp, depth, visited, logs);
+                out.push(Rule::Supports {
+                    condition,
+                    rules: expanded,
+                });
+            }
+            Rule::LayerBlock(mut lb) => {
+                lb.rules = expand_rule_list(client, lb.rules, base, vp, depth, visited, logs);
+                out.push(Rule::LayerBlock(lb));
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }

@@ -1433,6 +1433,16 @@ fn expand_list_style(tokens: &[Token]) -> Vec<(String, Vec<Token>)> {
 }
 
 fn expand_text_decoration(tokens: &[Token]) -> Vec<(String, Vec<Token>)> {
+    if let [Token::Ident(s)] = tokens {
+        let l = s.to_ascii_lowercase();
+        if matches!(l.as_str(), "inherit" | "initial" | "unset" | "revert") {
+            return vec![
+                ("text-decoration-line".into(), tokens.to_vec()),
+                ("text-decoration-style".into(), tokens.to_vec()),
+                ("text-decoration-color".into(), tokens.to_vec()),
+            ];
+        }
+    }
     let mut out = Vec::new();
     for g in split_whitespace_groups(tokens) {
         if let Some(Token::Ident(s)) = g.first() {
@@ -2675,6 +2685,9 @@ fn apply_longhand(
                 let mut combined = String::new();
                 let mut any = false;
                 for t in trimmed {
+                    if matches!(t, Token::Delim('/')) {
+                        break;
+                    }
                     if let Token::String(s) = t {
                         combined.push_str(s);
                         any = true;
@@ -2972,12 +2985,25 @@ fn presentational_declarations(el: &ElementData) -> Vec<Declaration> {
         }
     }
     if let Some(align) = el.get_attr("align") {
-        match align.trim().to_ascii_lowercase().as_str() {
-            "left" => push_decl(&mut out, "text-align", "left"),
-            "right" => push_decl(&mut out, "text-align", "right"),
-            "center" | "middle" => push_decl(&mut out, "text-align", "center"),
-            "justify" => push_decl(&mut out, "text-align", "justify"),
-            _ => {}
+        let a = align.trim().to_ascii_lowercase();
+        if el.tag_is("table") {
+            match a.as_str() {
+                "center" | "middle" => {
+                    push_decl(&mut out, "margin-left", "auto");
+                    push_decl(&mut out, "margin-right", "auto");
+                }
+                "left" => push_decl(&mut out, "float", "left"),
+                "right" => push_decl(&mut out, "float", "right"),
+                _ => {}
+            }
+        } else {
+            match a.as_str() {
+                "left" => push_decl(&mut out, "text-align", "left"),
+                "right" => push_decl(&mut out, "text-align", "right"),
+                "center" | "middle" => push_decl(&mut out, "text-align", "center"),
+                "justify" => push_decl(&mut out, "text-align", "justify"),
+                _ => {}
+            }
         }
     }
     if let Some(valign) = el.get_attr("valign") {

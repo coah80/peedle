@@ -613,7 +613,9 @@ impl LayoutEngine {
                 let children = self.tree.get(id).children.clone();
                 let has_block_children = children.iter().any(|&cid| {
                     let cb = self.tree.get(cid);
-                    cb.style.float == Float::None && self.is_block_level(cid)
+                    cb.style.float == Float::None
+                        && !matches!(cb.style.position, Position::Absolute | Position::Fixed)
+                        && self.is_block_level(cid)
                 });
                 let explicit_h = self.resolve_explicit_height(&style, cb_height);
                 let is_root = self.tree.root == Some(id);
@@ -642,7 +644,15 @@ impl LayoutEngine {
                         explicit_h,
                     )
                 } else {
-                    self.layout_inline_children(id, &children, content_x, content_y, content_w, child_cb_h)
+                    self.layout_inline_children(
+                        id,
+                        &children,
+                        content_x,
+                        content_y,
+                        content_w,
+                        child_cb_h,
+                        explicit_h,
+                    )
                 };
                 if establishes_bfc {
                     content_h = content_h.max((self.float_ctx.max_bottom() - content_y).max(0.0));
@@ -923,10 +933,12 @@ impl LayoutEngine {
         content_y: f32,
         content_w: f32,
         cb_height: f32,
+        explicit_h: Option<f32>,
     ) -> f32 {
         let container_style = self.tree.get(container_id).style.clone();
         let mut flat: Vec<InlineItem> = Vec::new();
         self.collect_inline_items(children, content_w, &mut flat);
+        let mut abs_children: Vec<LayoutBoxId> = Vec::new();
 
         let base_line_h = container_style.line_height.resolve(container_style.font_size);
         let mut cur_y = content_y;
@@ -1026,7 +1038,7 @@ impl LayoutEngine {
             let item_kind = self.tree.get(item_id).kind.clone();
             let item_style = self.tree.get(item_id).style.clone();
             if matches!(item_style.position, Position::Absolute | Position::Fixed) {
-                self.layout_out_of_flow(item_id, container_id);
+                abs_children.push(item_id);
                 continue;
             }
             if item_style.float != Float::None {
@@ -1366,7 +1378,12 @@ impl LayoutEngine {
         }
 
         self.update_inline_wrapper_bounds(children);
-        (cur_y - content_y).max(0.0)
+        let total_h = (cur_y - content_y).max(0.0);
+        self.tree.get_mut(container_id).dims.content.height = explicit_h.unwrap_or(total_h);
+        for cid in abs_children {
+            self.layout_out_of_flow(cid, container_id);
+        }
+        total_h
     }
 
     fn collect_inline_items(
@@ -1409,6 +1426,9 @@ impl LayoutEngine {
                 let mut max_x = f32::NEG_INFINITY;
                 let mut max_y = f32::NEG_INFINITY;
                 for &sc in &sub {
+                    if matches!(self.tree.get(sc).style.position, Position::Absolute | Position::Fixed) {
+                        continue;
+                    }
                     let r = self.tree.get(sc).dims.border_box();
                     if r.width > 0.0 || r.height > 0.0 {
                         min_x = min_x.min(r.x);
@@ -1580,56 +1600,144 @@ impl LayoutEngine {
         let kind = self.tree.get(id).kind.clone();
         let style = self.tree.get(id).style.clone();
         let ctx = self.calc_ctx(&style, cb_width);
-        if matches!(style.width, LengthPercentageAuto::Length(_)) {
+        let pb = if matches!(kind, BoxKind::Text(_)) {
+            0.0
+        } else {
+            style.padding_left.resolve_or(&ctx, 0.0)
+                + style.padding_right.resolve_or(&ctx, 0.0)
+                + style.border_left_width
+                + style.border_right_width
+        };
+        let mut raw = if matches!(style.width, LengthPercentageAuto::Length(_)) {
             if let Some(w) = style.width.resolve(&ctx) {
-                return w;
+                if style.box_sizing == BoxSizing::BorderBox {
+                    (w - pb).max(0.0)
+                } else {
+                    w
+                }
+            } else {
+                0.0
             }
-        }
-        match kind {
-            BoxKind::Text(ref t) => {
-                let s = apply_text_transform(t, style.text_transform);
-                self.measurer
-                    .measure_str(s.trim(), &style.font_family, style.font_size, style.font_weight)
-            }
-            BoxKind::Replaced(ref rep) => self.resolve_replaced_size(rep, &style, cb_width, self.viewport_h).0,
-            BoxKind::Grid => {
-                let ctx_g = self.calc_ctx(&style, cb_width);
-                let gap = style.column_gap.resolve_or(&ctx_g, 0.0).max(0.0);
-                let mut total = 0.0f32;
-                let mut px_count = 0usize;
-                let mut total_tracks = 0usize;
-                for tr in &style.grid_template_columns {
-                    match tr {
-                        peedle_css::GridTrackSize::Px(v) => {
-                            total += *v;
-                            px_count += 1;
-                            total_tracks += 1;
-                        }
-                        peedle_css::GridTrackSize::Repeat(peedle_css::GridRepeatCount::Count(n), inner) => {
-                            for _ in 0..*n {
-                                for it in inner {
-                                    total_tracks += 1;
-                                    if let peedle_css::GridTrackSize::Px(v) = it {
-                                        total += *v;
-                                        px_count += 1;
+        } else {
+            match kind {
+                BoxKind::Text(ref t) => {
+                    let s = apply_text_transform(t, style.text_transform);
+                    self.measurer.measure_str(
+                        s.trim(),
+                        &style.font_family,
+                        style.font_size,
+                        style.font_weight,
+                    )
+                }
+                BoxKind::Replaced(ref rep) => {
+                    if matches!(style.width, LengthPercentageAuto::Percent(_)) {
+                        let mut intrinsic_style = style.clone();
+                        intrinsic_style.width = LengthPercentageAuto::Auto;
+                        self.resolve_replaced_size(rep, &intrinsic_style, cb_width, self.viewport_h).0
+                    } else {
+                        self.resolve_replaced_size(rep, &style, cb_width, self.viewport_h).0
+                    }
+                }
+                BoxKind::Grid => {
+                    let ctx_g = self.calc_ctx(&style, cb_width);
+                    let gap = style.column_gap.resolve_or(&ctx_g, 0.0).max(0.0);
+                    let mut total = 0.0f32;
+                    let mut px_count = 0usize;
+                    let mut total_tracks = 0usize;
+                    for tr in &style.grid_template_columns {
+                        match tr {
+                            peedle_css::GridTrackSize::Px(v) => {
+                                total += *v;
+                                px_count += 1;
+                                total_tracks += 1;
+                            }
+                            peedle_css::GridTrackSize::Repeat(
+                                peedle_css::GridRepeatCount::Count(n),
+                                inner,
+                            ) => {
+                                for _ in 0..*n {
+                                    for it in inner {
+                                        total_tracks += 1;
+                                        if let peedle_css::GridTrackSize::Px(v) = it {
+                                            total += *v;
+                                            px_count += 1;
+                                        }
                                     }
                                 }
                             }
+                            _ => {
+                                total_tracks += 1;
+                            }
                         }
-                        _ => {
-                            total_tracks += 1;
+                    }
+                    let area_cols = style
+                        .grid_template_areas
+                        .iter()
+                        .map(|r| r.len())
+                        .max()
+                        .unwrap_or(0);
+                    if px_count > 0 && px_count == total_tracks && area_cols <= total_tracks {
+                        total + gap * (px_count.saturating_sub(1) as f32)
+                    } else {
+                        let kids = self.tree.get(id).children.clone();
+                        let cols = total_tracks.max(area_cols).max(1);
+                        let mut col_widths = vec![0.0f32; cols];
+                        let mut col_idx = 0usize;
+                        let mut non_empty_kids = 0usize;
+                        let mut inline_sum = 0.0f32;
+                        for cid in kids {
+                            let cs = self.tree.get(cid).style.clone();
+                            if matches!(cs.position, Position::Absolute | Position::Fixed) {
+                                continue;
+                            }
+                            let cw = self.measure_intrinsic_width(cid, cb_width);
+                            let extra = if matches!(self.tree.get(cid).kind, BoxKind::Text(_)) {
+                                0.0
+                            } else {
+                                let cctx = self.calc_ctx(&cs, cb_width);
+                                cs.padding_left.resolve_or(&cctx, 0.0)
+                                    + cs.padding_right.resolve_or(&cctx, 0.0)
+                                    + cs.border_left_width
+                                    + cs.border_right_width
+                                    + cs.margin_left.resolve_or(&cctx, 0.0)
+                                    + cs.margin_right.resolve_or(&cctx, 0.0)
+                            };
+                            let w = cw + extra;
+                            let c = col_idx % cols;
+                            col_widths[c] = col_widths[c].max(w);
+                            col_idx += 1;
+                            non_empty_kids += 1;
+                            inline_sum += w;
+                        }
+                        if total_tracks > 0 || area_cols > 0 {
+                            let active = col_widths.iter().filter(|&&w| w > 0.0).count();
+                            let sum: f32 = col_widths.iter().sum();
+                            let gaps = gap * (active.saturating_sub(1) as f32);
+                            (sum + gaps).max(total)
+                        } else if non_empty_kids > 0 {
+                            inline_sum + gap * (non_empty_kids.saturating_sub(1) as f32)
+                        } else {
+                            0.0
                         }
                     }
                 }
-                if px_count > 0 && px_count == total_tracks {
-                    total + gap * (px_count.saturating_sub(1) as f32)
-                } else if style.display == Display::InlineGrid {
+                _ => {
+                    let is_flex_row = matches!(
+                        style.display,
+                        Display::Flex | Display::InlineFlex
+                    ) && matches!(
+                        style.flex_direction,
+                        peedle_css::FlexDirection::Row | peedle_css::FlexDirection::RowReverse
+                    );
+                    let flex_gap = if is_flex_row {
+                        style.column_gap.resolve_or(&ctx, 0.0).max(0.0)
+                    } else {
+                        0.0
+                    };
                     let kids = self.tree.get(id).children.clone();
-                    let cols = total_tracks.max(1);
-                    let mut col_widths = vec![0.0f32; cols];
-                    let mut col_idx = 0usize;
-                    let mut non_empty_kids = 0usize;
-                    let mut inline_sum = 0.0f32;
+                    let mut sum_inline = 0.0f32;
+                    let mut flex_items = 0usize;
+                    let mut max_block = 0.0f32;
                     for cid in kids {
                         let cs = self.tree.get(cid).style.clone();
                         if matches!(cs.position, Position::Absolute | Position::Fixed) {
@@ -1647,64 +1755,43 @@ impl LayoutEngine {
                                 + cs.margin_left.resolve_or(&cctx, 0.0)
                                 + cs.margin_right.resolve_or(&cctx, 0.0)
                         };
-                        let w = cw + extra;
-                        let c = col_idx % cols;
-                        col_widths[c] = col_widths[c].max(w);
-                        col_idx += 1;
-                        non_empty_kids += 1;
-                        inline_sum += w;
+                        if self.is_block_level(cid) && !is_flex_row {
+                            max_block = max_block.max(cw + extra);
+                        } else {
+                            sum_inline += cw + extra;
+                            if is_flex_row {
+                                flex_items += 1;
+                            }
+                        }
                     }
-                    if total_tracks > 0 {
-                        let active = col_widths.iter().filter(|&&w| w > 0.0).count();
-                        let sum: f32 = col_widths.iter().sum();
-                        let gaps = gap * (active.saturating_sub(1) as f32);
-                        (sum + gaps).max(total)
-                    } else if non_empty_kids > 0 {
-                        inline_sum + gap * (non_empty_kids.saturating_sub(1) as f32)
-                    } else {
-                        0.0
+                    if is_flex_row && flex_items > 1 {
+                        sum_inline += flex_gap * ((flex_items - 1) as f32);
                     }
-                } else {
-                    cb_width
+                    max_block.max(sum_inline)
                 }
             }
-            _ => {
-                let is_flex_row = matches!(
-                    style.display,
-                    Display::Flex | Display::InlineFlex
-                ) && matches!(
-                    style.flex_direction,
-                    peedle_css::FlexDirection::Row | peedle_css::FlexDirection::RowReverse
-                );
-                let kids = self.tree.get(id).children.clone();
-                let mut sum_inline = 0.0f32;
-                let mut max_block = 0.0f32;
-                for cid in kids {
-                    let cs = self.tree.get(cid).style.clone();
-                    if matches!(cs.position, Position::Absolute | Position::Fixed) {
-                        continue;
-                    }
-                    let cw = self.measure_intrinsic_width(cid, cb_width);
-                    let extra = if matches!(self.tree.get(cid).kind, BoxKind::Text(_)) {
-                        0.0
-                    } else {
-                        let cctx = self.calc_ctx(&cs, cb_width);
-                        cs.padding_left.resolve_or(&cctx, 0.0)
-                            + cs.padding_right.resolve_or(&cctx, 0.0)
-                            + cs.border_left_width
-                            + cs.border_right_width
-                            + cs.margin_left.resolve_or(&cctx, 0.0)
-                            + cs.margin_right.resolve_or(&cctx, 0.0)
-                    };
-                    if self.is_block_level(cid) && !is_flex_row {
-                        max_block = max_block.max(cw + extra);
-                    } else {
-                        sum_inline += cw + extra;
-                    }
-                }
-                max_block.max(sum_inline)
+        };
+        if matches!(style.max_width, LengthPercentageAuto::Length(_)) {
+            if let Some(mw) = style.max_width.resolve(&ctx) {
+                let lim = if style.box_sizing == BoxSizing::BorderBox {
+                    (mw - pb).max(0.0)
+                } else {
+                    mw
+                };
+                raw = raw.min(lim);
             }
         }
+        if matches!(style.min_width, LengthPercentageAuto::Length(_)) {
+            if let Some(mn) = style.min_width.resolve(&ctx) {
+                let floor = if style.box_sizing == BoxSizing::BorderBox {
+                    (mn - pb).max(0.0)
+                } else {
+                    mn
+                };
+                raw = raw.max(floor);
+            }
+        }
+        raw
     }
 
     pub fn measure_min_word_width(&mut self, id: LayoutBoxId, cb_width: f32) -> f32 {
@@ -1767,53 +1854,101 @@ impl LayoutEngine {
     ) -> (f32, f32) {
         let ctx_w = self.calc_ctx(style, cb_width);
         let ctx_h = self.calc_ctx(style, cb_height.max(0.0));
+        let pb_h = style.padding_left.resolve_or(&ctx_w, 0.0)
+            + style.padding_right.resolve_or(&ctx_w, 0.0)
+            + style.border_left_width.max(0.0)
+            + style.border_right_width.max(0.0);
+        let pb_v = style.padding_top.resolve_or(&ctx_w, 0.0)
+            + style.padding_bottom.resolve_or(&ctx_w, 0.0)
+            + style.border_top_width.max(0.0)
+            + style.border_bottom_width.max(0.0);
+        let is_border_box = style.box_sizing == BoxSizing::BorderBox;
+        let has_aspect = matches!(
+            rep,
+            ReplacedKind::Image { .. } | ReplacedKind::Canvas { .. } | ReplacedKind::Svg { .. }
+        );
+        let line_h = (style.font_size * 1.4).max(18.0);
         let (iw, ih) = match rep {
             ReplacedKind::Image { intrinsic_w, intrinsic_h, .. } => (*intrinsic_w, *intrinsic_h),
             ReplacedKind::Canvas { width, height } => (*width, *height),
             ReplacedKind::Svg { width, height } => (*width, *height),
-            ReplacedKind::Input { input_type, .. } => match input_type.as_str() {
-                "checkbox" | "radio" => (16.0, 16.0),
+            ReplacedKind::Input { input_type, value, .. } => match input_type.as_str() {
+                "checkbox" | "radio" => (15.0, 15.0),
                 "hidden" => (0.0, 0.0),
-                "submit" | "button" | "reset" => (96.0, 30.0),
+                "submit" | "button" | "reset" => {
+                    let est_w = (value.chars().count() as f32 * style.font_size * 0.58 + 12.0).max(32.0);
+                    (est_w, line_h)
+                }
                 "range" => (140.0, 20.0),
-                _ => (180.0, 30.0),
+                _ => (180.0, line_h),
             },
             ReplacedKind::Textarea { rows, cols, .. } => {
                 ((*cols as f32 * 8.0).max(160.0), (*rows as f32 * 20.0).max(52.0))
             }
-            ReplacedKind::Select { .. } => (160.0, 30.0),
+            ReplacedKind::Select { .. } => (160.0, line_h),
             ReplacedKind::Hr => (cb_width, 2.0),
             ReplacedKind::Br => (0.0, 0.0),
         };
-        let ew = style.width.resolve(&ctx_w);
+        let ew = style.width.resolve(&ctx_w).map(|v| {
+            if is_border_box { (v - pb_h).max(0.0) } else { v.max(0.0) }
+        });
         let eh = if cb_height < 0.0 && matches!(style.height, LengthPercentageAuto::Percent(_)) {
             None
         } else {
-            style.height.resolve(&ctx_h)
+            style.height.resolve(&ctx_h).map(|v| {
+                if is_border_box { (v - pb_v).max(0.0) } else { v.max(0.0) }
+            })
         };
-        match (ew, eh) {
-            (Some(w), Some(h)) => (w.max(0.0), h.max(0.0)),
+        let (mut w, mut h) = match (ew, eh) {
+            (Some(w), Some(h)) => (w, h),
             (Some(w), None) => {
-                let h = if iw > 0.0 { w * (ih / iw) } else { ih };
-                (w.max(0.0), h.max(0.0))
+                let h = if has_aspect && iw > 0.0 {
+                    w * (ih / iw)
+                } else {
+                    ih
+                };
+                (w, h.max(0.0))
             }
             (None, Some(h)) => {
-                let w = if ih > 0.0 { h * (iw / ih) } else { iw };
-                (w.max(0.0), h.max(0.0))
+                let w = if has_aspect && ih > 0.0 {
+                    h * (iw / ih)
+                } else {
+                    iw
+                };
+                (w.max(0.0), h)
             }
             (None, None) => {
                 let mut w = iw;
                 let mut h = ih;
                 if let Some(max_w) = style.max_width.resolve(&ctx_w) {
-                    if w > max_w && w > 0.0 {
-                        let scale = max_w / w;
-                        w = max_w;
-                        h *= scale;
+                    let max_cw = if is_border_box { (max_w - pb_h).max(0.0) } else { max_w.max(0.0) };
+                    if w > max_cw && w > 0.0 {
+                        if has_aspect {
+                            h *= max_cw / w;
+                        }
+                        w = max_cw;
                     }
                 }
                 (w, h)
             }
+        };
+        if let Some(min_w) = style.min_width.resolve(&ctx_w) {
+            let min_cw = if is_border_box { (min_w - pb_h).max(0.0) } else { min_w.max(0.0) };
+            w = w.max(min_cw);
         }
+        if let Some(max_w) = style.max_width.resolve(&ctx_w) {
+            let max_cw = if is_border_box { (max_w - pb_h).max(0.0) } else { max_w.max(0.0) };
+            w = w.min(max_cw);
+        }
+        if let Some(min_h) = style.min_height.resolve(&ctx_h) {
+            let min_ch = if is_border_box { (min_h - pb_v).max(0.0) } else { min_h.max(0.0) };
+            h = h.max(min_ch);
+        }
+        if let Some(max_h) = style.max_height.resolve(&ctx_h) {
+            let max_ch = if is_border_box { (max_h - pb_v).max(0.0) } else { max_h.max(0.0) };
+            h = h.min(max_ch);
+        }
+        (w, h)
     }
 }
 
@@ -1904,12 +2039,22 @@ fn detect_replaced(
                 .unwrap_or(150.0);
             Some(ReplacedKind::Canvas { width: w, height: h })
         }
-        "input" => Some(ReplacedKind::Input {
-            input_type: el.get_attr("type").unwrap_or("text").to_ascii_lowercase(),
-            value: el.current_value(),
-            placeholder: el.get_attr("placeholder").unwrap_or("").to_string(),
-            checked: el.is_checked(),
-        }),
+        "input" => {
+            let input_type = el.get_attr("type").unwrap_or("text").to_ascii_lowercase();
+            let value = if input_type == "submit" && el.get_attr("value").is_none() && el.input_value.is_none() {
+                "Submit".to_string()
+            } else if input_type == "reset" && el.get_attr("value").is_none() && el.input_value.is_none() {
+                "Reset".to_string()
+            } else {
+                el.current_value()
+            };
+            Some(ReplacedKind::Input {
+                input_type,
+                value,
+                placeholder: el.get_attr("placeholder").unwrap_or("").to_string(),
+                checked: el.is_checked(),
+            })
+        }
         "textarea" => {
             let val = el
                 .input_value

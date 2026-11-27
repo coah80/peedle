@@ -80,12 +80,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
 
 [[package]]
+name = "alloc-no-stdlib"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2fb6cfd47bf496ff64095c20eaba0c201404ee38714d4142fcfa1dc334fcc7a"
+
+[[package]]
 name = "alloc-stdlib"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195"
 dependencies = [
- "alloc-no-stdlib",
+ "alloc-no-stdlib 2.0.4",
 ]
 
 [[package]]
@@ -200,8 +206,17 @@ version = "5.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
 dependencies = [
- "alloc-no-stdlib",
+ "alloc-no-stdlib 2.0.4",
  "alloc-stdlib",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "6.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "664148598c930650998ef56df301329ffe7b4cdb02d49b2a3fca3bcaf2185bcb"
+dependencies = [
+ "alloc-no-stdlib 3.0.0",
 ]
 
 [[package]]
@@ -1388,6 +1403,7 @@ dependencies = [
 name = "peedle"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "fontdue",
  "image",
  "peedle-css",
@@ -1399,6 +1415,8 @@ dependencies = [
  "peedle-net",
  "peedle-render",
  "peedle-url",
+ "serde",
+ "serde_json",
  "softbuffer",
  "winit",
 ]
@@ -1478,12 +1496,14 @@ name = "peedle-net"
 version = "0.1.0"
 dependencies = [
  "base64",
- "brotli-decompressor",
+ "brotli-decompressor 5.0.3",
  "flate2",
  "getrandom 0.3.4",
  "peedle-url",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "sha1",
  "webpki-roots",
 ]
@@ -1492,12 +1512,14 @@ dependencies = [
 name = "peedle-render"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "fontdue",
  "image",
  "peedle-css",
  "peedle-html",
  "peedle-layout",
  "peedle-net",
+ "wuff",
 ]
 
 [[package]]
@@ -2668,6 +2690,17 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "wuff"
+version = "0.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6a992b57b3d1ee972b2e3fd9225e44793104d49818836dd812d5459187712dd"
+dependencies = [
+ "brotli-decompressor 6.4.0",
+ "bytes",
+ "flate2",
+]
 
 [[package]]
 name = "x11-dl"

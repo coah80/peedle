@@ -1,8 +1,26 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fontdue::{Font, FontSettings};
+
+static WEB_FONT_CACHE: OnceLock<Mutex<Vec<(String, u16, Arc<Font>)>>> = OnceLock::new();
+
+pub fn register_web_font_arc(family: &str, font: Arc<Font>) {
+    register_web_font_arc_weighted(family, 400, font);
+}
+
+pub fn register_web_font_arc_weighted(family: &str, weight: u16, font: Arc<Font>) {
+    let norm = family.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+    if norm.is_empty() {
+        return;
+    }
+    let cache = WEB_FONT_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cache.lock().unwrap();
+    if !guard.iter().any(|(_, _, f)| Arc::ptr_eq(f, &font)) {
+        guard.push((norm, weight, font));
+    }
+}
 
 struct SharedLayoutFonts {
     sans: Option<Arc<Font>>,
@@ -104,7 +122,8 @@ pub struct TextMeasurer {
     mono: Option<Arc<Font>>,
     mono_bold: Option<Arc<Font>>,
     fallbacks: Vec<Arc<Font>>,
-    width_cache: HashMap<(u8, u32, char), f32>,
+    custom_fonts: Vec<(String, u16, Arc<Font>)>,
+    width_cache: HashMap<(u16, u32, char), f32>,
 }
 
 impl Default for TextMeasurer {
@@ -116,6 +135,16 @@ impl Default for TextMeasurer {
 impl TextMeasurer {
     pub fn new() -> Self {
         let base = shared_fonts();
+        let custom_fonts = WEB_FONT_CACHE
+            .get()
+            .map(|m| {
+                m.lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(n, w, f)| (n.clone(), *w, Arc::clone(f)))
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             sans: base.sans.clone(),
             sans_bold: base.sans_bold.clone(),
@@ -125,14 +154,24 @@ impl TextMeasurer {
             mono: base.mono.clone(),
             mono_bold: base.mono_bold.clone(),
             fallbacks: base.fallbacks.clone(),
+            custom_fonts,
             width_cache: HashMap::new(),
         }
     }
 
-    fn pick_kind(&self, families: &[String], weight: u16) -> u8 {
+    fn pick_kind(&self, families: &[String], weight: u16) -> u16 {
         let bold = weight >= 600;
         for fam in families {
             let low = fam.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+            if let Some((pos, _)) = self
+                .custom_fonts
+                .iter()
+                .enumerate()
+                .filter(|(_, (n, _, _))| n == &low)
+                .min_by_key(|(_, (_, w, _))| (*w as i32 - weight as i32).abs())
+            {
+                return 100 + pos as u16;
+            }
             if low.contains("mono")
                 || low.contains("courier")
                 || low.contains("consolas")
@@ -167,7 +206,12 @@ impl TextMeasurer {
         if bold { 1 } else { 0 }
     }
 
-    fn font_for(&self, kind: u8) -> Option<&Arc<Font>> {
+    fn font_for(&self, kind: u16) -> Option<&Arc<Font>> {
+        if kind >= 100 {
+            if let Some((_, _, f)) = self.custom_fonts.get((kind - 100) as usize) {
+                return Some(f);
+            }
+        }
         match kind {
             1 => self.sans_bold.as_ref().or(self.sans.as_ref()),
             2 => self.serif.as_ref().or(self.sans.as_ref()),
@@ -179,10 +223,31 @@ impl TextMeasurer {
         }
     }
 
-    fn resolve_glyph_font(&self, kind: u8, c: char) -> Option<&Arc<Font>> {
+    fn resolve_glyph_font(&self, kind: u16, c: char) -> Option<&Arc<Font>> {
         let primary = self.font_for(kind)?;
-        if c.is_ascii() || primary.lookup_glyph_index(c) != 0 {
+        if primary.lookup_glyph_index(c) != 0 {
             return Some(primary);
+        }
+        if kind >= 100 {
+            if let Some((fam, weight, _)) = self.custom_fonts.get((kind - 100) as usize) {
+                let mut best: Option<(i32, &Arc<Font>)> = None;
+                for (i, (n, w, f)) in self.custom_fonts.iter().enumerate() {
+                    if i != (kind - 100) as usize && n == fam && f.lookup_glyph_index(c) != 0 {
+                        let dist = (*w as i32 - *weight as i32).abs();
+                        if best.map_or(true, |(bd, _)| dist < bd) {
+                            best = Some((dist, f));
+                        }
+                    }
+                }
+                if let Some((_, bf)) = best {
+                    return Some(bf);
+                }
+            }
+            if let Some(ref sans) = self.sans {
+                if sans.lookup_glyph_index(c) != 0 {
+                    return Some(sans);
+                }
+            }
         }
         for fb in &self.fallbacks {
             if fb.lookup_glyph_index(c) != 0 {

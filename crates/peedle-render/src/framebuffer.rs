@@ -131,6 +131,7 @@ pub struct Framebuffer {
     pub height: u32,
     pub data: Vec<u8>,
     clip_stack: Vec<ClipRect>,
+    rounded_clips: Vec<(f32, f32, f32, f32, [f32; 4])>,
 }
 
 impl Framebuffer {
@@ -146,6 +147,7 @@ impl Framebuffer {
                 w: width as i32,
                 h: height as i32,
             }],
+            rounded_clips: Vec::new(),
         }
     }
 
@@ -166,6 +168,7 @@ impl Framebuffer {
             self.data.resize(needed, 0);
         }
         self.clip_stack.clear();
+        self.rounded_clips.clear();
         self.clip_stack.push(ClipRect {
             x: 0,
             y: 0,
@@ -312,8 +315,23 @@ impl Framebuffer {
         }
     }
 
+    pub fn push_rounded_clip(&mut self, x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) {
+        let max_r = (w * 0.5).min(h * 0.5).max(0.0);
+        let clamped = [
+            radii[0].clamp(0.0, max_r),
+            radii[1].clamp(0.0, max_r),
+            radii[2].clamp(0.0, max_r),
+            radii[3].clamp(0.0, max_r),
+        ];
+        self.rounded_clips.push((x, y, w, h, clamped));
+    }
+
+    pub fn pop_rounded_clip(&mut self) {
+        self.rounded_clips.pop();
+    }
+
     #[inline]
-    pub fn blend_pixel(&mut self, x: i32, y: i32, color: RgbaColor) {
+    pub fn blend_pixel(&mut self, x: i32, y: i32, mut color: RgbaColor) {
         if color.a == 0 {
             return;
         }
@@ -321,11 +339,30 @@ impl Framebuffer {
         if x < clip.x || y < clip.y || x >= clip.x + clip.w || y >= clip.y + clip.h {
             return;
         }
+        if !self.rounded_clips.is_empty() {
+            let cx = x as f32 + 0.5;
+            let cy = y as f32 + 0.5;
+            let mut cov = 1.0f32;
+            for &(rx, ry, rw, rh, radii) in &self.rounded_clips {
+                let d = rounded_rect_sdf(cx, cy, rx, ry, rw, rh, radii);
+                let c = (0.5 - d).clamp(0.0, 1.0);
+                if c <= 0.0 {
+                    return;
+                }
+                cov *= c;
+            }
+            if cov < 1.0 {
+                color = color.with_alpha(cov);
+                if color.a == 0 {
+                    return;
+                }
+            }
+        }
         let idx = ((y as u32 * self.width + x as u32) * 4) as usize;
         if idx + 3 >= self.data.len() {
             return;
         }
-        if color.a == 255 {
+        if color.a == 255 && self.rounded_clips.is_empty() {
             self.data[idx] = color.r;
             self.data[idx + 1] = color.g;
             self.data[idx + 2] = color.b;
@@ -356,7 +393,7 @@ impl Framebuffer {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
-        if color.a == 255 {
+        if color.a == 255 && self.rounded_clips.is_empty() {
             for py in y0..y1 {
                 let row = (py as u32 * self.width) as usize;
                 for px in x0..x1 {
@@ -1048,6 +1085,10 @@ impl Framebuffer {
         dst_h: f32,
     ) {
         if src_w == 0 || src_h == 0 || dst_w <= 0.0 || dst_h <= 0.0 {
+            return;
+        }
+        if !self.rounded_clips.is_empty() {
+            self.blit_rgba(src_w, src_h, src, dst_x, dst_y, dst_w, dst_h, 1.0);
             return;
         }
         let clip = self.current_clip();

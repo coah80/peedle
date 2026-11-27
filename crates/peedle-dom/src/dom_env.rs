@@ -296,6 +296,8 @@ impl BrowserJsEnv {
             }
         }
 
+        let prev_step_limit = self.rt.max_steps;
+        self.rt.max_steps = Some(prev_step_limit.unwrap_or(1_500_000));
         for (idx, (sid, is_module, src_attr, resolved, inline_code)) in
             script_specs.into_iter().enumerate()
         {
@@ -314,6 +316,7 @@ impl BrowserJsEnv {
                 continue;
             }
 
+            self.rt.step_count = 0;
             self.dom.borrow_mut().current_script = Some(sid);
             let res = if is_module {
                 let spec = src_attr.unwrap_or_else(|| format!("inline:{}", sid.0));
@@ -329,6 +332,7 @@ impl BrowserJsEnv {
             }
             self.tick_event_loop(64);
         }
+        self.rt.max_steps = prev_step_limit;
 
         self.dom.borrow_mut().ready_state = "interactive".to_string();
         let root_id = self.dom.borrow().doc.root;

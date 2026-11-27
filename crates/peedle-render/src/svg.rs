@@ -52,10 +52,44 @@ pub fn render_svg_node_with_color(
         .unwrap_or((0.0, 0.0, dst_w, dst_h));
 
     if vb_w > 0.0 && vb_h > 0.0 {
+        let par = doc
+            .element(svg_id)
+            .and_then(|e| {
+                e.get_attr("preserveAspectRatio")
+                    .or_else(|| e.get_attr("preserveaspectratio"))
+            })
+            .unwrap_or("xMidYMid meet")
+            .trim()
+            .to_ascii_lowercase();
         let sx = dst_w / vb_w;
         let sy = dst_h / vb_h;
-        canvas.scale(sx, sy);
-        canvas.translate(-vb_x, -vb_y);
+        if par.starts_with("none") {
+            canvas.scale(sx, sy);
+            canvas.translate(-vb_x, -vb_y);
+        } else {
+            let scale = if par.contains("slice") {
+                sx.max(sy)
+            } else {
+                sx.min(sy)
+            };
+            let tx = if par.starts_with("xmin") {
+                0.0
+            } else if par.starts_with("xmax") {
+                dst_w - vb_w * scale
+            } else {
+                (dst_w - vb_w * scale) * 0.5
+            };
+            let ty = if par.contains("ymin") {
+                0.0
+            } else if par.contains("ymax") {
+                dst_h - vb_h * scale
+            } else {
+                (dst_h - vb_h * scale) * 0.5
+            };
+            canvas.translate(tx, ty);
+            canvas.scale(scale, scale);
+            canvas.translate(-vb_x, -vb_y);
+        }
     }
 
     let inherited_fill = doc
