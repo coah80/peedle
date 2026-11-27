@@ -955,7 +955,62 @@ impl LayoutEngine {
 
                     let lh = item_style.line_height.resolve(item_style.font_size);
                     let baseline_off = item_style.font_size * 0.82 + (lh - item_style.font_size) * 0.5;
-                    let tokens = tokenize_inline_text(&transformed, preserve_spaces, preserve_nl);
+                    let raw_tokens = tokenize_inline_text(&transformed, preserve_spaces, preserve_nl);
+                    let break_long_words = matches!(
+                        item_style.word_break,
+                        peedle_css::WordBreak::BreakAll | peedle_css::WordBreak::BreakWord
+                    ) || matches!(
+                        item_style.overflow_wrap,
+                        peedle_css::OverflowWrap::BreakWord | peedle_css::OverflowWrap::Anywhere
+                    );
+                    let max_line_w = (line_right - line_left).max(16.0);
+                    let mut tokens: Vec<String> = Vec::with_capacity(raw_tokens.len());
+                    for t in raw_tokens {
+                        if break_long_words && !no_wrap && t != " " && t != "\n" && t.chars().count() > 1 {
+                            let tw = self.measurer.measure_str(
+                                &t,
+                                &item_style.font_family,
+                                item_style.font_size,
+                                item_style.font_weight,
+                            );
+                            if tw > max_line_w {
+                                let mut chunk = String::new();
+                                for ch in t.chars() {
+                                    let mut cand = chunk.clone();
+                                    cand.push(ch);
+                                    let cw = self.measurer.measure_str(
+                                        &cand,
+                                        &item_style.font_family,
+                                        item_style.font_size,
+                                        item_style.font_weight,
+                                    );
+                                    if !chunk.is_empty() && cw > max_line_w {
+                                        tokens.push(std::mem::take(&mut chunk));
+                                    }
+                                    chunk.push(ch);
+                                }
+                                if !chunk.is_empty() {
+                                    tokens.push(chunk);
+                                }
+                                continue;
+                            }
+                        }
+                        tokens.push(t);
+                    }
+
+                    let use_ellipsis = no_wrap
+                        && container_style.text_overflow == peedle_css::TextOverflow::Ellipsis
+                        && container_style.overflow_x != peedle_css::Overflow::Visible;
+                    let ellipsis_w = if use_ellipsis {
+                        self.measurer.measure_str(
+                            "...",
+                            &item_style.font_family,
+                            item_style.font_size,
+                            item_style.font_weight,
+                        )
+                    } else {
+                        0.0
+                    };
 
                     self.tree.get_mut(item_id).text_fragments.clear();
                     for tok in tokens {
@@ -992,6 +1047,46 @@ impl LayoutEngine {
                             item_style.font_size,
                             item_style.font_weight,
                         );
+                        if use_ellipsis && cur_x + w > line_right - ellipsis_w {
+                            let avail = (line_right - ellipsis_w - cur_x).max(0.0);
+                            let mut kept = String::new();
+                            for ch in tok.chars() {
+                                let mut cand = kept.clone();
+                                cand.push(ch);
+                                let cw = self.measurer.measure_str(
+                                    &cand,
+                                    &item_style.font_family,
+                                    item_style.font_size,
+                                    item_style.font_weight,
+                                );
+                                if cw > avail {
+                                    break;
+                                }
+                                kept.push(ch);
+                            }
+                            kept.push_str("...");
+                            let kw = self.measurer.measure_str(
+                                &kept,
+                                &item_style.font_family,
+                                item_style.font_size,
+                                item_style.font_weight,
+                            );
+                            let frag = TextFragment {
+                                text: kept,
+                                x: cur_x,
+                                y: cur_y,
+                                width: kw,
+                                height: lh,
+                                baseline: cur_y + baseline_off,
+                            };
+                            let fidx = self.tree.get(item_id).text_fragments.len();
+                            self.tree.get_mut(item_id).text_fragments.push(frag);
+                            line_items.push((item_id, fidx));
+                            cur_x += kw;
+                            line_h = line_h.max(lh);
+                            line_has_content = true;
+                            break;
+                        }
                         if !no_wrap && line_has_content && cur_x + w > line_right + 0.5 && tok != " " {
                             finish_line(
                                 self,

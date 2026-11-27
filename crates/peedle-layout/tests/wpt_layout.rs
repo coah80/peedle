@@ -130,3 +130,32 @@ fn wpt_css_grid_repeat_minmax_and_rows() {
     assert!((c.y - 80.0).abs() < 1.5);
     assert!((d.x - 220.0).abs() < 1.5 && (d.y - 80.0).abs() < 1.5);
 }
+
+#[test]
+fn wpt_text_overflow_ellipsis_and_word_break() {
+    let (doc, tree) = run_layout(
+        r#"
+            <div id="ell">Supercalifragilisticexpialidocious overflowing headline text</div>
+            <div id="brk">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+        "#,
+        r#"
+            body { margin: 0; font-size: 14px; }
+            #ell { width: 100px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            #brk { width: 80px; word-break: break-all; }
+        "#,
+        400.0,
+        300.0,
+    );
+    let ell_id = doc.get_element_by_id("ell").unwrap();
+    let ell_box = tree.box_of(ell_id).unwrap();
+    let mut joined = String::new();
+    for &cid in &ell_box.children {
+        for f in &tree.get(cid).text_fragments {
+            joined.push_str(&f.text);
+        }
+    }
+    assert!(joined.ends_with("..."), "expected ellipsis, got {:?}", joined);
+
+    let brk_rect = tree.bounding_rect(doc.get_element_by_id("brk").unwrap()).unwrap();
+    assert!(brk_rect.height > 28.0, "expected word-break wrapping, got {:?}", brk_rect);
+}

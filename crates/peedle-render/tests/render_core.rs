@@ -205,3 +205,79 @@ fn acid2_full_pipeline_render() {
     assert!(yellow_pixels > 10000);
     assert!(black_pixels > 5000);
 }
+
+#[test]
+fn transform_sticky_outline_and_svg_arcs_render() {
+    let html = r##"
+        <style>
+            body { margin: 0; height: 1000px; }
+            #centered {
+                position: fixed;
+                left: 50%;
+                top: 50%;
+                width: 100px;
+                height: 60px;
+                transform: translate(-50%, -50%);
+                background: #22c55e;
+                outline: 4px solid #ef4444;
+                outline-offset: 2px;
+            }
+            #bar {
+                position: sticky;
+                top: 10px;
+                height: 20px;
+                background: #2563eb;
+            }
+        </style>
+        <div id="bar"></div>
+        <div id="centered"></div>
+    "##;
+    let doc = parse_html(html);
+    let mut sheets = Vec::new();
+    for nid in doc.descendants(doc.root) {
+        if let Some(el) = doc.element(nid) {
+            if el.tag_is("style") {
+                sheets.push(peedle_css::parse_stylesheet(&doc.text_content(nid)));
+            }
+        }
+    }
+    let styles = peedle_css::compute_styles(
+        &doc,
+        &sheets,
+        peedle_css::Viewport {
+            width: 400.0,
+            height: 300.0,
+            dark_mode: false,
+        },
+    );
+    let tree = peedle_layout::layout_document(&doc, &styles, &std::collections::HashMap::new(), 400.0, 300.0);
+    let fonts = FontSystem::load_system_fonts();
+    let images = peedle_render::ImageCache::new();
+    let canvases = std::collections::HashMap::new();
+    let mut fb = Framebuffer::new(400, 300);
+    peedle_render::paint_layout(&doc, &tree, &mut fb, &fonts, &images, &canvases, 0.0, 100.0);
+
+    let sticky_px = ((18 * 400 + 20) * 4) as usize;
+    assert_eq!((fb.data[sticky_px], fb.data[sticky_px + 1], fb.data[sticky_px + 2]), (37, 99, 235));
+
+    let center_px = ((150 * 400 + 200) * 4) as usize;
+    assert_eq!((fb.data[center_px], fb.data[center_px + 1], fb.data[center_px + 2]), (34, 197, 94));
+
+    let outline_px = ((116 * 400 + 200) * 4) as usize;
+    assert_eq!((fb.data[outline_px], fb.data[outline_px + 1], fb.data[outline_px + 2]), (239, 68, 68));
+
+    let svg_doc = parse_html(
+        r##"<svg viewBox="0 0 100 100">
+            <rect x="10" y="10" width="80" height="80" rx="16" style="fill:#10b981"/>
+            <path d="M 50 20 A 30 30 0 1 1 49.9 20 Z" fill="#1d4ed8"/>
+        </svg>"##,
+    );
+    let svg_id = svg_doc.get_elements_by_tag_name(svg_doc.root, "svg")[0];
+    let mut svg_fb = Framebuffer::new(100, 100);
+    svg_fb.clear(RgbaColor::WHITE);
+    render_svg_node(&svg_doc, svg_id, &mut svg_fb, &fonts, 0.0, 0.0, 100.0, 100.0);
+    let arc_center = ((50 * 100 + 50) * 4) as usize;
+    assert_eq!((svg_fb.data[arc_center], svg_fb.data[arc_center + 1], svg_fb.data[arc_center + 2]), (29, 78, 216));
+    let rounded_corner = ((11 * 100 + 11) * 4) as usize;
+    assert_eq!((svg_fb.data[rounded_corner], svg_fb.data[rounded_corner + 1], svg_fb.data[rounded_corner + 2]), (255, 255, 255));
+}

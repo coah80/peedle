@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use peedle_css::{
-    BackgroundImage, CalcContext, Color, ComputedStyle, FontStyle, Overflow, TextDecorationLine,
-    Visibility,
+    BackgroundImage, BorderStyle, CalcContext, Color, ComputedStyle, FontStyle, Overflow, Position,
+    TextDecorationLine, TransformOp, Visibility,
 };
 use peedle_html::{Document, NodeId};
 use peedle_layout::{BoxKind, LayoutBoxId, LayoutTree, ReplacedKind};
@@ -100,12 +100,71 @@ fn paint_box(
         return;
     }
 
-    let is_fixed = b.style.position == peedle_css::Position::Fixed;
-    let dx = if is_fixed { 0.0 } else { ox };
-    let dy = if is_fixed { 0.0 } else { oy };
+    let is_fixed = b.style.position == Position::Fixed;
+    let mut dx = if is_fixed { 0.0 } else { ox };
+    let mut dy = if is_fixed { 0.0 } else { oy };
+
+    let bb = b.dims.border_box();
+    if b.style.position == Position::Sticky {
+        let ctx_x = CalcContext {
+            font_size: b.style.font_size,
+            root_font_size: 16.0,
+            viewport_width: fb.width as f32,
+            viewport_height: fb.height as f32,
+            percentage_base: fb.width as f32,
+        };
+        let ctx_y = CalcContext {
+            percentage_base: fb.height as f32,
+            ..ctx_x
+        };
+        if let Some(top_limit) = b.style.top.resolve(&ctx_y) {
+            let screen_y = bb.y + dy;
+            if screen_y < top_limit {
+                dy += top_limit - screen_y;
+            }
+        }
+        if let Some(left_limit) = b.style.left.resolve(&ctx_x) {
+            let screen_x = bb.x + dx;
+            if screen_x < left_limit {
+                dx += left_limit - screen_x;
+            }
+        }
+    }
+
+    if !b.style.transform.is_empty() {
+        let ctx_w = CalcContext {
+            font_size: b.style.font_size,
+            root_font_size: 16.0,
+            viewport_width: fb.width as f32,
+            viewport_height: fb.height as f32,
+            percentage_base: bb.width,
+        };
+        let ctx_h = CalcContext {
+            percentage_base: bb.height,
+            ..ctx_w
+        };
+        for op in &b.style.transform {
+            match op {
+                TransformOp::Translate(tx, ty) => {
+                    dx += tx.resolve_or(&ctx_w, 0.0);
+                    dy += ty.resolve_or(&ctx_h, 0.0);
+                }
+                TransformOp::TranslateX(tx) => {
+                    dx += tx.resolve_or(&ctx_w, 0.0);
+                }
+                TransformOp::TranslateY(ty) => {
+                    dy += ty.resolve_or(&ctx_h, 0.0);
+                }
+                TransformOp::Matrix(_, _, _, _, e, f) => {
+                    dx += *e;
+                    dy += *f;
+                }
+                _ => {}
+            }
+        }
+    }
 
     let alpha = b.style.opacity.clamp(0.0, 1.0);
-    let bb = b.dims.border_box();
     let rx = bb.x + dx;
     let ry = bb.y + dy;
     let radii = resolve_radii(&b.style, bb.width, bb.height);
@@ -260,6 +319,30 @@ fn paint_box(
                 to_rgba(b.style.border_left_color).with_alpha(alpha),
             ];
             fb.stroke_rounded_rect(rx, ry, bb.width, bb.height, radii, widths, colors);
+        }
+
+        if b.style.outline_width > 0.0
+            && !matches!(b.style.outline_style, BorderStyle::None | BorderStyle::Hidden)
+        {
+            let ow = b.style.outline_width;
+            let off = b.style.outline_offset;
+            let expand = off + ow;
+            let oc = to_rgba(b.style.outline_color).with_alpha(alpha);
+            let out_radii = [
+                (radii[0] + expand).max(0.0),
+                (radii[1] + expand).max(0.0),
+                (radii[2] + expand).max(0.0),
+                (radii[3] + expand).max(0.0),
+            ];
+            fb.stroke_rounded_rect(
+                rx - expand,
+                ry - expand,
+                bb.width + expand * 2.0,
+                bb.height + expand * 2.0,
+                out_radii,
+                [ow; 4],
+                [oc; 4],
+            );
         }
 
         if let Some(ref marker) = b.list_marker {
