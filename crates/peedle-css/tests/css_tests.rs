@@ -409,6 +409,7 @@ fn error_recovery_current_color_css_wide_and_more_gradients() {
             unknown-prop: 999widgets;
         }
         p.lead {
+            border-top-style: solid;
             border-top-width: inherit;
             color: initial;
             padding-top: unset;

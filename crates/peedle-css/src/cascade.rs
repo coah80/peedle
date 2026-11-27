@@ -148,11 +148,31 @@ pub fn compute_styles(
     viewport: Viewport,
 ) -> StyleMap {
     let ua = ua_stylesheet();
-    compute_styles_with_ua(doc, &ua, author_sheets, viewport)
+    compute_styles_with_ua_root(doc, doc.root, &ua, author_sheets, viewport)
+}
+
+pub fn compute_styles_for_root(
+    doc: &Document,
+    root: NodeId,
+    author_sheets: &[Stylesheet],
+    viewport: Viewport,
+) -> StyleMap {
+    let ua = ua_stylesheet();
+    compute_styles_with_ua_root(doc, root, &ua, author_sheets, viewport)
 }
 
 pub fn compute_styles_with_ua(
     doc: &Document,
+    ua_sheet: &Stylesheet,
+    author_sheets: &[Stylesheet],
+    viewport: Viewport,
+) -> StyleMap {
+    compute_styles_with_ua_root(doc, doc.root, ua_sheet, author_sheets, viewport)
+}
+
+pub fn compute_styles_with_ua_root(
+    doc: &Document,
+    root: NodeId,
     ua_sheet: &Stylesheet,
     author_sheets: &[Stylesheet],
     viewport: Viewport,
@@ -192,9 +212,10 @@ pub fn compute_styles_with_ua(
         );
     }
 
+    let prev_dark = crate::values::set_active_dark_mode(viewport.dark_mode);
     let root_default = ComputedStyle::default();
     let mut root_font_size = 16.0f32;
-    if let Some(doc_el) = doc.document_element() {
+    if let Some(doc_el) = doc.document_element_of(root) {
         resolve_subtree(
             doc,
             doc_el,
@@ -206,7 +227,7 @@ pub fn compute_styles_with_ua(
             &mut map,
         );
     } else {
-        for child in doc.element_children(doc.root) {
+        for child in doc.element_children(root) {
             resolve_subtree(
                 doc,
                 child,
@@ -219,6 +240,7 @@ pub fn compute_styles_with_ua(
             );
         }
     }
+    crate::values::set_active_dark_mode(prev_dark);
 
     map
 }
@@ -561,6 +583,35 @@ fn compute_element_style(
         apply_longhand(&mut style, parent, &prop, &tokens, &ctx);
     }
 
+    if matches!(style.border_top_style, BorderStyle::None | BorderStyle::Hidden) {
+        style.border_top_width = 0.0;
+    }
+    if matches!(style.border_right_style, BorderStyle::None | BorderStyle::Hidden) {
+        style.border_right_width = 0.0;
+    }
+    if matches!(style.border_bottom_style, BorderStyle::None | BorderStyle::Hidden) {
+        style.border_bottom_width = 0.0;
+    }
+    if matches!(style.border_left_style, BorderStyle::None | BorderStyle::Hidden) {
+        style.border_left_width = 0.0;
+    }
+    if matches!(style.outline_style, BorderStyle::None | BorderStyle::Hidden) {
+        style.outline_width = 0.0;
+    }
+
+    if style.display != Display::None
+        && (style.float != Float::None
+            || matches!(style.position, Position::Absolute | Position::Fixed))
+    {
+        style.display = match style.display {
+            Display::Inline | Display::InlineBlock | Display::TableCell | Display::TableRow | Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup | Display::TableCaption => Display::Block,
+            Display::InlineFlex => Display::Flex,
+            Display::InlineGrid => Display::Grid,
+            Display::InlineTable => Display::Table,
+            other => other,
+        };
+    }
+
     style
 }
 
@@ -783,7 +834,9 @@ fn expand_shorthand(name: &str, value: &[Token]) -> Vec<(String, Vec<Token>)> {
             )
         }
         "border" => {
-            let (w, s, c) = parse_border_parts(trimmed);
+            let Some((w, s, c)) = parse_border_parts(trimmed) else {
+                return Vec::new();
+            };
             let mut out = Vec::new();
             for side in ["top", "right", "bottom", "left"] {
                 out.push((format!("border-{}-width", side), w.clone()));
@@ -797,7 +850,9 @@ fn expand_shorthand(name: &str, value: &[Token]) -> Vec<(String, Vec<Token>)> {
         "border-bottom" => expand_border_side("bottom", trimmed),
         "border-left" => expand_border_side("left", trimmed),
         "outline" => {
-            let (w, s, c) = parse_border_parts(trimmed);
+            let Some((w, s, c)) = parse_border_parts(trimmed) else {
+                return Vec::new();
+            };
             vec![
                 ("outline-width".to_string(), w),
                 ("outline-style".to_string(), s),
@@ -884,7 +939,9 @@ fn expand_two_pair(tokens: &[Token], first: &str, second: &str) -> Vec<(String, 
 }
 
 fn expand_border_side(side: &str, tokens: &[Token]) -> Vec<(String, Vec<Token>)> {
-    let (w, s, c) = parse_border_parts(tokens);
+    let Some((w, s, c)) = parse_border_parts(tokens) else {
+        return Vec::new();
+    };
     vec![
         (format!("border-{}-width", side), w),
         (format!("border-{}-style", side), s),
@@ -892,20 +949,31 @@ fn expand_border_side(side: &str, tokens: &[Token]) -> Vec<(String, Vec<Token>)>
     ]
 }
 
-fn parse_border_parts(tokens: &[Token]) -> (Vec<Token>, Vec<Token>, Vec<Token>) {
+fn parse_border_parts(tokens: &[Token]) -> Option<(Vec<Token>, Vec<Token>, Vec<Token>)> {
     let mut width = vec![Token::Ident("medium".to_string())];
     let mut style = vec![Token::Ident("none".to_string())];
     let mut color = vec![Token::Ident("currentColor".to_string())];
+    let mut has_w = false;
+    let mut has_s = false;
+    let mut has_c = false;
 
     for g in split_whitespace_groups(tokens) {
         if g.len() == 1 {
             if let Token::Ident(s) = &g[0] {
                 let lower = s.to_ascii_lowercase();
                 if parse_border_style_str(&lower).is_some() {
+                    if has_s {
+                        return None;
+                    }
+                    has_s = true;
                     style = g.to_vec();
                     continue;
                 }
                 if matches!(lower.as_str(), "thin" | "medium" | "thick") {
+                    if has_w {
+                        return None;
+                    }
+                    has_w = true;
                     width = g.to_vec();
                     continue;
                 }
@@ -914,14 +982,24 @@ fn parse_border_parts(tokens: &[Token]) -> (Vec<Token>, Vec<Token>, Vec<Token>) 
         if parse_length_percentage_auto(g).is_some()
             && !matches!(g.first(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("auto"))
         {
+            if has_w {
+                return None;
+            }
+            has_w = true;
             width = g.to_vec();
             continue;
         }
         if parse_color_from_tokens(g, Color::BLACK).is_some() {
+            if has_c {
+                return None;
+            }
+            has_c = true;
             color = g.to_vec();
+            continue;
         }
+        return None;
     }
-    (width, style, color)
+    Some((width, style, color))
 }
 
 fn expand_flex(tokens: &[Token]) -> Vec<(String, Vec<Token>)> {
@@ -1046,8 +1124,13 @@ fn expand_background(tokens: &[Token]) -> Vec<(String, Vec<Token>)> {
         }
     }
 
+    let mut color_count = 0usize;
     for g in split_whitespace_groups(last_layer) {
         if parse_color_from_tokens(g, Color::BLACK).is_some() {
+            color_count += 1;
+            if color_count > 1 {
+                return Vec::new();
+            }
             out.push(("background-color".into(), g.to_vec()));
         }
     }

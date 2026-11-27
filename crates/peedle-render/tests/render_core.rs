@@ -55,3 +55,44 @@ fn framebuffer_and_canvas2d_and_svg_render() {
     let png = fb.encode_png().unwrap();
     assert!(png.starts_with(b"\x89PNG"));
 }
+
+#[test]
+fn acid1_full_pipeline_render() {
+    let acid1_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/acid/acid1.html");
+    if !acid1_path.exists() {
+        return;
+    }
+    let html = std::fs::read_to_string(&acid1_path).unwrap();
+    let doc = parse_html(&html);
+    let mut sheets = Vec::new();
+    for nid in doc.descendants(doc.root) {
+        if let Some(el) = doc.element(nid) {
+            if el.is_html() && el.tag_is("style") {
+                sheets.push(peedle_css::parse_stylesheet(&doc.text_content(nid)));
+            }
+        }
+    }
+    let styles = peedle_css::compute_styles(
+        &doc,
+        &sheets,
+        peedle_css::Viewport {
+            width: 800.0,
+            height: 600.0,
+            dark_mode: false,
+        },
+    );
+    let tree = peedle_layout::layout_document(&doc, &styles, &std::collections::HashMap::new(), 800.0, 600.0);
+    let fonts = FontSystem::load_system_fonts();
+    let images = peedle_render::ImageCache::new();
+    let canvases = std::collections::HashMap::new();
+    let mut fb = Framebuffer::new(800, 600);
+    peedle_render::paint_layout(&doc, &tree, &mut fb, &fonts, &images, &canvases, 0.0, 0.0);
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../screenshots/acid1_v3.png");
+    let _ = fb.save_png(&out);
+
+    let bg_px = ((500 * 800 + 700) * 4) as usize;
+    assert_eq!((fb.data[bg_px], fb.data[bg_px + 1], fb.data[bg_px + 2]), (0, 0, 255));
+    let dt_px = ((100 * 800 + 60) * 4) as usize;
+    assert_eq!((fb.data[dt_px], fb.data[dt_px + 1], fb.data[dt_px + 2]), (204, 0, 0));
+}

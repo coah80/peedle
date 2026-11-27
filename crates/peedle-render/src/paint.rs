@@ -132,16 +132,66 @@ fn paint_box(
             }
             BackgroundImage::Url(u) => {
                 if let Some(img) = images.get(u) {
-                    fb.blit_rgba(
-                        img.width,
-                        img.height,
-                        &img.rgba,
-                        rx,
-                        ry,
-                        bb.width,
-                        bb.height,
-                        alpha,
-                    );
+                    if img.width > 0 && img.height > 0 && bb.width > 0.0 && bb.height > 0.0 {
+                        fb.push_clip(ClipRect {
+                            x: rx.floor() as i32,
+                            y: ry.floor() as i32,
+                            w: bb.width.ceil() as i32,
+                            h: bb.height.ceil() as i32,
+                        });
+                        let (tw, th) = match b.style.background_size {
+                            peedle_css::BackgroundSize::Cover => {
+                                let sx = bb.width / img.width as f32;
+                                let sy = bb.height / img.height as f32;
+                                let s = sx.max(sy);
+                                (img.width as f32 * s, img.height as f32 * s)
+                            }
+                            peedle_css::BackgroundSize::Contain => {
+                                let sx = bb.width / img.width as f32;
+                                let sy = bb.height / img.height as f32;
+                                let s = sx.min(sy);
+                                (img.width as f32 * s, img.height as f32 * s)
+                            }
+                            _ => (img.width as f32, img.height as f32),
+                        };
+                        let (rep_x, rep_y) = match b.style.background_repeat {
+                            peedle_css::BackgroundRepeat::NoRepeat => (false, false),
+                            peedle_css::BackgroundRepeat::RepeatX => (true, false),
+                            peedle_css::BackgroundRepeat::RepeatY => (false, true),
+                            _ => (true, true),
+                        };
+                        let max_cols = if rep_x && tw >= 1.0 {
+                            ((bb.width / tw).ceil() as usize).min(2048)
+                        } else {
+                            1
+                        };
+                        let max_rows = if rep_y && th >= 1.0 {
+                            ((bb.height / th).ceil() as usize).min(2048)
+                        } else {
+                            1
+                        };
+                        if img.width == 1 && img.height == 1 && rep_x && rep_y {
+                            let c = RgbaColor::new(img.rgba[0], img.rgba[1], img.rgba[2], img.rgba[3])
+                                .with_alpha(alpha);
+                            fb.fill_rounded_rect(rx, ry, bb.width, bb.height, radii, c);
+                        } else {
+                            for row in 0..max_rows {
+                                for col in 0..max_cols {
+                                    fb.blit_rgba(
+                                        img.width,
+                                        img.height,
+                                        &img.rgba,
+                                        rx + col as f32 * tw,
+                                        ry + row as f32 * th,
+                                        tw,
+                                        th,
+                                        alpha,
+                                    );
+                                }
+                            }
+                        }
+                        fb.pop_clip();
+                    }
                 }
             }
             _ => {}

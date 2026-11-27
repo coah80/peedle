@@ -462,17 +462,27 @@ fn read_chunked<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, HttpError> {
 }
 
 pub fn parse_data_url(url: &Url) -> Result<HttpResponse, HttpError> {
-    let raw = url.pathname();
+    let href = url.href();
+    let without_frag = href.split('#').next().unwrap_or(&href);
+    let fallback = url.pathname();
+    let raw = without_frag
+        .strip_prefix("data:")
+        .or_else(|| without_frag.strip_prefix("DATA:"))
+        .unwrap_or(&fallback);
     let Some(comma) = raw.find(',') else {
         return Err(HttpError::InvalidUrl("data url missing comma".to_string()));
     };
-    let meta = &raw[..comma];
+    let meta = raw[..comma].trim();
     let payload = &raw[comma + 1..];
-    let is_base64 = meta.ends_with(";base64") || meta == "base64";
+    let lower_meta = meta.to_ascii_lowercase();
+    let is_base64 = lower_meta.ends_with(";base64") || lower_meta == "base64";
     let mime = if is_base64 {
-        meta.strip_suffix(";base64")
-            .or_else(|| meta.strip_suffix("base64"))
-            .unwrap_or("")
+        let trim_len = if lower_meta.ends_with(";base64") {
+            meta.len() - 7
+        } else {
+            0
+        };
+        meta[..trim_len].trim()
     } else {
         meta
     };
@@ -481,13 +491,21 @@ pub fn parse_data_url(url: &Url) -> Result<HttpResponse, HttpError> {
     } else {
         mime.to_string()
     };
+    let decoded_pct = percent_decode(payload.as_bytes());
     let body = if is_base64 {
-        let cleaned: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let mut cleaned: Vec<u8> = decoded_pct
+            .into_iter()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+        while cleaned.len() % 4 != 0 {
+            cleaned.push(b'=');
+        }
         base64::engine::general_purpose::STANDARD
-            .decode(cleaned.as_bytes())
+            .decode(&cleaned)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(cleaned.trim_ascii_end()))
             .unwrap_or_else(|_| percent_decode(payload.as_bytes()))
     } else {
-        percent_decode(payload.as_bytes())
+        decoded_pct
     };
     Ok(HttpResponse {
         url: url.clone(),

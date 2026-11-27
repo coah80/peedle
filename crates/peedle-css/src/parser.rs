@@ -484,9 +484,6 @@ impl<'a> CssParser<'a> {
                     self.pos += 1;
                     break;
                 }
-                Token::Semicolon => {
-                    self.pos += 1;
-                }
                 Token::AtKeyword(_) => {
                     if let Some(r) = self.parse_at_rule() {
                         rules.push(r);

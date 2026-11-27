@@ -1,4 +1,17 @@
 use crate::tokenizer::{serialize_tokens, tokenize, Token};
+use std::cell::Cell;
+
+thread_local! {
+    static ACTIVE_DARK_MODE: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_active_dark_mode(dark: bool) -> bool {
+    ACTIVE_DARK_MODE.with(|c| {
+        let prev = c.get();
+        c.set(dark);
+        prev
+    })
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Color {
@@ -657,7 +670,12 @@ pub fn parse_color_value(tokens: &[Token]) -> Option<ColorValue> {
                 "light-dark" => {
                     let parts = split_commas(inner);
                     if parts.len() >= 2 {
-                        parse_color_from_tokens(parts[0], Color::BLACK)?
+                        let pick = if ACTIVE_DARK_MODE.with(|c| c.get()) {
+                            parts[1]
+                        } else {
+                            parts[0]
+                        };
+                        parse_color_from_tokens(pick, Color::BLACK)?
                     } else {
                         return None;
                     }

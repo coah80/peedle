@@ -66,6 +66,49 @@ impl FloatContext {
         y
     }
 
+    fn place_float(
+        &self,
+        side: Float,
+        start_y: f32,
+        width: f32,
+        height: f32,
+        left_bound: f32,
+        right_bound: f32,
+    ) -> (f32, f32) {
+        let mut y = start_y;
+        let check_h = height.max(1.0);
+        for _ in 0..64 {
+            let (fl, fr) = self.available_span(y, check_h, left_bound, right_bound);
+            if fr - fl >= width - 0.5 || (fl <= left_bound + 0.01 && fr >= right_bound - 0.01) {
+                let x = match side {
+                    Float::Left => fl,
+                    Float::Right => (fr - width).max(left_bound),
+                    Float::None => left_bound,
+                };
+                return (x, y);
+            }
+            let mut next_y = f32::INFINITY;
+            for f in &self.floats {
+                let fb = f.y + f.height;
+                if fb > y + 0.01 && f.y < y + check_h - 0.01 {
+                    next_y = next_y.min(fb);
+                }
+            }
+            if next_y.is_finite() && next_y > y + 0.01 {
+                y = next_y;
+            } else {
+                break;
+            }
+        }
+        let (fl, fr) = self.available_span(y, check_h, left_bound, right_bound);
+        let x = match side {
+            Float::Left => fl,
+            Float::Right => (fr - width).max(left_bound),
+            Float::None => left_bound,
+        };
+        (x, y)
+    }
+
     fn max_bottom(&self) -> f32 {
         self.floats
             .iter()
@@ -155,16 +198,17 @@ impl LayoutEngine {
     ) -> Vec<LayoutBoxId> {
         match &doc.node(node_id).data {
             NodeData::Text(text) => {
+                if text.is_empty() {
+                    return Vec::new();
+                }
                 let parent_style = doc
                     .node(node_id)
                     .parent
                     .and_then(|p| styles.get(p))
                     .cloned()
                     .unwrap_or_default();
-                if text.is_empty() {
-                    return Vec::new();
-                }
-                let id = self.tree.alloc(Some(node_id), BoxKind::Text(text.clone()), parent_style);
+                let text_style = inherited_only_style(&parent_style, Display::Inline);
+                let id = self.tree.alloc(Some(node_id), BoxKind::Text(text.clone()), text_style);
                 vec![id]
             }
             NodeData::Element(el) => {
@@ -294,25 +338,7 @@ impl LayoutEngine {
                             if t.trim().is_empty() {
                                 continue;
                             }
-                            let mut anon_style = style.clone();
-                            anon_style.display = Display::Block;
-                            anon_style.background_color = peedle_css::Color::TRANSPARENT;
-                            anon_style.background_image = peedle_css::BackgroundImage::None;
-                            anon_style.border_top_width = 0.0;
-                            anon_style.border_right_width = 0.0;
-                            anon_style.border_bottom_width = 0.0;
-                            anon_style.border_left_width = 0.0;
-                            anon_style.padding_top = LengthPercentageAuto::px(0.0);
-                            anon_style.padding_right = LengthPercentageAuto::px(0.0);
-                            anon_style.padding_bottom = LengthPercentageAuto::px(0.0);
-                            anon_style.padding_left = LengthPercentageAuto::px(0.0);
-                            anon_style.margin_top = LengthPercentageAuto::px(0.0);
-                            anon_style.margin_right = LengthPercentageAuto::px(0.0);
-                            anon_style.margin_bottom = LengthPercentageAuto::px(0.0);
-                            anon_style.margin_left = LengthPercentageAuto::px(0.0);
-                            anon_style.width = LengthPercentageAuto::Auto;
-                            anon_style.height = LengthPercentageAuto::Auto;
-                            anon_style.box_shadow.clear();
+                            let anon_style = inherited_only_style(&style, Display::Block);
                             let anon = self.tree.alloc(None, BoxKind::AnonymousBlock, anon_style);
                             self.tree.get_mut(anon).children.push(cid);
                             wrapped.push(anon);
@@ -372,25 +398,7 @@ impl LayoutEngine {
             run.clear();
             return;
         }
-        let mut anon_style = parent_style.clone();
-        anon_style.display = Display::Block;
-        anon_style.background_color = peedle_css::Color::TRANSPARENT;
-        anon_style.background_image = peedle_css::BackgroundImage::None;
-        anon_style.border_top_width = 0.0;
-        anon_style.border_right_width = 0.0;
-        anon_style.border_bottom_width = 0.0;
-        anon_style.border_left_width = 0.0;
-        anon_style.padding_top = LengthPercentageAuto::px(0.0);
-        anon_style.padding_right = LengthPercentageAuto::px(0.0);
-        anon_style.padding_bottom = LengthPercentageAuto::px(0.0);
-        anon_style.padding_left = LengthPercentageAuto::px(0.0);
-        anon_style.margin_top = LengthPercentageAuto::px(0.0);
-        anon_style.margin_right = LengthPercentageAuto::px(0.0);
-        anon_style.margin_bottom = LengthPercentageAuto::px(0.0);
-        anon_style.margin_left = LengthPercentageAuto::px(0.0);
-        anon_style.width = LengthPercentageAuto::Auto;
-        anon_style.height = LengthPercentageAuto::Auto;
-        anon_style.box_shadow.clear();
+        let anon_style = inherited_only_style(parent_style, Display::Block);
         let anon_id = self.tree.alloc(None, BoxKind::AnonymousBlock, anon_style);
         self.tree.get_mut(anon_id).children = std::mem::take(run);
         out.push(anon_id);
@@ -419,7 +427,10 @@ impl LayoutEngine {
     }
 
     pub fn resolve_explicit_height(&self, style: &ComputedStyle, cb_height: f32) -> Option<f32> {
-        let ctx = self.calc_ctx(style, cb_height);
+        if cb_height < 0.0 && matches!(style.height, LengthPercentageAuto::Percent(_)) {
+            return None;
+        }
+        let ctx = self.calc_ctx(style, cb_height.max(0.0));
         let h = style.height.resolve(&ctx)?;
         if style.box_sizing == BoxSizing::BorderBox {
             let pv = style.padding_top.resolve_or(&ctx, 0.0)
@@ -557,9 +568,21 @@ impl LayoutEngine {
                 let children = self.tree.get(id).children.clone();
                 let has_block_children = children.iter().any(|&cid| self.is_block_level(cid));
                 let explicit_h = self.resolve_explicit_height(&style, cb_height);
-                let child_cb_h = explicit_h.unwrap_or(cb_height);
+                let is_root = self.tree.root == Some(id);
+                let child_cb_h = explicit_h.unwrap_or(if is_root { cb_height } else { -1.0 });
+                let establishes_bfc = style.overflow_x != peedle_css::Overflow::Visible
+                    || style.overflow_y != peedle_css::Overflow::Visible
+                    || style.display == Display::FlowRoot
+                    || style.display == Display::InlineBlock
+                    || style.float != Float::None
+                    || matches!(style.position, Position::Absolute | Position::Fixed);
+                let saved_floats = if establishes_bfc {
+                    Some(std::mem::take(&mut self.float_ctx))
+                } else {
+                    None
+                };
 
-                let content_h = if has_block_children {
+                let mut content_h = if has_block_children {
                     self.layout_block_children(
                         id,
                         &children,
@@ -572,6 +595,12 @@ impl LayoutEngine {
                 } else {
                     self.layout_inline_children(id, &children, content_x, content_y, content_w, child_cb_h)
                 };
+                if establishes_bfc {
+                    content_h = content_h.max((self.float_ctx.max_bottom() - content_y).max(0.0));
+                }
+                if let Some(prev) = saved_floats {
+                    self.float_ctx = prev;
+                }
 
                 let mut final_h = explicit_h.unwrap_or(content_h);
                 if explicit_h.is_none() {
@@ -581,22 +610,36 @@ impl LayoutEngine {
                         }
                     }
                 }
-                let ctx_h = self.calc_ctx(&style, cb_height);
-                if let Some(min_h) = style.min_height.resolve(&ctx_h) {
-                    let mh = if style.box_sizing == BoxSizing::BorderBox {
-                        (min_h - pb_v).max(0.0)
-                    } else {
-                        min_h
-                    };
-                    final_h = final_h.max(mh);
-                }
-                if let Some(max_h) = style.max_height.resolve(&ctx_h) {
+                let ctx_h = self.calc_ctx(&style, cb_height.max(0.0));
+                let max_h_opt = if cb_height < 0.0
+                    && matches!(style.max_height, LengthPercentageAuto::Percent(_))
+                {
+                    None
+                } else {
+                    style.max_height.resolve(&ctx_h)
+                };
+                if let Some(max_h) = max_h_opt {
                     let xh = if style.box_sizing == BoxSizing::BorderBox {
                         (max_h - pb_v).max(0.0)
                     } else {
                         max_h
                     };
                     final_h = final_h.min(xh);
+                }
+                let min_h_opt = if cb_height < 0.0
+                    && matches!(style.min_height, LengthPercentageAuto::Percent(_))
+                {
+                    None
+                } else {
+                    style.min_height.resolve(&ctx_h)
+                };
+                if let Some(min_h) = min_h_opt {
+                    let mh = if style.box_sizing == BoxSizing::BorderBox {
+                        (min_h - pb_v).max(0.0)
+                    } else {
+                        min_h
+                    };
+                    final_h = final_h.max(mh);
                 }
                 self.tree.get_mut(id).dims.content.height = final_h.max(0.0);
             }
@@ -617,19 +660,6 @@ impl LayoutEngine {
         let mut prev_margin_bottom = 0.0f32;
         let mut has_prev = false;
         let mut abs_children = Vec::new();
-        let establishes_bfc = {
-            let s = &self.tree.get(container_id).style;
-            s.overflow_x != peedle_css::Overflow::Visible
-                || s.overflow_y != peedle_css::Overflow::Visible
-                || s.display == Display::FlowRoot
-                || s.display == Display::InlineBlock
-                || s.float != Float::None
-        };
-        let saved_floats = if establishes_bfc {
-            Some(std::mem::take(&mut self.float_ctx))
-        } else {
-            None
-        };
 
         for &cid in children {
             let cs = self.tree.get(cid).style.clone();
@@ -650,15 +680,15 @@ impl LayoutEngine {
                     SizeConstraint::Available(content_w),
                 );
                 let mb = self.tree.get(cid).dims.margin_box();
-                let (fl, fr) = self
-                    .float_ctx
-                    .available_span(cursor_y, mb.height, content_x, content_x + content_w);
-                let target_x = match cs.float {
-                    Float::Left => fl,
-                    Float::Right => (fr - mb.width).max(content_x),
-                    Float::None => content_x,
-                };
-                self.translate_subtree(cid, target_x - mb.x, 0.0);
+                let (target_x, target_y) = self.float_ctx.place_float(
+                    cs.float,
+                    cursor_y,
+                    mb.width,
+                    mb.height,
+                    content_x,
+                    content_x + content_w,
+                );
+                self.translate_subtree(cid, target_x - mb.x, target_y - mb.y);
                 let final_mb = self.tree.get(cid).dims.margin_box();
                 self.float_ctx.floats.push(FloatRect {
                     side: cs.float,
@@ -673,8 +703,14 @@ impl LayoutEngine {
             let cctx = self.calc_ctx(&cs, content_w);
             let mt = cs.margin_top.resolve_or(&cctx, 0.0);
             let collapsed_y = if has_prev {
-                let overlap = prev_margin_bottom.min(mt).max(0.0);
-                cursor_y - overlap
+                let adj = if prev_margin_bottom >= 0.0 && mt >= 0.0 {
+                    prev_margin_bottom.min(mt)
+                } else if prev_margin_bottom < 0.0 && mt < 0.0 {
+                    prev_margin_bottom.max(mt)
+                } else {
+                    0.0
+                };
+                cursor_y - adj
             } else {
                 cursor_y
             };
@@ -695,13 +731,7 @@ impl LayoutEngine {
             has_prev = true;
         }
 
-        let mut total_h = (cursor_y - content_y).max(0.0);
-        if establishes_bfc {
-            total_h = total_h.max((self.float_ctx.max_bottom() - content_y).max(0.0));
-        }
-        if let Some(prev) = saved_floats {
-            self.float_ctx = prev;
-        }
+        let total_h = (cursor_y - content_y).max(0.0);
 
         self.tree.get_mut(container_id).dims.content.height = explicit_h.unwrap_or(total_h);
         for cid in abs_children {
@@ -1154,14 +1184,18 @@ impl LayoutEngine {
                 let mut max_block = 0.0f32;
                 for cid in kids {
                     let cw = self.measure_intrinsic_width(cid, cb_width);
-                    let cs = self.tree.get(cid).style.clone();
-                    let cctx = self.calc_ctx(&cs, cb_width);
-                    let extra = cs.padding_left.resolve_or(&cctx, 0.0)
-                        + cs.padding_right.resolve_or(&cctx, 0.0)
-                        + cs.border_left_width
-                        + cs.border_right_width
-                        + cs.margin_left.resolve_or(&cctx, 0.0)
-                        + cs.margin_right.resolve_or(&cctx, 0.0);
+                    let extra = if matches!(self.tree.get(cid).kind, BoxKind::Text(_)) {
+                        0.0
+                    } else {
+                        let cs = self.tree.get(cid).style.clone();
+                        let cctx = self.calc_ctx(&cs, cb_width);
+                        cs.padding_left.resolve_or(&cctx, 0.0)
+                            + cs.padding_right.resolve_or(&cctx, 0.0)
+                            + cs.border_left_width
+                            + cs.border_right_width
+                            + cs.margin_left.resolve_or(&cctx, 0.0)
+                            + cs.margin_right.resolve_or(&cctx, 0.0)
+                    };
                     if self.is_block_level(cid) && style.display != Display::Flex {
                         max_block = max_block.max(cw + extra);
                     } else {
@@ -1228,6 +1262,34 @@ impl LayoutEngine {
     }
 }
 
+fn inherited_only_style(parent: &ComputedStyle, display: Display) -> ComputedStyle {
+    let mut s = ComputedStyle::default();
+    s.display = display;
+    s.color = parent.color;
+    s.font_family = parent.font_family.clone();
+    s.font_size = parent.font_size;
+    s.font_weight = parent.font_weight;
+    s.font_style = parent.font_style;
+    s.line_height = parent.line_height;
+    s.letter_spacing = parent.letter_spacing;
+    s.word_spacing = parent.word_spacing;
+    s.text_align = parent.text_align;
+    s.text_decoration_line = parent.text_decoration_line;
+    s.text_decoration_style = parent.text_decoration_style;
+    s.text_decoration_color = parent.text_decoration_color;
+    s.text_transform = parent.text_transform;
+    s.text_indent = parent.text_indent;
+    s.text_shadow = parent.text_shadow.clone();
+    s.white_space = parent.white_space;
+    s.word_break = parent.word_break;
+    s.overflow_wrap = parent.overflow_wrap;
+    s.visibility = parent.visibility;
+    s.cursor = parent.cursor;
+    s.pointer_events = parent.pointer_events;
+    s.user_select = parent.user_select;
+    s
+}
+
 fn detect_replaced(
     doc: &Document,
     node_id: NodeId,
@@ -1263,6 +1325,17 @@ fn detect_replaced(
                 url,
                 intrinsic_w: w,
                 intrinsic_h: h,
+            })
+        }
+        "object" => {
+            let url = el.get_attr("data")?;
+            let &(nat_w, nat_h) = image_sizes.get(url)?;
+            let attr_w = el.get_attr("width").and_then(|s| s.parse::<f32>().ok());
+            let attr_h = el.get_attr("height").and_then(|s| s.parse::<f32>().ok());
+            Some(ReplacedKind::Image {
+                url: url.to_string(),
+                intrinsic_w: attr_w.unwrap_or(nat_w as f32),
+                intrinsic_h: attr_h.unwrap_or(nat_h as f32),
             })
         }
         "canvas" => {

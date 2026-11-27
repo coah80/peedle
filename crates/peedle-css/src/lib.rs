@@ -5,7 +5,10 @@ pub mod style;
 pub mod tokenizer;
 pub mod values;
 
-pub use cascade::{compute_styles, compute_styles_with_ua, StyleMap};
+pub use cascade::{
+    compute_styles, compute_styles_for_root, compute_styles_with_ua, compute_styles_with_ua_root,
+    StyleMap,
+};
 pub use parser::{
     is_supported_declaration, parse_inline_declarations, parse_media_query_list,
     parse_stylesheet, parse_supports_condition, Declaration, FontFaceRule, ImportRule,

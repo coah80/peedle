@@ -110,3 +110,50 @@ fn table_and_absolute_positioning() {
     assert!((abs.right() - (rel.right() - 10.0)).abs() < 1.5);
     assert!((abs.bottom() - (rel.bottom() - 15.0)).abs() < 1.5);
 }
+
+#[test]
+fn acid1_float_grid_stays_inside_dd() {
+    let acid1_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/acid/acid1.html");
+    if !acid1_path.exists() {
+        return;
+    }
+    let html = std::fs::read_to_string(&acid1_path).unwrap();
+    let doc = parse_html(&html);
+    let mut sheets = Vec::new();
+    for nid in doc.descendants(doc.root) {
+        if let Some(el) = doc.element(nid) {
+            if el.is_html() && el.tag_is("style") {
+                sheets.push(parse_stylesheet(&doc.text_content(nid)));
+            }
+        }
+    }
+    let styles = compute_styles(
+        &doc,
+        &sheets,
+        Viewport {
+            width: 800.0,
+            height: 600.0,
+            dark_mode: false,
+        },
+    );
+    let tree = layout_document(&doc, &styles, &HashMap::new(), 800.0, 600.0);
+    let dd = doc.get_elements_by_tag_name(doc.root, "dd")[0];
+    let dd_rect = tree.bounding_rect(dd).unwrap();
+    let bar = doc.get_element_by_id("bar").unwrap();
+    let bar_rect = tree.bounding_rect(bar).unwrap();
+    let baz = doc.get_element_by_id("baz").unwrap();
+    let baz_rect = tree.bounding_rect(baz).unwrap();
+    assert!(
+        bar_rect.y >= dd_rect.y && bar_rect.bottom() <= dd_rect.bottom(),
+        "bar {:?} outside dd {:?}",
+        bar_rect,
+        dd_rect
+    );
+    assert!(
+        baz_rect.y >= dd_rect.y && baz_rect.bottom() <= dd_rect.bottom(),
+        "baz {:?} outside dd {:?}",
+        baz_rect,
+        dd_rect
+    );
+}
