@@ -164,7 +164,12 @@ fn paint_box(
         }
     }
 
-    let alpha = b.style.opacity.clamp(0.0, 1.0);
+    let mut alpha = b.style.opacity.clamp(0.0, 1.0);
+    for fop in &b.style.filter {
+        if let peedle_css::FilterOp::Opacity(fo) = fop {
+            alpha *= fo.clamp(0.0, 1.0);
+        }
+    }
     let rx = bb.x + dx;
     let ry = bb.y + dy;
     let radii = resolve_radii(&b.style, bb.width, bb.height);
@@ -211,11 +216,22 @@ fn paint_box(
                 }
             }
         } else if b.style.background_color.a > 0 {
+            let (bg_x, bg_y, bg_w, bg_h) = match b.style.background_clip {
+                peedle_css::BackgroundClip::PaddingBox => {
+                    let pb = b.dims.padding_box();
+                    (pb.x + dx, pb.y + dy, pb.width, pb.height)
+                }
+                peedle_css::BackgroundClip::ContentBox => {
+                    let cb = b.dims.content;
+                    (cb.x + dx, cb.y + dy, cb.width, cb.height)
+                }
+                _ => (rx, ry, bb.width, bb.height),
+            };
             fb.fill_rounded_rect(
-                rx,
-                ry,
-                bb.width,
-                bb.height,
+                bg_x,
+                bg_y,
+                bg_w,
+                bg_h,
                 radii,
                 to_rgba(b.style.background_color).with_alpha(alpha),
             );

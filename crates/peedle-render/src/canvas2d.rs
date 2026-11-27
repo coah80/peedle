@@ -158,6 +158,65 @@ impl Canvas2D {
         self.close_path();
     }
 
+    pub fn round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32) {
+        let r = radius.max(0.0).min(w.abs() * 0.5).min(h.abs() * 0.5);
+        if r <= 0.01 {
+            self.rect(x, y, w, h);
+            return;
+        }
+        let k = 0.552_284_8 * r;
+        self.move_to(x + r, y);
+        self.line_to(x + w - r, y);
+        self.bezier_curve_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+        self.line_to(x + w, y + h - r);
+        self.bezier_curve_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+        self.line_to(x + r, y + h);
+        self.bezier_curve_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+        self.line_to(x, y + r);
+        self.bezier_curve_to(x, y + r - k, x + r - k, y, x + r, y);
+        self.close_path();
+    }
+
+    pub fn ellipse(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        rx: f32,
+        ry: f32,
+        rotation: f32,
+        start: f32,
+        end: f32,
+        ccw: bool,
+    ) {
+        let mut sweep = end - start;
+        if ccw {
+            if sweep >= 0.0 {
+                sweep = (sweep % std::f32::consts::TAU) - std::f32::consts::TAU;
+            }
+        } else if sweep <= 0.0 {
+            sweep = (sweep % std::f32::consts::TAU) + std::f32::consts::TAU;
+        }
+        if sweep.abs() >= std::f32::consts::TAU {
+            sweep = if ccw {
+                -std::f32::consts::TAU
+            } else {
+                std::f32::consts::TAU
+            };
+        }
+        let cos_r = rotation.cos();
+        let sin_r = rotation.sin();
+        let steps = ((sweep.abs() * rx.abs().max(ry.abs())).clamp(16.0, 128.0)) as usize;
+        for i in 0..=steps {
+            let a = start + sweep * (i as f32 / steps as f32);
+            let lx = rx * a.cos();
+            let ly = ry * a.sin();
+            let px = cx + lx * cos_r - ly * sin_r;
+            let py = cy + lx * sin_r + ly * cos_r;
+            let pt = self.state.transform.apply(px, py);
+            self.current.push(pt);
+        }
+    }
+
     pub fn arc(&mut self, cx: f32, cy: f32, r: f32, start: f32, end: f32, ccw: bool) {
         let mut sweep = end - start;
         if ccw {

@@ -825,6 +825,20 @@ fn expand_shorthand(name: &str, value: &[Token]) -> Vec<(String, Vec<Token>)> {
         "border-inline-end" => expand_border_side("right", trimmed),
         "border-block-start" => expand_border_side("top", trimmed),
         "border-block-end" => expand_border_side("bottom", trimmed),
+        "border-inline" => {
+            let mut out = expand_border_side("left", trimmed);
+            out.extend(expand_border_side("right", trimmed));
+            out
+        }
+        "border-block" => {
+            let mut out = expand_border_side("top", trimmed);
+            out.extend(expand_border_side("bottom", trimmed));
+            out
+        }
+        "border-start-start-radius" => vec![("border-top-left-radius".to_string(), trimmed.to_vec())],
+        "border-start-end-radius" => vec![("border-top-right-radius".to_string(), trimmed.to_vec())],
+        "border-end-end-radius" => vec![("border-bottom-right-radius".to_string(), trimmed.to_vec())],
+        "border-end-start-radius" => vec![("border-bottom-left-radius".to_string(), trimmed.to_vec())],
         "border-inline-start-width" => vec![("border-left-width".to_string(), trimmed.to_vec())],
         "border-inline-end-width" => vec![("border-right-width".to_string(), trimmed.to_vec())],
         "border-block-start-width" => vec![("border-top-width".to_string(), trimmed.to_vec())],
