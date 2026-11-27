@@ -359,3 +359,50 @@ fn mask_image_and_rounded_object_fit_render() {
     let av_corner = ((41 * 200 + 1) * 4) as usize;
     assert_eq!((fb.data[av_corner], fb.data[av_corner + 1], fb.data[av_corner + 2]), (255, 255, 255));
 }
+
+#[test]
+fn svg_current_color_use_symbol_and_evenodd_render() {
+    let html = r##"<!DOCTYPE html>
+        <style>
+            body { margin: 0; background: #000000; color: #38bdf8; }
+            svg { display: block; }
+        </style>
+        <svg width="80" height="80" viewBox="0 0 80 80">
+            <defs>
+                <symbol id="ring">
+                    <path fill="currentColor" fill-rule="evenodd" d="M 10 10 L 70 10 L 70 70 L 10 70 Z M 30 30 L 50 30 L 50 50 L 30 50 Z"/>
+                </symbol>
+            </defs>
+            <use href="#ring"/>
+        </svg>
+    "##;
+    let doc = parse_html(html);
+    let mut sheets = Vec::new();
+    for nid in doc.descendants(doc.root) {
+        if let Some(el) = doc.element(nid) {
+            if el.tag_is("style") {
+                sheets.push(peedle_css::parse_stylesheet(&doc.text_content(nid)));
+            }
+        }
+    }
+    let styles = peedle_css::compute_styles(
+        &doc,
+        &sheets,
+        peedle_css::Viewport {
+            width: 100.0,
+            height: 100.0,
+            dark_mode: false,
+        },
+    );
+    let tree = peedle_layout::layout_document(&doc, &styles, &std::collections::HashMap::new(), 100.0, 100.0);
+    let fonts = FontSystem::load_system_fonts();
+    let images = peedle_render::ImageCache::new();
+    let canvases = std::collections::HashMap::new();
+    let mut fb = Framebuffer::new(100, 100);
+    peedle_render::paint_layout(&doc, &tree, &mut fb, &fonts, &images, &canvases, 0.0, 0.0);
+
+    let ring_px = ((20 * 100 + 20) * 4) as usize;
+    assert_eq!((fb.data[ring_px], fb.data[ring_px + 1], fb.data[ring_px + 2]), (56, 189, 248));
+    let hole_px = ((40 * 100 + 40) * 4) as usize;
+    assert_eq!((fb.data[hole_px], fb.data[hole_px + 1], fb.data[hole_px + 2]), (0, 0, 0));
+}

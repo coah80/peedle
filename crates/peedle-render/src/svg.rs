@@ -14,6 +14,30 @@ pub fn render_svg_node(
     dst_w: f32,
     dst_h: f32,
 ) {
+    render_svg_node_with_color(
+        doc,
+        svg_id,
+        fb,
+        fonts,
+        dst_x,
+        dst_y,
+        dst_w,
+        dst_h,
+        RgbaColor::BLACK,
+    );
+}
+
+pub fn render_svg_node_with_color(
+    doc: &Document,
+    svg_id: NodeId,
+    fb: &mut Framebuffer,
+    fonts: &FontSystem,
+    dst_x: f32,
+    dst_y: f32,
+    dst_w: f32,
+    dst_h: f32,
+    current_color: RgbaColor,
+) {
     if dst_w <= 0.0 || dst_h <= 0.0 {
         return;
     }
@@ -37,10 +61,10 @@ pub fn render_svg_node(
     let inherited_fill = doc
         .element(svg_id)
         .and_then(|e| e.get_attr("fill"))
-        .and_then(parse_svg_color)
-        .unwrap_or(Some(RgbaColor::BLACK));
+        .and_then(|v| parse_svg_color_with_current(v, current_color))
+        .unwrap_or(Some(current_color));
 
-    render_svg_children(doc, svg_id, &mut canvas, fonts, inherited_fill, None, 1.0);
+    render_svg_children(doc, svg_id, &mut canvas, fonts, inherited_fill, None, 1.0, current_color, 0);
     fb.blit_rgba(
         canvas.fb.width,
         canvas.fb.height,
@@ -61,170 +85,234 @@ fn render_svg_children(
     parent_fill: Option<RgbaColor>,
     parent_stroke: Option<RgbaColor>,
     parent_stroke_w: f32,
+    current_color: RgbaColor,
+    depth: usize,
 ) {
+    if depth > 16 {
+        return;
+    }
     for child in doc.element_children(parent) {
-        let Some(el) = doc.element(child) else {
-            continue;
-        };
-        if el.tag_name.eq_ignore_ascii_case("defs")
-            || el.tag_name.eq_ignore_ascii_case("title")
-            || el.tag_name.eq_ignore_ascii_case("desc")
-            || el.tag_name.eq_ignore_ascii_case("style")
-        {
-            continue;
-        }
-        canvas.save();
-        if let Some(tf) = el.get_attr("transform") {
-            apply_svg_transform(canvas, tf);
-        }
-        let style_prop = |name: &str| -> Option<&str> {
-            let st = el.get_attr("style")?;
-            for decl in st.split(';') {
-                let (k, v) = decl.split_once(':')?;
-                if k.trim().eq_ignore_ascii_case(name) {
-                    return Some(v.trim());
-                }
-            }
-            None
-        };
-        let svg_attr = |name: &str| -> Option<&str> {
-            style_prop(name).or_else(|| el.get_attr(name))
-        };
-
-        if let Some(op) = svg_attr("opacity").and_then(|s| s.parse::<f32>().ok()) {
-            canvas.state.global_alpha *= op.clamp(0.0, 1.0);
-        }
-
-        let fill_op = svg_attr("fill-opacity")
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
-        let stroke_op = svg_attr("stroke-opacity")
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
-
-        let fill = match svg_attr("fill") {
-            Some(v) => parse_svg_color(v).unwrap_or(parent_fill),
-            None => parent_fill,
-        }
-        .map(|c| c.with_alpha(fill_op));
-        let stroke = match svg_attr("stroke") {
-            Some(v) => parse_svg_color(v).unwrap_or(parent_stroke),
-            None => parent_stroke,
-        }
-        .map(|c| c.with_alpha(stroke_op));
-        let stroke_w = svg_attr("stroke-width")
-            .and_then(|s| s.trim_end_matches("px").parse::<f32>().ok())
-            .unwrap_or(parent_stroke_w);
-        canvas.state.line_width = stroke_w;
-
-        match el.tag_name.to_ascii_lowercase().as_str() {
-            "g" | "a" | "svg" => {
-                render_svg_children(doc, child, canvas, fonts, fill, stroke, stroke_w);
-            }
-            "rect" => {
-                let x = attr_f32(el.get_attr("x"), 0.0);
-                let y = attr_f32(el.get_attr("y"), 0.0);
-                let w = attr_f32(el.get_attr("width"), 0.0);
-                let h = attr_f32(el.get_attr("height"), 0.0);
-                let rx_opt = el.get_attr("rx").and_then(|s| s.trim_end_matches("px").parse::<f32>().ok());
-                let ry_opt = el.get_attr("ry").and_then(|s| s.trim_end_matches("px").parse::<f32>().ok());
-                let rx = rx_opt.or(ry_opt).unwrap_or(0.0).clamp(0.0, w * 0.5);
-                let ry = ry_opt.or(rx_opt).unwrap_or(0.0).clamp(0.0, h * 0.5);
-                canvas.begin_path();
-                if rx > 0.01 || ry > 0.01 {
-                    trace_rounded_rect(canvas, x, y, w, h, rx, ry);
-                } else {
-                    canvas.rect(x, y, w, h);
-                }
-                paint_path(canvas, fill, stroke);
-            }
-            "circle" => {
-                let cx = attr_f32(el.get_attr("cx"), 0.0);
-                let cy = attr_f32(el.get_attr("cy"), 0.0);
-                let r = attr_f32(el.get_attr("r"), 0.0);
-                canvas.begin_path();
-                canvas.arc(cx, cy, r, 0.0, std::f32::consts::TAU, false);
-                canvas.close_path();
-                paint_path(canvas, fill, stroke);
-            }
-            "ellipse" => {
-                let cx = attr_f32(el.get_attr("cx"), 0.0);
-                let cy = attr_f32(el.get_attr("cy"), 0.0);
-                let rx = attr_f32(el.get_attr("rx"), 0.0);
-                let ry = attr_f32(el.get_attr("ry"), 0.0);
-                canvas.begin_path();
-                let steps = 48usize;
-                for i in 0..=steps {
-                    let a = std::f32::consts::TAU * (i as f32 / steps as f32);
-                    let px = cx + rx * a.cos();
-                    let py = cy + ry * a.sin();
-                    if i == 0 {
-                        canvas.move_to(px, py);
-                    } else {
-                        canvas.line_to(px, py);
-                    }
-                }
-                canvas.close_path();
-                paint_path(canvas, fill, stroke);
-            }
-            "line" => {
-                let x1 = attr_f32(el.get_attr("x1"), 0.0);
-                let y1 = attr_f32(el.get_attr("y1"), 0.0);
-                let x2 = attr_f32(el.get_attr("x2"), 0.0);
-                let y2 = attr_f32(el.get_attr("y2"), 0.0);
-                canvas.begin_path();
-                canvas.move_to(x1, y1);
-                canvas.line_to(x2, y2);
-                paint_path(canvas, None, stroke);
-            }
-            "polyline" | "polygon" => {
-                if let Some(pts_str) = el.get_attr("points") {
-                    let nums = parse_numbers(pts_str);
-                    canvas.begin_path();
-                    let mut i = 0;
-                    while i + 1 < nums.len() {
-                        if i == 0 {
-                            canvas.move_to(nums[i], nums[i + 1]);
-                        } else {
-                            canvas.line_to(nums[i], nums[i + 1]);
-                        }
-                        i += 2;
-                    }
-                    if el.tag_name.eq_ignore_ascii_case("polygon") {
-                        canvas.close_path();
-                    }
-                    paint_path(canvas, fill, stroke);
-                }
-            }
-            "path" => {
-                if let Some(d) = el.get_attr("d") {
-                    trace_svg_path(canvas, d);
-                    paint_path(canvas, fill, stroke);
-                }
-            }
-            "text" => {
-                let x = attr_f32(el.get_attr("x"), 0.0);
-                let y = attr_f32(el.get_attr("y"), 12.0);
-                let fs = attr_f32(el.get_attr("font-size"), 14.0);
-                canvas.state.font_size = fs;
-                if let Some(c) = fill {
-                    canvas.state.fill_style = c;
-                    let txt = doc.text_content(child);
-                    canvas.fill_text(fonts, txt.trim(), x, y);
-                }
-            }
-            _ => {}
-        }
-        canvas.restore();
+        render_svg_element(
+            doc,
+            child,
+            canvas,
+            fonts,
+            parent_fill,
+            parent_stroke,
+            parent_stroke_w,
+            current_color,
+            depth,
+            false,
+        );
     }
 }
 
-fn paint_path(canvas: &mut Canvas2D, fill: Option<RgbaColor>, stroke: Option<RgbaColor>) {
+fn render_svg_element(
+    doc: &Document,
+    child: NodeId,
+    canvas: &mut Canvas2D,
+    fonts: &FontSystem,
+    parent_fill: Option<RgbaColor>,
+    parent_stroke: Option<RgbaColor>,
+    parent_stroke_w: f32,
+    current_color: RgbaColor,
+    depth: usize,
+    from_use: bool,
+) {
+    if depth > 16 {
+        return;
+    }
+    let Some(el) = doc.element(child) else {
+        return;
+    };
+    if el.tag_name.eq_ignore_ascii_case("defs")
+        || el.tag_name.eq_ignore_ascii_case("title")
+        || el.tag_name.eq_ignore_ascii_case("desc")
+        || el.tag_name.eq_ignore_ascii_case("style")
+        || (!from_use && el.tag_name.eq_ignore_ascii_case("symbol"))
+    {
+        return;
+    }
+    canvas.save();
+    if let Some(tf) = el.get_attr("transform") {
+        apply_svg_transform(canvas, tf);
+    }
+    let style_prop = |name: &str| -> Option<&str> {
+        let st = el.get_attr("style")?;
+        for decl in st.split(';') {
+            let (k, v) = decl.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim());
+            }
+        }
+        None
+    };
+    let svg_attr = |name: &str| -> Option<&str> {
+        style_prop(name).or_else(|| el.get_attr(name))
+    };
+
+    if let Some(op) = svg_attr("opacity").and_then(|s| s.parse::<f32>().ok()) {
+        canvas.state.global_alpha *= op.clamp(0.0, 1.0);
+    }
+
+    let fill_op = svg_attr("fill-opacity")
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let stroke_op = svg_attr("stroke-opacity")
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+
+    let effective_current = svg_attr("color")
+        .and_then(|v| parse_svg_color_with_current(v, current_color))
+        .flatten()
+        .unwrap_or(current_color);
+
+    let fill = match svg_attr("fill") {
+        Some(v) => parse_svg_color_with_current(v, effective_current).unwrap_or(parent_fill),
+        None => parent_fill,
+    }
+    .map(|c| c.with_alpha(fill_op));
+    let stroke = match svg_attr("stroke") {
+        Some(v) => parse_svg_color_with_current(v, effective_current).unwrap_or(parent_stroke),
+        None => parent_stroke,
+    }
+    .map(|c| c.with_alpha(stroke_op));
+    let stroke_w = svg_attr("stroke-width")
+        .and_then(|s| s.trim_end_matches("px").parse::<f32>().ok())
+        .unwrap_or(parent_stroke_w);
+    let even_odd = svg_attr("fill-rule")
+        .map_or(false, |v| v.eq_ignore_ascii_case("evenodd"));
+    canvas.state.line_width = stroke_w;
+
+    match el.tag_name.to_ascii_lowercase().as_str() {
+        "g" | "a" | "svg" | "symbol" => {
+            render_svg_children(doc, child, canvas, fonts, fill, stroke, stroke_w, effective_current, depth + 1);
+        }
+        "use" => {
+            let ux = attr_f32(el.get_attr("x"), 0.0);
+            let uy = attr_f32(el.get_attr("y"), 0.0);
+            if ux != 0.0 || uy != 0.0 {
+                canvas.translate(ux, uy);
+            }
+            let href = el.get_attr("href").or_else(|| el.get_attr("xlink:href"));
+            if let Some(target_id) = href.and_then(|h| h.strip_prefix('#')).and_then(|id| doc.get_element_by_id(id)) {
+                render_svg_element(
+                    doc,
+                    target_id,
+                    canvas,
+                    fonts,
+                    fill,
+                    stroke,
+                    stroke_w,
+                    effective_current,
+                    depth + 1,
+                    true,
+                );
+            }
+        }
+        "rect" => {
+            let x = attr_f32(el.get_attr("x"), 0.0);
+            let y = attr_f32(el.get_attr("y"), 0.0);
+            let w = attr_f32(el.get_attr("width"), 0.0);
+            let h = attr_f32(el.get_attr("height"), 0.0);
+            let rx_opt = el.get_attr("rx").and_then(|s| s.trim_end_matches("px").parse::<f32>().ok());
+            let ry_opt = el.get_attr("ry").and_then(|s| s.trim_end_matches("px").parse::<f32>().ok());
+            let rx = rx_opt.or(ry_opt).unwrap_or(0.0).clamp(0.0, w * 0.5);
+            let ry = ry_opt.or(rx_opt).unwrap_or(0.0).clamp(0.0, h * 0.5);
+            canvas.begin_path();
+            if rx > 0.01 || ry > 0.01 {
+                trace_rounded_rect(canvas, x, y, w, h, rx, ry);
+            } else {
+                canvas.rect(x, y, w, h);
+            }
+            paint_path(canvas, fill, stroke, even_odd);
+        }
+        "circle" => {
+            let cx = attr_f32(el.get_attr("cx"), 0.0);
+            let cy = attr_f32(el.get_attr("cy"), 0.0);
+            let r = attr_f32(el.get_attr("r"), 0.0);
+            canvas.begin_path();
+            canvas.arc(cx, cy, r, 0.0, std::f32::consts::TAU, false);
+            canvas.close_path();
+            paint_path(canvas, fill, stroke, even_odd);
+        }
+        "ellipse" => {
+            let cx = attr_f32(el.get_attr("cx"), 0.0);
+            let cy = attr_f32(el.get_attr("cy"), 0.0);
+            let rx = attr_f32(el.get_attr("rx"), 0.0);
+            let ry = attr_f32(el.get_attr("ry"), 0.0);
+            canvas.begin_path();
+            let steps = 48usize;
+            for i in 0..=steps {
+                let a = std::f32::consts::TAU * (i as f32 / steps as f32);
+                let px = cx + rx * a.cos();
+                let py = cy + ry * a.sin();
+                if i == 0 {
+                    canvas.move_to(px, py);
+                } else {
+                    canvas.line_to(px, py);
+                }
+            }
+            canvas.close_path();
+            paint_path(canvas, fill, stroke, even_odd);
+        }
+        "line" => {
+            let x1 = attr_f32(el.get_attr("x1"), 0.0);
+            let y1 = attr_f32(el.get_attr("y1"), 0.0);
+            let x2 = attr_f32(el.get_attr("x2"), 0.0);
+            let y2 = attr_f32(el.get_attr("y2"), 0.0);
+            canvas.begin_path();
+            canvas.move_to(x1, y1);
+            canvas.line_to(x2, y2);
+            paint_path(canvas, None, stroke, false);
+        }
+        "polyline" | "polygon" => {
+            if let Some(pts_str) = el.get_attr("points") {
+                let nums = parse_numbers(pts_str);
+                canvas.begin_path();
+                let mut i = 0;
+                while i + 1 < nums.len() {
+                    if i == 0 {
+                        canvas.move_to(nums[i], nums[i + 1]);
+                    } else {
+                        canvas.line_to(nums[i], nums[i + 1]);
+                    }
+                    i += 2;
+                }
+                if el.tag_name.eq_ignore_ascii_case("polygon") {
+                    canvas.close_path();
+                }
+                paint_path(canvas, fill, stroke, even_odd);
+            }
+        }
+        "path" => {
+            if let Some(d) = el.get_attr("d") {
+                trace_svg_path(canvas, d);
+                paint_path(canvas, fill, stroke, even_odd);
+            }
+        }
+        "text" => {
+            let x = attr_f32(el.get_attr("x"), 0.0);
+            let y = attr_f32(el.get_attr("y"), 12.0);
+            let fs = attr_f32(el.get_attr("font-size"), 14.0);
+            canvas.state.font_size = fs;
+            if let Some(c) = fill {
+                canvas.state.fill_style = c;
+                let txt = doc.text_content(child);
+                canvas.fill_text(fonts, txt.trim(), x, y);
+            }
+        }
+        _ => {}
+    }
+    canvas.restore();
+}
+
+fn paint_path(canvas: &mut Canvas2D, fill: Option<RgbaColor>, stroke: Option<RgbaColor>, even_odd: bool) {
     if let Some(c) = fill {
         canvas.state.fill_style = c;
-        canvas.fill(false);
+        canvas.fill(even_odd);
     }
     if let Some(c) = stroke {
         canvas.state.stroke_style = c;
@@ -610,48 +698,16 @@ fn apply_svg_transform(canvas: &mut Canvas2D, tf: &str) {
 }
 
 pub fn parse_svg_color(raw: &str) -> Option<Option<RgbaColor>> {
-    let s = raw.trim().to_ascii_lowercase();
-    if s == "none" || s == "transparent" {
+    parse_svg_color_with_current(raw, RgbaColor::BLACK)
+}
+
+pub fn parse_svg_color_with_current(raw: &str, current: RgbaColor) -> Option<Option<RgbaColor>> {
+    let s = raw.trim();
+    if s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("transparent") {
         return Some(None);
     }
-    if let Some(hex) = s.strip_prefix('#') {
-        let parsed = match hex.len() {
-            3 => {
-                let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
-                let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
-                let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
-                RgbaColor::new(r, g, b, 255)
-            }
-            6 => {
-                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                RgbaColor::new(r, g, b, 255)
-            }
-            8 => {
-                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
-                RgbaColor::new(r, g, b, a)
-            }
-            _ => return None,
-        };
-        return Some(Some(parsed));
+    if s.eq_ignore_ascii_case("currentcolor") {
+        return Some(Some(current));
     }
-    let named = match s.as_str() {
-        "black" | "currentcolor" => RgbaColor::BLACK,
-        "white" => RgbaColor::WHITE,
-        "red" => RgbaColor::new(255, 0, 0, 255),
-        "green" => RgbaColor::new(0, 128, 0, 255),
-        "blue" => RgbaColor::new(0, 0, 255, 255),
-        "yellow" => RgbaColor::new(255, 255, 0, 255),
-        "orange" => RgbaColor::new(255, 165, 0, 255),
-        "purple" => RgbaColor::new(128, 0, 128, 255),
-        "gray" | "grey" => RgbaColor::new(128, 128, 128, 255),
-        "cyan" | "aqua" => RgbaColor::new(0, 255, 255, 255),
-        "magenta" | "fuchsia" => RgbaColor::new(255, 0, 255, 255),
-        _ => return None,
-    };
-    Some(Some(named))
+    peedle_css::parse_color(s).map(|c| Some(RgbaColor::new(c.r, c.g, c.b, c.a)))
 }

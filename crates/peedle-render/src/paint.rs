@@ -11,7 +11,7 @@ use crate::canvas2d::Canvas2D;
 use crate::fonts::{FontFaceKey, FontSystem};
 use crate::framebuffer::{ClipRect, Framebuffer, RgbaColor};
 use crate::images::ImageCache;
-use crate::svg::render_svg_node;
+use crate::svg::render_svg_node_with_color;
 
 pub fn paint_layout(
     doc: &Document,
@@ -612,7 +612,17 @@ fn paint_replaced(
         }
         ReplacedKind::Svg { .. } => {
             if let Some(nid) = node {
-                render_svg_node(doc, nid, fb, fonts, x, y, w, h);
+                render_svg_node_with_color(
+                    doc,
+                    nid,
+                    fb,
+                    fonts,
+                    x,
+                    y,
+                    w,
+                    h,
+                    to_rgba(style.color).with_alpha(alpha),
+                );
             }
         }
         ReplacedKind::Input {
