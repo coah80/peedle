@@ -224,6 +224,7 @@ impl ApplicationHandler for BrowserApp {
                     self.chrome.devtools_open,
                 );
                 self.chrome.omnibox_focused = false;
+                self.chrome.console_focused = false;
                 match hit {
                     ChromeHit::Tab(i) => {
                         self.active_tab = i;
@@ -255,6 +256,10 @@ impl ApplicationHandler for BrowserApp {
                     }
                     ChromeHit::DevToolsTab(t) => {
                         self.chrome.devtools_tab = t;
+                    }
+                    ChromeHit::ConsoleInput => {
+                        self.chrome.devtools_tab = crate::chrome::DevToolsTab::Console;
+                        self.chrome.console_focused = true;
                     }
                     ChromeHit::Content => {
                         let cx = self.cursor_x;
@@ -312,6 +317,35 @@ impl ApplicationHandler for BrowserApp {
                 }
                 if matches!(event.logical_key, Key::Named(NamedKey::F5)) {
                     let _ = self.active_page_mut().reload();
+                    self.request_redraw();
+                    return;
+                }
+
+                if self.chrome.console_focused {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Enter) => {
+                            let code = std::mem::take(&mut self.chrome.console_input);
+                            if !code.trim().is_empty() {
+                                let _ = self.active_page_mut().eval_js(&code);
+                                self.sync_window_title();
+                            }
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            self.chrome.console_focused = false;
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            self.chrome.console_input.pop();
+                        }
+                        _ => {
+                            if let Some(txt) = &event.text {
+                                for c in txt.chars() {
+                                    if !c.is_control() {
+                                        self.chrome.console_input.push(c);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     self.request_redraw();
                     return;
                 }

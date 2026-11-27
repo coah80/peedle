@@ -24,6 +24,8 @@ fn main() {
 fn run_headless(args: &[String]) {
     let mut width = 1280.0f32;
     let mut height = 800.0f32;
+    let mut wait_ms = 0u64;
+    let mut eval_code: Option<String> = None;
     let mut screenshot_url: Option<String> = None;
     let mut screenshot_out: Option<String> = None;
     let mut dump_dom_url: Option<String> = None;
@@ -41,6 +43,16 @@ fn run_headless(args: &[String]) {
                 if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
                     height = v;
                 }
+                i += 2;
+            }
+            "--wait-ms" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
+                    wait_ms = v;
+                }
+                i += 2;
+            }
+            "--eval-js" => {
+                eval_code = args.get(i + 1).cloned();
                 i += 2;
             }
             "--screenshot" => {
@@ -61,17 +73,31 @@ fn run_headless(args: &[String]) {
         if let Err(e) = page.navigate(&url) {
             eprintln!("navigation error: {}", e);
         }
+        if wait_ms > 0 {
+            let steps = (wait_ms / 16).max(1);
+            let step_ms = (wait_ms / steps).max(1);
+            for _ in 0..steps {
+                page.advance_time_ms(step_ms);
+            }
+        }
+        if let Some(ref code) = eval_code {
+            match page.eval_js(code) {
+                Ok(val) => println!("JS => {}", val),
+                Err(err) => eprintln!("JS error: {}", err),
+            }
+        }
         if let Err(e) = page.save_screenshot(Path::new(&out)) {
             eprintln!("screenshot error: {}", e);
             std::process::exit(1);
         }
         println!(
-            "Rendered {} ({}x{}, {} boxes, {} net reqs) -> {}",
+            "Rendered {} ({}x{}, {} boxes, {} net reqs, {} logs) -> {}",
             page.url,
             width as u32,
             height as u32,
-            page.layout.boxes.len(),
+            page.layout_box_count(),
             page.network_log.len(),
+            page.console_logs.len(),
             out
         );
         return;
@@ -80,10 +106,25 @@ fn run_headless(args: &[String]) {
     if let Some(url) = dump_dom_url {
         let mut page = Page::new(width, height);
         let _ = page.navigate(&url);
-        println!("{}", page.document.outer_html(page.document.root));
+        if wait_ms > 0 {
+            let steps = (wait_ms / 16).max(1);
+            let step_ms = (wait_ms / steps).max(1);
+            for _ in 0..steps {
+                page.advance_time_ms(step_ms);
+            }
+        }
+        if let Some(ref code) = eval_code {
+            match page.eval_js(code) {
+                Ok(val) => eprintln!("JS => {}", val),
+                Err(err) => eprintln!("JS error: {}", err),
+            }
+        }
+        println!("{}", page.outer_html());
         return;
     }
 
-    eprintln!("usage: peedle --headless --screenshot <url> <out.png> [--width W --height H]");
+    eprintln!(
+        "usage: peedle --headless --screenshot <url> <out.png> [--width W --height H --wait-ms MS --eval-js CODE]"
+    );
     std::process::exit(2);
 }

@@ -73,6 +73,7 @@ pub struct DomPrototypes {
 pub struct DomState {
     pub doc: Document,
     pub url: String,
+    pub external_stylesheets: Vec<Stylesheet>,
     pub stylesheets: Vec<Stylesheet>,
     pub styles: StyleMap,
     pub layout: LayoutTree,
@@ -114,6 +115,7 @@ impl DomState {
         let mut st = Self {
             doc,
             url: url.clone(),
+            external_stylesheets: Vec::new(),
             stylesheets: Vec::new(),
             styles: StyleMap::default(),
             layout: LayoutTree::default(),
@@ -158,6 +160,7 @@ impl DomState {
 
     pub fn collect_inline_stylesheets(&mut self) {
         self.stylesheets.clear();
+        self.stylesheets.extend(self.external_stylesheets.iter().cloned());
         let nodes = self.doc.descendants(self.doc.root);
         for nid in nodes {
             if let Some(el) = self.doc.element(nid) {

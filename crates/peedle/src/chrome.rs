@@ -24,6 +24,7 @@ pub enum ChromeHit {
     Omnibox,
     ToggleDevTools,
     DevToolsTab(DevToolsTab),
+    ConsoleInput,
     Content,
     None,
 }
@@ -33,6 +34,8 @@ pub struct ChromeState {
     pub omnibox_focused: bool,
     pub devtools_open: bool,
     pub devtools_tab: DevToolsTab,
+    pub console_input: String,
+    pub console_focused: bool,
 }
 
 impl Default for ChromeState {
@@ -42,6 +45,8 @@ impl Default for ChromeState {
             omnibox_focused: false,
             devtools_open: false,
             devtools_tab: DevToolsTab::Elements,
+            console_input: String::new(),
+            console_focused: false,
         }
     }
 }
@@ -111,6 +116,9 @@ pub fn hit_test_chrome(
                 if x < 280.0 {
                     return ChromeHit::DevToolsTab(DevToolsTab::Network);
                 }
+            }
+            if y >= win_h - 32.0 {
+                return ChromeHit::ConsoleInput;
             }
             return ChromeHit::None;
         }
@@ -265,7 +273,7 @@ pub fn draw_chrome(
     }
 
     if chrome.devtools_open {
-        draw_devtools(fb, fonts, page, chrome.devtools_tab, h - DEVTOOLS_H, w, DEVTOOLS_H);
+        draw_devtools(fb, fonts, page, chrome, h - DEVTOOLS_H, w, DEVTOOLS_H);
     }
 }
 
@@ -283,11 +291,12 @@ fn draw_devtools(
     fb: &mut Framebuffer,
     fonts: &FontSystem,
     page: &Page,
-    tab: DevToolsTab,
+    chrome: &ChromeState,
     top: f32,
     w: f32,
     h: f32,
 ) {
+    let tab = chrome.devtools_tab;
     let bg = RgbaColor::new(13, 17, 23, 255);
     let header_bg = RgbaColor::new(22, 27, 36, 255);
     let border = RgbaColor::new(40, 50, 68, 255);
@@ -322,12 +331,13 @@ fn draw_devtools(
     }
 
     let mut y = top + 46.0;
-    let max_y = top + h - 8.0;
+    let max_y = top + h - 36.0;
     match tab {
         DevToolsTab::Elements => {
             let mut lines = Vec::new();
-            if let Some(root_el) = page.document.document_element() {
-                collect_dom_lines(&page.document, root_el, 0, &mut lines, 12);
+            let st = page.js_env.dom.borrow();
+            if let Some(root_el) = st.doc.document_element() {
+                collect_dom_lines(&st.doc, root_el, 0, &mut lines, 12);
             }
             for line in lines {
                 if y > max_y {
@@ -341,13 +351,29 @@ fn draw_devtools(
             if page.console_logs.is_empty() {
                 fonts.draw_text(fb, "(no console output)", 12.0, y, FontFaceKey::MonoRegular, 11.5, text_dim);
             } else {
-                for line in page.console_logs.iter().rev().take(10).rev() {
+                for line in page.console_logs.iter().rev().take(9).rev() {
                     if y > max_y {
                         break;
                     }
-                    fonts.draw_text(fb, &truncate_chars(line, 110), 12.0, y, FontFaceKey::MonoRegular, 11.5, text_hi);
+                    let c = if line.starts_with("[Error]") {
+                        RgbaColor::new(248, 113, 113, 255)
+                    } else if line.starts_with("=> ") {
+                        RgbaColor::new(125, 211, 252, 255)
+                    } else {
+                        text_hi
+                    };
+                    fonts.draw_text(fb, &truncate_chars(line, 110), 12.0, y, FontFaceKey::MonoRegular, 11.5, c);
                     y += 16.0;
                 }
+            }
+            let input_y = top + h - 30.0;
+            fb.fill_rect(0.0, input_y - 2.0, w, 1.0, border);
+            fb.fill_rect(0.0, input_y - 1.0, w, 31.0, header_bg);
+            fonts.draw_text(fb, ">", 12.0, input_y + 18.0, FontFaceKey::MonoBold, 12.0, accent);
+            let shown_in = truncate_chars(&chrome.console_input, 110);
+            let end_x = fonts.draw_text(fb, &shown_in, 26.0, input_y + 18.0, FontFaceKey::MonoRegular, 12.0, text_hi);
+            if chrome.console_focused {
+                fb.fill_rect(end_x + 1.0, input_y + 6.0, 1.5, 16.0, accent);
             }
         }
         DevToolsTab::Network => {

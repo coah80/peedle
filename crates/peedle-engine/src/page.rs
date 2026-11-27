@@ -1,11 +1,10 @@
-use std::collections::HashMap;
 use std::time::Instant;
 
-use peedle_css::{compute_styles, parse_stylesheet, StyleMap, Stylesheet, Viewport};
+use peedle_css::parse_stylesheet;
+use peedle_dom::BrowserJsEnv;
 use peedle_html::{parse_html, Document, NodeId};
-use peedle_layout::{layout_document, LayoutTree};
 use peedle_net::HttpClient;
-use peedle_render::{paint_layout, Canvas2D, DecodedImage, FontSystem, Framebuffer, ImageCache};
+use peedle_render::{paint_layout, DecodedImage, FontSystem, Framebuffer, ImageCache};
 use peedle_url::Url;
 
 use crate::internal_pages::render_internal_page;
@@ -29,20 +28,14 @@ pub struct HistoryEntry {
 pub struct Page {
     pub url: String,
     pub base_url: Option<Url>,
-    pub document: Document,
-    pub stylesheets: Vec<Stylesheet>,
-    pub styles: StyleMap,
-    pub layout: LayoutTree,
+    pub js_env: BrowserJsEnv,
     pub images: ImageCache,
-    pub image_sizes: HashMap<String, (u32, u32)>,
-    pub canvases: HashMap<NodeId, Canvas2D>,
     pub viewport_w: f32,
     pub viewport_h: f32,
     pub scroll_x: f32,
     pub scroll_y: f32,
     pub hovered_node: Option<NodeId>,
     pub hovered_href: Option<String>,
-    pub focused_node: Option<NodeId>,
     pub active_node: Option<NodeId>,
     pub console_logs: Vec<String>,
     pub network_log: Vec<NetworkEntry>,
@@ -51,51 +44,60 @@ pub struct Page {
     pub client: HttpClient,
     pub fonts: FontSystem,
     pub dark_mode: bool,
-    pub dirty_style: bool,
-    pub dirty_layout: bool,
+    pub scripts_enabled: bool,
 }
 
 impl Page {
     pub fn new(viewport_w: f32, viewport_h: f32) -> Self {
+        let client = HttpClient::new();
+        let js_env = BrowserJsEnv::new(
+            Document::new(),
+            "peedle://newtab".to_string(),
+            viewport_w,
+            viewport_h,
+            client.clone(),
+        );
         let mut page = Self {
             url: "peedle://newtab".to_string(),
             base_url: None,
-            document: Document::new(),
-            stylesheets: Vec::new(),
-            styles: StyleMap::default(),
-            layout: LayoutTree::default(),
+            js_env,
             images: ImageCache::new(),
-            image_sizes: HashMap::new(),
-            canvases: HashMap::new(),
             viewport_w,
             viewport_h,
             scroll_x: 0.0,
             scroll_y: 0.0,
             hovered_node: None,
             hovered_href: None,
-            focused_node: None,
             active_node: None,
             console_logs: Vec::new(),
             network_log: Vec::new(),
             history: Vec::new(),
             history_index: 0,
-            client: HttpClient::new(),
+            client,
             fonts: FontSystem::load_system_fonts(),
             dark_mode: false,
-            dirty_style: true,
-            dirty_layout: true,
+            scripts_enabled: true,
         };
         let _ = page.navigate("peedle://newtab");
         page
     }
 
     pub fn title(&self) -> String {
-        let t = self.document.title();
+        let t = self.js_env.dom.borrow().doc.title();
         if t.is_empty() {
             self.url.clone()
         } else {
             t
         }
+    }
+
+    pub fn layout_box_count(&self) -> usize {
+        self.js_env.dom.borrow().layout.boxes.len()
+    }
+
+    pub fn outer_html(&self) -> String {
+        let st = self.js_env.dom.borrow();
+        st.doc.outer_html(st.doc.root)
     }
 
     pub fn navigate(&mut self, raw_input: &str) -> Result<(), String> {
@@ -136,13 +138,12 @@ impl Page {
 
     fn load_url_internal(&mut self, target: &str, push_history: bool) -> Result<(), String> {
         self.network_log.clear();
+        self.console_logs.clear();
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         self.hovered_node = None;
         self.hovered_href = None;
-        self.focused_node = None;
         self.active_node = None;
-        self.canvases.clear();
 
         if let Some((_title, html)) = render_internal_page(target) {
             self.url = target.to_string();
@@ -188,11 +189,10 @@ impl Page {
         self.base_url = Some(resp.url.clone());
 
         let ct = resp.content_type().to_ascii_lowercase();
+        let mut predecoded_image: Option<(String, DecodedImage)> = None;
         let html = if ct.contains("image/") {
             if let Ok(decoded) = DecodedImage::decode(&resp.body) {
-                self.image_sizes
-                    .insert(final_url.clone(), (decoded.width, decoded.height));
-                self.images.insert(final_url.clone(), decoded);
+                predecoded_image = Some((final_url.clone(), decoded));
             }
             format!(
                 "<!DOCTYPE html><html><body style=\"margin:0;background:#111;display:flex;justify-content:center;align-items:center;min-height:100vh;\"><img src=\"{}\"></body></html>",
@@ -206,6 +206,10 @@ impl Page {
         } else {
             resp.text()
         };
+
+        if let Some((img_url, decoded)) = predecoded_image {
+            self.images.insert(img_url, decoded);
+        }
 
         self.load_html_string(&html, &final_url);
         if let Some(frag) = resp.url.fragment.as_deref() {
@@ -221,11 +225,16 @@ impl Page {
 
     pub fn scroll_to_fragment(&mut self, fragment: &str) {
         self.recompute_if_needed();
-        if let Some(nid) = self.document.get_element_by_id(fragment) {
-            if let Some(rect) = self.layout.bounding_rect(nid) {
-                self.scroll_y = rect.y;
-                self.clamp_scroll();
-            }
+        let y_opt = {
+            let st = self.js_env.dom.borrow();
+            st.doc
+                .get_element_by_id(fragment)
+                .and_then(|nid| st.layout.bounding_rect(nid))
+                .map(|r| r.y)
+        };
+        if let Some(y) = y_opt {
+            self.scroll_y = y;
+            self.clamp_scroll();
         }
     }
 
@@ -234,12 +243,83 @@ impl Page {
         if self.base_url.is_none() {
             self.base_url = Url::parse(url).ok();
         }
-        self.document = parse_html(html);
-        self.document.url = url.to_string();
-        self.collect_stylesheets_and_resources();
-        self.dirty_style = true;
-        self.dirty_layout = true;
+        let mut doc = parse_html(html);
+        doc.url = url.to_string();
+
+        self.js_env = BrowserJsEnv::new(
+            doc,
+            url.to_string(),
+            self.viewport_w,
+            self.viewport_h,
+            self.client.clone(),
+        );
+        self.js_env.dom.borrow_mut().dark_mode = self.dark_mode;
+
+        self.fetch_external_stylesheets();
+        self.fetch_missing_images();
         self.recompute_if_needed();
+
+        if self.scripts_enabled {
+            let _errs = self.js_env.run_document_scripts();
+            self.sync_console_from_js();
+            self.fetch_missing_images();
+            self.recompute_if_needed();
+            self.check_pending_navigation();
+        }
+    }
+
+    pub fn eval_js(&mut self, code: &str) -> Result<String, String> {
+        let res = self.js_env.eval(code);
+        self.sync_console_from_js();
+        self.fetch_missing_images();
+        self.recompute_if_needed();
+        self.check_pending_navigation();
+        match res {
+            Ok(v) => {
+                let s = self
+                    .js_env
+                    .rt
+                    .to_string(&v)
+                    .unwrap_or_else(|_| format!("{:?}", v));
+                self.console_logs.push(format!("=> {}", s));
+                Ok(s)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.console_logs.push(format!("[Error] {}", msg));
+                Err(msg)
+            }
+        }
+    }
+
+    pub fn advance_time_ms(&mut self, delta_ms: u64) {
+        self.js_env.advance_time_ms(delta_ms);
+        self.sync_console_from_js();
+        self.fetch_missing_images();
+        self.recompute_if_needed();
+        self.check_pending_navigation();
+    }
+
+    fn sync_console_from_js(&mut self) {
+        if !self.js_env.rt.console_lines.is_empty() {
+            let drained: Vec<String> = self.js_env.rt.console_lines.drain(..).collect();
+            self.console_logs.extend(drained);
+            if self.console_logs.len() > 500 {
+                let drop_n = self.console_logs.len() - 500;
+                self.console_logs.drain(..drop_n);
+            }
+        }
+    }
+
+    fn check_pending_navigation(&mut self) {
+        let pending = self.js_env.dom.borrow_mut().pending_navigation.take();
+        if let Some(dest) = pending {
+            if let Some(resolved) = self.resolve_subresource_url(&dest) {
+                if resolved != self.url {
+                    let _ = self.navigate(&resolved);
+                }
+            }
+        }
     }
 
     fn push_history_entry(&mut self) {
@@ -265,48 +345,33 @@ impl Page {
         }
     }
 
-    fn collect_stylesheets_and_resources(&mut self) {
-        self.stylesheets.clear();
-        let nodes = self.document.descendants(self.document.root);
-        let mut css_links = Vec::new();
-        let mut img_srcs = Vec::new();
-
-        for nid in nodes {
-            let Some(el) = self.document.element(nid) else {
-                continue;
-            };
-            if !el.is_html() {
-                continue;
-            }
-            match el.tag_name.as_str() {
-                "style" => {
-                    let css_text = self.document.text_content(nid);
-                    self.stylesheets.push(parse_stylesheet(&css_text));
+    fn fetch_external_stylesheets(&mut self) {
+        let css_links: Vec<String> = {
+            let st = self.js_env.dom.borrow();
+            let mut out = Vec::new();
+            for nid in st.doc.descendants(st.doc.root) {
+                let Some(el) = st.doc.element(nid) else {
+                    continue;
+                };
+                if !el.is_html() || !el.tag_is("link") {
+                    continue;
                 }
-                "link" => {
-                    let is_sheet = el
-                        .get_attr("rel")
-                        .map_or(false, |r| {
-                            r.split_ascii_whitespace()
-                                .any(|tok| tok.eq_ignore_ascii_case("stylesheet"))
-                        });
-                    if is_sheet {
-                        if let Some(href) = el.get_attr("href") {
-                            if let Some(resolved) = self.resolve_subresource_url(href) {
-                                css_links.push(resolved);
-                            }
+                let is_sheet = el.get_attr("rel").map_or(false, |r| {
+                    r.split_ascii_whitespace()
+                        .any(|tok| tok.eq_ignore_ascii_case("stylesheet"))
+                });
+                if is_sheet {
+                    if let Some(href) = el.get_attr("href") {
+                        if let Some(resolved) = self.resolve_subresource_url(href) {
+                            out.push(resolved);
                         }
                     }
                 }
-                "img" => {
-                    if let Some(src) = el.get_attr("src") {
-                        img_srcs.push((src.to_string(), self.resolve_subresource_url(src)));
-                    }
-                }
-                _ => {}
             }
-        }
+            out
+        };
 
+        let mut sheets = Vec::new();
         for css_url in css_links.into_iter().take(24) {
             let start = Instant::now();
             if let Ok(resp) = self.client.get(&css_url) {
@@ -319,13 +384,43 @@ impl Page {
                     duration_ms: start.elapsed().as_millis() as u64,
                 });
                 if resp.status < 400 {
-                    self.stylesheets.push(parse_stylesheet(&resp.text()));
+                    sheets.push(parse_stylesheet(&resp.text()));
                 }
             }
         }
 
+        let mut st = self.js_env.dom.borrow_mut();
+        st.external_stylesheets = sheets;
+        st.dirty_style = true;
+    }
+
+    fn fetch_missing_images(&mut self) {
+        let img_srcs: Vec<(String, Option<String>)> = {
+            let st = self.js_env.dom.borrow();
+            let mut out = Vec::new();
+            for nid in st.doc.descendants(st.doc.root) {
+                if let Some(el) = st.doc.element(nid) {
+                    if el.is_html() && el.tag_is("img") {
+                        if let Some(src) = el.get_attr("src") {
+                            if !self.images.contains(src) {
+                                out.push((src.to_string(), self.resolve_subresource_url(src)));
+                            } else if let Some(img) = self.images.get(src) {
+                                if !st.image_sizes.contains_key(src) {
+                                    out.push((src.to_string(), None));
+                                    let _ = img;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        let mut new_sizes = Vec::new();
         for (raw_src, resolved_opt) in img_srcs.into_iter().take(48) {
-            if self.images.contains(&raw_src) {
+            if let Some(existing) = self.images.get(&raw_src) {
+                new_sizes.push((raw_src, (existing.width, existing.height)));
                 continue;
             }
             let Some(resolved) = resolved_opt else {
@@ -343,12 +438,19 @@ impl Page {
                 });
                 if resp.status < 400 {
                     if let Ok(decoded) = DecodedImage::decode(&resp.body) {
-                        self.image_sizes
-                            .insert(raw_src.clone(), (decoded.width, decoded.height));
+                        new_sizes.push((raw_src.clone(), (decoded.width, decoded.height)));
                         self.images.insert(raw_src, decoded);
                     }
                 }
             }
+        }
+
+        if !new_sizes.is_empty() {
+            let mut st = self.js_env.dom.borrow_mut();
+            for (k, sz) in new_sizes {
+                st.image_sizes.insert(k, sz);
+            }
+            st.dirty_layout = true;
         }
     }
 
@@ -356,48 +458,38 @@ impl Page {
         if (self.viewport_w - w).abs() > 0.5 || (self.viewport_h - h).abs() > 0.5 {
             self.viewport_w = w.max(100.0);
             self.viewport_h = h.max(100.0);
-            self.dirty_style = true;
-            self.dirty_layout = true;
+            {
+                let mut st = self.js_env.dom.borrow_mut();
+                st.viewport_w = self.viewport_w;
+                st.viewport_h = self.viewport_h;
+                st.dirty_style = true;
+                st.dirty_layout = true;
+            }
+            let _ = self.js_env.dispatch_dom_event(None, "resize", false, false);
+            self.sync_console_from_js();
             self.recompute_if_needed();
         }
     }
 
     pub fn recompute_if_needed(&mut self) {
-        if self.dirty_style {
-            self.styles = compute_styles(
-                &self.document,
-                &self.stylesheets,
-                Viewport {
-                    width: self.viewport_w,
-                    height: self.viewport_h,
-                    dark_mode: self.dark_mode,
-                },
-            );
-            self.dirty_style = false;
-            self.dirty_layout = true;
+        {
+            let mut st = self.js_env.dom.borrow_mut();
+            st.dark_mode = self.dark_mode;
+            st.ensure_layout();
         }
-        if self.dirty_layout {
-            self.layout = layout_document(
-                &self.document,
-                &self.styles,
-                &self.image_sizes,
-                self.viewport_w,
-                self.viewport_h,
-            );
-            self.dirty_layout = false;
-            self.clamp_scroll();
-        }
+        self.clamp_scroll();
     }
 
     pub fn render_to_framebuffer(&mut self, fb: &mut Framebuffer) {
         self.recompute_if_needed();
+        let st = self.js_env.dom.borrow();
         paint_layout(
-            &self.document,
-            &self.layout,
+            &st.doc,
+            &st.layout,
             fb,
             &self.fonts,
             &self.images,
-            &self.canvases,
+            &st.canvases,
             self.scroll_x,
             self.scroll_y,
         );
@@ -419,76 +511,147 @@ impl Page {
         self.scroll_x += dx;
         self.scroll_y += dy;
         self.clamp_scroll();
+        let mut st = self.js_env.dom.borrow_mut();
+        st.scroll_x = self.scroll_x;
+        st.scroll_y = self.scroll_y;
     }
 
     fn clamp_scroll(&mut self) {
-        let max_x = (self.layout.content_width - self.viewport_w).max(0.0);
-        let max_y = (self.layout.content_height - self.viewport_h).max(0.0);
+        let (max_x, max_y) = {
+            let st = self.js_env.dom.borrow();
+            (
+                (st.layout.content_width - self.viewport_w).max(0.0),
+                (st.layout.content_height - self.viewport_h).max(0.0),
+            )
+        };
         self.scroll_x = self.scroll_x.clamp(0.0, max_x);
         self.scroll_y = self.scroll_y.clamp(0.0, max_y);
     }
 
     pub fn on_mouse_move(&mut self, vx: f32, vy: f32) -> bool {
-        let hit = self.layout.hit_test(vx + self.scroll_x, vy + self.scroll_y);
+        let hit = {
+            let st = self.js_env.dom.borrow();
+            st.layout.hit_test(vx + self.scroll_x, vy + self.scroll_y)
+        };
         if hit == self.hovered_node {
             return false;
         }
-        if let Some(prev) = self.hovered_node {
-            if let Some(el) = self.document.element_mut(prev) {
-                el.hovered = false;
+        {
+            let mut st = self.js_env.dom.borrow_mut();
+            if let Some(prev) = self.hovered_node {
+                if let Some(el) = st.doc.element_mut(prev) {
+                    el.hovered = false;
+                }
             }
+            self.hovered_node = hit;
+            self.hovered_href = hit.and_then(|nid| find_ancestor_href(&st.doc, nid));
+            if let Some(cur) = hit {
+                if let Some(el) = st.doc.element_mut(cur) {
+                    el.hovered = true;
+                }
+            }
+            st.dirty_style = true;
         }
-        self.hovered_node = hit;
-        self.hovered_href = hit.and_then(|nid| self.find_ancestor_href(nid));
         if let Some(cur) = hit {
-            if let Some(el) = self.document.element_mut(cur) {
-                el.hovered = true;
-            }
+            let _ = self.js_env.dispatch_dom_event(Some(cur), "mouseover", true, true);
+            self.sync_console_from_js();
         }
-        self.dirty_style = true;
         true
     }
 
     pub fn on_click(&mut self, vx: f32, vy: f32) -> Option<String> {
-        let hit = self.layout.hit_test(vx + self.scroll_x, vy + self.scroll_y);
-        if let Some(prev) = self.focused_node {
-            if let Some(el) = self.document.element_mut(prev) {
-                el.focused = false;
+        let hit = {
+            let st = self.js_env.dom.borrow();
+            st.layout.hit_test(vx + self.scroll_x, vy + self.scroll_y)
+        };
+        {
+            let mut st = self.js_env.dom.borrow_mut();
+            if let Some(prev) = st.focused_node {
+                if let Some(el) = st.doc.element_mut(prev) {
+                    el.focused = false;
+                }
             }
+            st.focused_node = None;
         }
-        self.focused_node = None;
 
         let nid = hit?;
-        if let Some(el) = self.document.element_mut(nid) {
-            if el.is_html() && el.tag_is("input") {
-                let itype = el.get_attr("type").unwrap_or("text").to_ascii_lowercase();
-                if itype == "checkbox" {
-                    let cur = el.is_checked();
-                    el.checked = Some(!cur);
-                    self.dirty_style = true;
-                    self.dirty_layout = true;
-                    return None;
-                }
-                if itype == "radio" {
-                    el.checked = Some(true);
-                    self.dirty_style = true;
-                    self.dirty_layout = true;
-                    return None;
-                }
-                el.focused = true;
-                self.focused_node = Some(nid);
-                self.dirty_style = true;
-                return None;
-            }
-            if el.is_html() && el.tag_is("textarea") {
-                el.focused = true;
-                self.focused_node = Some(nid);
-                self.dirty_style = true;
-                return None;
+
+        let _ = self.js_env.dispatch_dom_event(Some(nid), "mousedown", true, true);
+        let _ = self.js_env.dispatch_dom_event(Some(nid), "mouseup", true, true);
+        let allow_default = self
+            .js_env
+            .dispatch_dom_event(Some(nid), "click", true, true)
+            .unwrap_or(true);
+        self.sync_console_from_js();
+        self.fetch_missing_images();
+
+        let pending = self.js_env.dom.borrow_mut().pending_navigation.take();
+        if let Some(pending) = pending {
+            if let Some(dest) = self.resolve_subresource_url(&pending) {
+                let _ = self.navigate(&dest);
+                return Some(dest);
             }
         }
 
-        if let Some(href) = self.find_ancestor_href(nid) {
+        if !allow_default {
+            self.recompute_if_needed();
+            return None;
+        }
+
+        let input_action = {
+            let mut st = self.js_env.dom.borrow_mut();
+            let mut act = 0u8;
+            if let Some(el) = st.doc.element_mut(nid) {
+                if el.is_html() && el.tag_is("input") {
+                    let itype = el.get_attr("type").unwrap_or("text").to_ascii_lowercase();
+                    if itype == "checkbox" {
+                        let cur = el.is_checked();
+                        el.checked = Some(!cur);
+                        st.mark_dirty();
+                        act = 1;
+                    } else if itype == "radio" {
+                        el.checked = Some(true);
+                        st.mark_dirty();
+                        act = 1;
+                    } else {
+                        el.focused = true;
+                        st.focused_node = Some(nid);
+                        st.dirty_style = true;
+                        act = 2;
+                    }
+                } else if el.is_html() && el.tag_is("textarea") {
+                    el.focused = true;
+                    st.focused_node = Some(nid);
+                    st.dirty_style = true;
+                    act = 2;
+                }
+            }
+            act
+        };
+
+        if input_action == 1 {
+            let _ = self.js_env.dispatch_dom_event(Some(nid), "input", true, false);
+            let _ = self.js_env.dispatch_dom_event(Some(nid), "change", true, false);
+            self.sync_console_from_js();
+            self.recompute_if_needed();
+            return None;
+        }
+        if input_action == 2 {
+            let _ = self.js_env.dispatch_dom_event(Some(nid), "focus", false, false);
+            self.sync_console_from_js();
+            self.recompute_if_needed();
+            return None;
+        }
+
+        let href_opt = {
+            let st = self.js_env.dom.borrow();
+            find_ancestor_href(&st.doc, nid)
+        };
+        if let Some(href) = href_opt {
+            if let Some(js_code) = href.strip_prefix("javascript:") {
+                let _ = self.eval_js(js_code);
+                return None;
+            }
             let resolved = if href.starts_with("peedle://") || href.starts_with("about:") {
                 Some(href)
             } else {
@@ -499,41 +662,53 @@ impl Page {
                 return Some(dest);
             }
         }
+        self.recompute_if_needed();
         None
     }
 
     pub fn on_text_input(&mut self, ch: char) -> bool {
-        let Some(fid) = self.focused_node else {
-            return false;
-        };
-        if let Some(el) = self.document.element_mut(fid) {
-            let mut val = el.current_value();
-            if ch == '\u{0008}' {
-                val.pop();
-            } else if !ch.is_control() || (ch == '\n' && el.tag_is("textarea")) {
-                val.push(ch);
+        let fid_opt = {
+            let mut st = self.js_env.dom.borrow_mut();
+            let Some(fid) = st.focused_node else {
+                return false;
+            };
+            if let Some(el) = st.doc.element_mut(fid) {
+                let mut val = el.current_value();
+                if ch == '\u{0008}' {
+                    val.pop();
+                } else if !ch.is_control() || (ch == '\n' && el.tag_is("textarea")) {
+                    val.push(ch);
+                }
+                el.input_value = Some(val);
+                st.dirty_layout = true;
+                Some(fid)
+            } else {
+                None
             }
-            el.input_value = Some(val);
-            self.dirty_layout = true;
+        };
+        if let Some(fid) = fid_opt {
+            let _ = self.js_env.dispatch_dom_event(Some(fid), "input", true, false);
+            self.sync_console_from_js();
+            self.recompute_if_needed();
             return true;
         }
         false
     }
+}
 
-    fn find_ancestor_href(&self, start: NodeId) -> Option<String> {
-        let mut cur = Some(start);
-        while let Some(id) = cur {
-            if let Some(el) = self.document.element(id) {
-                if el.is_html() && el.tag_is("a") {
-                    if let Some(href) = el.get_attr("href") {
-                        return Some(href.to_string());
-                    }
+fn find_ancestor_href(doc: &Document, start: NodeId) -> Option<String> {
+    let mut cur = Some(start);
+    while let Some(id) = cur {
+        if let Some(el) = doc.element(id) {
+            if el.is_html() && el.tag_is("a") {
+                if let Some(href) = el.get_attr("href") {
+                    return Some(href.to_string());
                 }
             }
-            cur = self.document.node(id).parent;
         }
-        None
+        cur = doc.node(id).parent;
     }
+    None
 }
 
 pub fn normalize_navigation_input(raw: &str) -> String {
@@ -549,6 +724,9 @@ pub fn normalize_navigation_input(raw: &str) -> String {
         || trimmed.starts_with("peedle://")
     {
         return trimmed.to_string();
+    }
+    if trimmed.starts_with('/') {
+        return format!("file://{}", trimmed);
     }
     if trimmed.contains('.') && !trimmed.contains(' ') {
         return format!("https://{}", trimmed);
