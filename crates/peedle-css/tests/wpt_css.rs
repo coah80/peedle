@@ -118,3 +118,45 @@ fn wpt_media_queries_range_and_color_scheme() {
     assert!(mq1.matches(&dark_wide));
     assert!(!mq1.matches(&light_narrow));
 }
+
+#[test]
+fn wpt_css_logical_properties_and_mask_image() {
+    let doc = parse_html(r#"<div id="box"></div>"#);
+    let sheet = parse_stylesheet(
+        r#"
+        #box {
+            inline-size: 320px;
+            block-size: 120px;
+            margin-inline: 12px 24px;
+            margin-block: 8px;
+            padding-inline-start: 16px;
+            padding-block-end: 10px;
+            inset-inline-start: 5px;
+            border-inline-start: 3px solid #2563eb;
+            mask-image: url("icon.svg");
+        }
+        "#,
+    );
+    let styles = compute_styles(
+        &doc,
+        &[sheet],
+        Viewport {
+            width: 800.0,
+            height: 600.0,
+            dark_mode: false,
+        },
+    );
+    let s = styles.get(doc.get_element_by_id("box").unwrap()).unwrap();
+    assert_eq!(s.width, LengthPercentageAuto::px(320.0));
+    assert_eq!(s.height, LengthPercentageAuto::px(120.0));
+    assert_eq!(s.margin_left, LengthPercentageAuto::px(12.0));
+    assert_eq!(s.margin_right, LengthPercentageAuto::px(24.0));
+    assert_eq!(s.margin_top, LengthPercentageAuto::px(8.0));
+    assert_eq!(s.margin_bottom, LengthPercentageAuto::px(8.0));
+    assert_eq!(s.padding_left, LengthPercentageAuto::px(16.0));
+    assert_eq!(s.padding_bottom, LengthPercentageAuto::px(10.0));
+    assert_eq!(s.left, LengthPercentageAuto::px(5.0));
+    assert_eq!(s.border_left_width, 3.0);
+    assert_eq!(s.border_left_color, Color::rgb(37, 99, 235));
+    assert_eq!(s.mask_image.as_deref(), Some("icon.svg"));
+}

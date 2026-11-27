@@ -69,3 +69,130 @@ fn fetch_https_example_com() {
     let body = resp.text();
     assert!(body.contains("Example Domain"), "unexpected body: {}", &body[..body.len().min(200)]);
 }
+
+#[test]
+fn http11_keep_alive_connection_reuse_and_gzip() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        for idx in 0..2 {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            assert!(n > 0, "expected request {}", idx);
+            if idx == 0 {
+                let body = b"first-keepalive";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+                stream.flush().unwrap();
+            } else {
+                let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+                enc.write_all(b"second-gzipped-reused").unwrap();
+                let gz = enc.finish().unwrap();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    gz.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.write_all(&gz).unwrap();
+                stream.flush().unwrap();
+            }
+        }
+    });
+
+    let client = HttpClient::new();
+    let r1 = client.get(&format!("http://127.0.0.1:{}/one", port)).unwrap();
+    let r2 = client.get(&format!("http://127.0.0.1:{}/two", port)).unwrap();
+    server.join().unwrap();
+    assert_eq!(r1.text(), "first-keepalive");
+    assert_eq!(r2.text(), "second-gzipped-reused");
+}
+
+#[test]
+fn websocket_rfc6455_handshake_text_binary_close() {
+    use base64::Engine;
+    use peedle_net::{WebSocketClient, WsMessage};
+    use peedle_url::Url;
+    use sha1::{Digest, Sha1};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let key = req
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("sec-websocket-key") {
+                    Some(v.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let mut hasher = Sha1::new();
+        hasher.update(key.as_bytes());
+        hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        let accept = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            accept
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        let read_client_frame = |s: &mut std::net::TcpStream| -> (u8, Vec<u8>) {
+            let mut h = [0u8; 2];
+            s.read_exact(&mut h).unwrap();
+            let op = h[0] & 0x0F;
+            let len = (h[1] & 0x7F) as usize;
+            let mut mask = [0u8; 4];
+            s.read_exact(&mut mask).unwrap();
+            let mut payload = vec![0u8; len];
+            s.read_exact(&mut payload).unwrap();
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= mask[i % 4];
+            }
+            (op, payload)
+        };
+
+        let (op1, p1) = read_client_frame(&mut stream);
+        assert_eq!(op1, 0x1);
+        assert_eq!(String::from_utf8(p1).unwrap(), "ping-peedle");
+        let reply1 = b"pong-peedle";
+        stream.write_all(&[0x81, reply1.len() as u8]).unwrap();
+        stream.write_all(reply1).unwrap();
+
+        let (op2, p2) = read_client_frame(&mut stream);
+        assert_eq!(op2, 0x2);
+        assert_eq!(p2, vec![1, 2, 3, 4]);
+        stream.write_all(&[0x82, 4, 4, 3, 2, 1]).unwrap();
+
+        let (op3, _) = read_client_frame(&mut stream);
+        assert_eq!(op3, 0x8);
+        stream.write_all(&[0x88, 2, 0x03, 0xE8]).unwrap();
+        stream.flush().unwrap();
+    });
+
+    let url = Url::parse(&format!("ws://127.0.0.1:{}/chat", port)).unwrap();
+    let mut ws = WebSocketClient::connect(&url).unwrap();
+    ws.send_text("ping-peedle").unwrap();
+    assert_eq!(ws.read_message().unwrap(), WsMessage::Text("pong-peedle".to_string()));
+    ws.send_binary(&[1, 2, 3, 4]).unwrap();
+    assert_eq!(ws.read_message().unwrap(), WsMessage::Binary(vec![4, 3, 2, 1]));
+    ws.close().unwrap();
+    assert_eq!(ws.read_message().unwrap(), WsMessage::Close(1000, String::new()));
+    server.join().unwrap();
+}

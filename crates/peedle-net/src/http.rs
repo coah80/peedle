@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -162,9 +163,12 @@ impl Write for Transport {
     }
 }
 
+type PoolKey = (String, String, u16);
+
 #[derive(Clone)]
 pub struct HttpClient {
     tls_config: Arc<ClientConfig>,
+    pool: Arc<Mutex<HashMap<PoolKey, Vec<BufReader<Transport>>>>>,
     pub cookies: Arc<Mutex<CookieJar>>,
     pub user_agent: String,
     pub timeout: Duration,
@@ -185,6 +189,7 @@ impl HttpClient {
             .with_no_client_auth();
         Self {
             tls_config: Arc::new(config),
+            pool: Arc::new(Mutex::new(HashMap::new())),
             cookies: Arc::new(Mutex::new(CookieJar::new())),
             user_agent: "Mozilla/5.0 (X11; Linux x86_64) Peedle/0.1".to_string(),
             timeout: Duration::from_secs(20),
@@ -240,19 +245,13 @@ impl HttpClient {
         }
     }
 
-    fn send_once(&self, req: &HttpRequest) -> Result<HttpResponse, HttpError> {
-        let host = req.url.hostname();
-        if host.is_empty() {
-            return Err(HttpError::InvalidUrl("missing host".to_string()));
-        }
-        let port = req.url.port_or_default().unwrap_or(80);
+    fn open_transport(&self, scheme: &str, host: &str, port: u16) -> Result<BufReader<Transport>, HttpError> {
         let addr = format!("{}:{}", host, port);
         let tcp = TcpStream::connect(&addr)?;
         tcp.set_read_timeout(Some(self.timeout))?;
         tcp.set_write_timeout(Some(self.timeout))?;
-
-        let mut transport = if req.url.scheme == "https" {
-            let server_name = ServerName::try_from(host.clone())
+        let transport = if scheme == "https" {
+            let server_name = ServerName::try_from(host.to_string())
                 .map_err(|e| HttpError::Tls(e.to_string()))?;
             let conn = ClientConnection::new(self.tls_config.clone(), server_name)
                 .map_err(|e| HttpError::Tls(e.to_string()))?;
@@ -260,12 +259,34 @@ impl HttpClient {
         } else {
             Transport::Plain(tcp)
         };
+        Ok(BufReader::new(transport))
+    }
+
+    fn take_pooled(&self, key: &PoolKey) -> Option<BufReader<Transport>> {
+        self.pool.lock().unwrap().get_mut(key).and_then(|v| v.pop())
+    }
+
+    fn return_pooled(&self, key: PoolKey, reader: BufReader<Transport>) {
+        let mut map = self.pool.lock().unwrap();
+        let entry = map.entry(key).or_default();
+        if entry.len() < 4 {
+            entry.push(reader);
+        }
+    }
+
+    fn send_once(&self, req: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let host = req.url.hostname();
+        if host.is_empty() {
+            return Err(HttpError::InvalidUrl("missing host".to_string()));
+        }
+        let port = req.url.port_or_default().unwrap_or(80);
+        let pool_key: PoolKey = (req.url.scheme.clone(), host.clone(), port);
 
         let target = req.url.request_target();
         let host_header = req.url.host_str();
 
         let mut wire = format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n",
             req.method.as_str(),
             target,
             host_header
@@ -311,18 +332,43 @@ impl HttpClient {
         }
         wire.push_str("\r\n");
 
-        transport.write_all(wire.as_bytes())?;
-        if let Some(ref body) = req.body {
-            transport.write_all(body)?;
-        }
-        transport.flush()?;
+        let mut reused = false;
+        let mut reader = match self.take_pooled(&pool_key) {
+            Some(r) => {
+                reused = true;
+                r
+            }
+            None => self.open_transport(&req.url.scheme, &host, port)?,
+        };
 
-        let mut reader = BufReader::new(transport);
         let mut status_line = String::new();
-        reader.read_line(&mut status_line)?;
+        let write_and_status = |r: &mut BufReader<Transport>, sl: &mut String| -> std::io::Result<usize> {
+            let t = r.get_mut();
+            t.write_all(wire.as_bytes())?;
+            if let Some(ref body) = req.body {
+                t.write_all(body)?;
+            }
+            t.flush()?;
+            sl.clear();
+            r.read_line(sl)
+        };
+
+        match write_and_status(&mut reader, &mut status_line) {
+            Ok(n) if n > 0 => {}
+            _ if reused => {
+                reader = self.open_transport(&req.url.scheme, &host, port)?;
+                let n = write_and_status(&mut reader, &mut status_line)?;
+                if n == 0 {
+                    return Err(HttpError::Protocol("empty http response".to_string()));
+                }
+            }
+            Ok(_) => return Err(HttpError::Protocol("empty http response".to_string())),
+            Err(e) => return Err(HttpError::Io(e)),
+        }
+
         let status_trimmed = status_line.trim_end_matches(['\r', '\n']);
         let mut parts = status_trimmed.splitn(3, ' ');
-        let _version = parts
+        let version = parts
             .next()
             .ok_or_else(|| HttpError::Protocol("missing http version".to_string()))?;
         let status: u16 = parts
@@ -363,7 +409,11 @@ impl HttpClient {
             .iter()
             .find(|(k, _)| k == "content-length")
             .and_then(|(_, v)| v.parse::<usize>().ok());
+        let conn_close = headers.iter().any(|(k, v)| {
+            k == "connection" && v.to_ascii_lowercase().contains("close")
+        }) || version == "HTTP/1.0";
 
+        let mut can_keep_alive = !conn_close;
         let raw_body = if req.method == HttpMethod::Head || status == 204 || status == 304 {
             Vec::new()
         } else if is_chunked {
@@ -373,10 +423,15 @@ impl HttpClient {
             reader.read_exact(&mut buf)?;
             buf
         } else {
+            can_keep_alive = false;
             let mut buf = Vec::new();
             let _ = reader.read_to_end(&mut buf);
             buf
         };
+
+        if can_keep_alive {
+            self.return_pooled(pool_key, reader);
+        }
 
         let content_encoding = headers
             .iter()
