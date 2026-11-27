@@ -392,7 +392,7 @@ pub fn parse_host(input: &str, is_opaque: bool) -> Result<Host, UrlError> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
+pub(crate) enum State {
     SchemeStart,
     Scheme,
     NoScheme,
@@ -404,6 +404,7 @@ enum State {
     SpecialAuthorityIgnoreSlashes,
     Authority,
     Host,
+    Hostname,
     Port,
     File,
     FileSlash,
@@ -421,14 +422,6 @@ impl Url {
     }
 
     pub fn parse_with_base(input: &str, base: Option<&Url>) -> Result<Self, UrlError> {
-        let trimmed = input.trim_matches(is_c0_or_space);
-        let cleaned: String = trimmed
-            .chars()
-            .filter(|&c| !is_ascii_tab_or_newline(c))
-            .collect();
-        let chars: Vec<char> = cleaned.chars().collect();
-        let len = chars.len();
-
         let mut url = Url {
             scheme: String::new(),
             username: String::new(),
@@ -439,8 +432,43 @@ impl Url {
             query: None,
             fragment: None,
         };
+        url.basic_parse_into(input, base, None)?;
+        Ok(url)
+    }
 
-        let mut state = State::SchemeStart;
+    pub(crate) fn includes_credentials(&self) -> bool {
+        !self.username.is_empty() || !self.password.is_empty()
+    }
+
+    pub(crate) fn has_empty_or_null_host(&self) -> bool {
+        matches!(self.host, None | Some(Host::Empty))
+            || matches!(&self.host, Some(Host::Opaque(s) | Host::Domain(s)) if s.is_empty())
+    }
+
+    pub(crate) fn cannot_have_username_password_or_port(&self) -> bool {
+        self.has_empty_or_null_host() || self.scheme == "file"
+    }
+
+    pub(crate) fn basic_parse_into(
+        &mut self,
+        input: &str,
+        base: Option<&Url>,
+        state_override: Option<State>,
+    ) -> Result<(), UrlError> {
+        let trimmed = if state_override.is_none() {
+            input.trim_matches(is_c0_or_space)
+        } else {
+            input
+        };
+        let cleaned: String = trimmed
+            .chars()
+            .filter(|&c| !is_ascii_tab_or_newline(c))
+            .collect();
+        let chars: Vec<char> = cleaned.chars().collect();
+        let len = chars.len();
+
+        let url = self;
+        let mut state = state_override.unwrap_or(State::SchemeStart);
         let mut buffer = String::new();
         let mut at_sign_seen = false;
         let mut inside_brackets = false;
@@ -462,13 +490,17 @@ impl Url {
                         if ch.is_ascii_alphabetic() {
                             buffer.push(ch.to_ascii_lowercase());
                             state = State::Scheme;
-                        } else {
+                        } else if state_override.is_none() {
                             state = State::NoScheme;
                             idx -= 1;
+                        } else {
+                            return Err(UrlError::InvalidScheme);
                         }
-                    } else {
+                    } else if state_override.is_none() {
                         state = State::NoScheme;
                         idx -= 1;
+                    } else {
+                        return Err(UrlError::InvalidScheme);
                     }
                 }
                 State::Scheme => {
@@ -476,7 +508,30 @@ impl Url {
                         if ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.') {
                             buffer.push(ch.to_ascii_lowercase());
                         } else if ch == ':' {
+                            if state_override.is_some() {
+                                let was_special = is_special_scheme(&url.scheme);
+                                let now_special = is_special_scheme(&buffer);
+                                if was_special != now_special {
+                                    return Ok(());
+                                }
+                                if (url.includes_credentials() || url.port.is_some())
+                                    && buffer == "file"
+                                {
+                                    return Ok(());
+                                }
+                                if url.scheme == "file" && url.has_empty_or_null_host() {
+                                    return Ok(());
+                                }
+                            }
                             url.scheme = std::mem::take(&mut buffer);
+                            if state_override.is_some() {
+                                if let Some(p) = url.port {
+                                    if default_port(&url.scheme) == Some(p) {
+                                        url.port = None;
+                                    }
+                                }
+                                return Ok(());
+                            }
                             if url.scheme == "file" {
                                 state = State::File;
                             } else if is_special_scheme(&url.scheme) {
@@ -496,15 +551,19 @@ impl Url {
                                 url.path = UrlPath::Opaque(String::new());
                                 state = State::OpaquePath;
                             }
-                        } else {
+                        } else if state_override.is_none() {
                             buffer.clear();
                             state = State::NoScheme;
                             idx = -1;
+                        } else {
+                            return Err(UrlError::InvalidScheme);
                         }
-                    } else {
+                    } else if state_override.is_none() {
                         buffer.clear();
                         state = State::NoScheme;
                         idx = -1;
+                    } else {
+                        return Err(UrlError::InvalidScheme);
                     }
                 }
                 State::NoScheme => {
@@ -635,10 +694,16 @@ impl Url {
                         buffer.push(ch);
                     }
                 }
-                State::Host => {
-                    if c == Some(':') && !inside_brackets {
+                State::Host | State::Hostname => {
+                    if state_override.is_some() && url.scheme == "file" {
+                        idx -= 1;
+                        state = State::FileHost;
+                    } else if c == Some(':') && !inside_brackets {
                         if buffer.is_empty() {
                             return Err(UrlError::MissingHost);
+                        }
+                        if state_override == Some(State::Hostname) {
+                            return Err(UrlError::InvalidHost);
                         }
                         let host = parse_host(&buffer, !is_special_scheme(&url.scheme))?;
                         url.host = Some(host);
@@ -651,10 +716,19 @@ impl Url {
                         if is_special_scheme(&url.scheme) && buffer.is_empty() {
                             return Err(UrlError::MissingHost);
                         }
+                        if state_override.is_some()
+                            && buffer.is_empty()
+                            && (url.includes_credentials() || url.port.is_some())
+                        {
+                            return Ok(());
+                        }
                         let host = parse_host(&buffer, !is_special_scheme(&url.scheme))?;
                         url.host = Some(host);
                         buffer.clear();
                         state = State::PathStart;
+                        if state_override.is_some() {
+                            return Ok(());
+                        }
                     } else if let Some(ch) = c {
                         if ch == '[' {
                             inside_brackets = true;
@@ -665,27 +739,12 @@ impl Url {
                     }
                 }
                 State::Port => {
-                    if let Some(ch) = c {
-                        if ch.is_ascii_digit() {
-                            buffer.push(ch);
-                        } else if matches!(ch, '/' | '?' | '#')
-                            || (is_special_scheme(&url.scheme) && ch == '\\')
-                        {
-                            if !buffer.is_empty() {
-                                let port = buffer.parse::<u16>().map_err(|_| UrlError::InvalidPort)?;
-                                url.port = if default_port(&url.scheme) == Some(port) {
-                                    None
-                                } else {
-                                    Some(port)
-                                };
-                                buffer.clear();
-                            }
-                            state = State::PathStart;
-                            idx -= 1;
-                        } else {
-                            return Err(UrlError::InvalidPort);
-                        }
-                    } else {
+                    if let Some(ch) = c.filter(|ch| ch.is_ascii_digit()) {
+                        buffer.push(ch);
+                    } else if matches!(c, None | Some('/') | Some('?') | Some('#'))
+                        || (is_special_scheme(&url.scheme) && c == Some('\\'))
+                        || state_override.is_some()
+                    {
                         if !buffer.is_empty() {
                             let port = buffer.parse::<u16>().map_err(|_| UrlError::InvalidPort)?;
                             url.port = if default_port(&url.scheme) == Some(port) {
@@ -694,9 +753,17 @@ impl Url {
                                 Some(port)
                             };
                             buffer.clear();
+                            if state_override.is_some() {
+                                return Ok(());
+                            }
+                        }
+                        if state_override.is_some() {
+                            return Ok(());
                         }
                         state = State::PathStart;
                         idx -= 1;
+                    } else {
+                        return Err(UrlError::InvalidPort);
                     }
                 }
                 State::File => {
@@ -758,10 +825,13 @@ impl Url {
                 State::FileHost => {
                     if matches!(c, None | Some('/') | Some('\\') | Some('?') | Some('#')) {
                         idx -= 1;
-                        if is_windows_drive_letter(&buffer) {
+                        if state_override.is_none() && is_windows_drive_letter(&buffer) {
                             state = State::Path;
                         } else if buffer.is_empty() {
                             url.host = Some(Host::Empty);
+                            if state_override.is_some() {
+                                return Ok(());
+                            }
                             state = State::PathStart;
                         } else {
                             let mut host = parse_host(&buffer, false)?;
@@ -769,6 +839,9 @@ impl Url {
                                 host = Host::Empty;
                             }
                             url.host = Some(host);
+                            if state_override.is_some() {
+                                return Ok(());
+                            }
                             buffer.clear();
                             state = State::PathStart;
                         }
@@ -782,10 +855,10 @@ impl Url {
                         if !matches!(c, Some('/') | Some('\\')) {
                             idx -= 1;
                         }
-                    } else if c == Some('?') {
+                    } else if state_override.is_none() && c == Some('?') {
                         url.query = Some(String::new());
                         state = State::Query;
-                    } else if c == Some('#') {
+                    } else if state_override.is_none() && c == Some('#') {
                         url.fragment = Some(String::new());
                         state = State::Fragment;
                     } else if c.is_some() {
@@ -793,12 +866,14 @@ impl Url {
                         if c != Some('/') {
                             idx -= 1;
                         }
+                    } else if state_override.is_some() && url.host.is_none() {
+                        url.push_segment(String::new());
                     }
                 }
                 State::Path => {
                     if matches!(c, None | Some('/'))
                         || (is_special_scheme(&url.scheme) && c == Some('\\'))
-                        || matches!(c, Some('?') | Some('#'))
+                        || (state_override.is_none() && matches!(c, Some('?') | Some('#')))
                     {
                         if is_double_dot_segment(&buffer) {
                             url.shorten_path();
@@ -820,10 +895,10 @@ impl Url {
                             url.push_segment(std::mem::take(&mut buffer));
                         }
                         buffer.clear();
-                        if c == Some('?') {
+                        if state_override.is_none() && c == Some('?') {
                             url.query = Some(String::new());
                             state = State::Query;
-                        } else if c == Some('#') {
+                        } else if state_override.is_none() && c == Some('#') {
                             url.fragment = Some(String::new());
                             state = State::Fragment;
                         }
@@ -857,7 +932,7 @@ impl Url {
                     }
                 }
                 State::Query => {
-                    if c.is_none() || c == Some('#') {
+                    if c.is_none() || (state_override.is_none() && c == Some('#')) {
                         let set = if is_special_scheme(&url.scheme) {
                             EncodeSet::SpecialQuery
                         } else {
@@ -868,7 +943,7 @@ impl Url {
                             q.push_str(&encoded);
                         }
                         buffer.clear();
-                        if c == Some('#') {
+                        if state_override.is_none() && c == Some('#') {
                             url.fragment = Some(String::new());
                             state = State::Fragment;
                         }
@@ -894,7 +969,7 @@ impl Url {
             idx += 1;
         }
 
-        Ok(url)
+        Ok(())
     }
 
     fn shorten_path(&mut self) {

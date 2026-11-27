@@ -27,6 +27,7 @@ pub fn parse_html_with_options(input: &str, scripting_enabled: bool) -> Document
         }
     }
 
+    sync_selectedcontent_elements(&mut state.doc);
     state.doc
 }
 
@@ -79,6 +80,7 @@ pub fn parse_fragment(
         }
     }
 
+    sync_selectedcontent_elements(&mut state.doc);
     state.doc
 }
 
@@ -123,6 +125,80 @@ fn import_subtree(src: &Document, id: NodeId, dst: &mut Document) -> NodeId {
         dst.append_child(new_id, c);
     }
     new_id
+}
+
+fn sync_selectedcontent_elements(doc: &mut Document) {
+    let selects: Vec<NodeId> = doc
+        .descendants(doc.root)
+        .into_iter()
+        .filter(|&id| {
+            doc.element(id).map_or(false, |el| {
+                el.namespace == Namespace::Html
+                    && el.tag_name == "select"
+                    && !el.has_attr("multiple")
+            })
+        })
+        .collect();
+
+    for select_id in selects {
+        let mut selectedcontents = Vec::new();
+        let mut options = Vec::new();
+        collect_select_descendants(doc, select_id, &mut selectedcontents, &mut options);
+        if selectedcontents.is_empty() {
+            continue;
+        }
+        let chosen = options
+            .iter()
+            .rev()
+            .copied()
+            .find(|&opt_id| doc.element(opt_id).map_or(false, |e| e.has_attr("selected")))
+            .or_else(|| {
+                options
+                    .iter()
+                    .copied()
+                    .find(|&opt_id| doc.element(opt_id).map_or(false, |e| !e.is_disabled()))
+            });
+        for sc_id in selectedcontents {
+            let existing = doc.children(sc_id);
+            for child in existing {
+                doc.detach(child);
+            }
+            if let Some(opt_id) = chosen {
+                let kids = doc.children(opt_id);
+                for k in kids {
+                    let cloned = doc.clone_node(k, true);
+                    doc.append_child(sc_id, cloned);
+                }
+            }
+        }
+    }
+}
+
+fn collect_select_descendants(
+    doc: &Document,
+    parent: NodeId,
+    selectedcontents: &mut Vec<NodeId>,
+    options: &mut Vec<NodeId>,
+) {
+    for child in doc.children(parent) {
+        if let Some(el) = doc.element(child) {
+            if el.namespace == Namespace::Html {
+                match el.tag_name.as_str() {
+                    "select" | "template" => continue,
+                    "selectedcontent" => {
+                        selectedcontents.push(child);
+                        continue;
+                    }
+                    "option" => {
+                        options.push(child);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        collect_select_descendants(doc, child, selectedcontents, options);
+    }
 }
 
 fn should_process_in_foreign(st: &TreeState, token: &Token) -> bool {

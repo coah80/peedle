@@ -22,8 +22,7 @@ pub fn step_head_and_outer(
         Mode::InHeadNoscript => step_in_head_noscript(st, token, tok_state),
         Mode::AfterHead => step_after_head(st, token, tok_state),
         Mode::Text => step_text(st, token),
-        Mode::InSelect => step_in_select(st, token, tok_state),
-        Mode::InSelectInTable => step_in_select_in_table(st, token, tok_state),
+        Mode::InSelect | Mode::InSelectInTable => StepAction::ProcessAsInBody,
         Mode::InTemplate => step_in_template(st, token, tok_state),
         Mode::AfterBody => step_after_body(st, token),
         Mode::InFrameset => step_in_frameset(st, token),
@@ -632,6 +631,12 @@ fn step_in_body_start(
             StepAction::Done
         }
         "input" => {
+            if st.fragment_context_is_html("select") {
+                return StepAction::Done;
+            }
+            if st.in_scope("select") {
+                st.pop_until_html("select");
+            }
             st.reconstruct_formatting();
             st.insert_void_html(t);
             let is_hidden = t
@@ -650,6 +655,9 @@ fn step_in_body_start(
         "hr" => {
             if st.in_button_scope("p") {
                 st.close_p_element();
+            }
+            if st.in_scope("select") {
+                st.generate_implied_end_tags(None);
             }
             st.insert_void_html(t);
             st.frameset_ok = false;
@@ -695,21 +703,32 @@ fn step_in_body_start(
             StepAction::Done
         }
         "select" => {
+            if st.fragment_context_is_html("select") {
+                return StepAction::Done;
+            }
+            if st.in_scope("select") {
+                st.pop_until_html("select");
+                return StepAction::Done;
+            }
             st.reconstruct_formatting();
             st.insert_html_element(t);
             st.frameset_ok = false;
-            if matches!(
-                st.mode,
-                Mode::InTable | Mode::InCaption | Mode::InTableBody | Mode::InRow | Mode::InCell
-            ) {
-                st.mode = Mode::InSelectInTable;
-            } else {
-                st.mode = Mode::InSelect;
-            }
             StepAction::Done
         }
-        "optgroup" | "option" => {
-            if st.current_is_html("option") {
+        "optgroup" => {
+            if st.in_scope("select") {
+                st.generate_implied_end_tags(None);
+            } else if st.current_is_html("option") {
+                st.open_elements.pop();
+            }
+            st.reconstruct_formatting();
+            st.insert_html_element(t);
+            StepAction::Done
+        }
+        "option" => {
+            if st.in_scope("select") {
+                st.generate_implied_end_tags(Some("optgroup"));
+            } else if st.current_is_html("option") {
                 st.open_elements.pop();
             }
             st.reconstruct_formatting();
@@ -781,7 +800,7 @@ fn step_in_body_end(st: &mut TreeState, t: &TagToken) -> StepAction {
         "address" | "article" | "aside" | "blockquote" | "button" | "center" | "details"
         | "dialog" | "dir" | "div" | "dl" | "fieldset" | "figcaption" | "figure" | "footer"
         | "header" | "hgroup" | "listing" | "main" | "menu" | "nav" | "ol" | "pre" | "search"
-        | "section" | "summary" | "ul" => {
+        | "section" | "select" | "summary" | "ul" => {
             if st.in_scope(&t.name) {
                 st.generate_implied_end_tags(None);
                 st.pop_until_html(&t.name);
@@ -875,136 +894,6 @@ fn step_in_body_end(st: &mut TreeState, t: &TagToken) -> StepAction {
             st.any_other_end_tag(&t.name);
             StepAction::Done
         }
-    }
-}
-
-fn step_in_select(
-    st: &mut TreeState,
-    token: &Token,
-    _tok_state: &mut TokenizerState,
-) -> StepAction {
-    match token {
-        Token::Character('\0') => StepAction::Done,
-        Token::Character(c) => {
-            st.insert_char(*c);
-            StepAction::Done
-        }
-        Token::Comment(data) => {
-            st.insert_comment(data.clone(), None);
-            StepAction::Done
-        }
-        Token::Doctype(_) => StepAction::Done,
-        Token::StartTag(t) => match t.name.as_str() {
-            "html" => StepAction::ProcessAsInBody,
-            "option" => {
-                if st.current_is_html("option") {
-                    st.open_elements.pop();
-                }
-                st.insert_html_element(t);
-                StepAction::Done
-            }
-            "optgroup" => {
-                if st.current_is_html("option") {
-                    st.open_elements.pop();
-                }
-                if st.current_is_html("optgroup") {
-                    st.open_elements.pop();
-                }
-                st.insert_html_element(t);
-                StepAction::Done
-            }
-            "hr" => {
-                if st.current_is_html("option") {
-                    st.open_elements.pop();
-                }
-                if st.current_is_html("optgroup") {
-                    st.open_elements.pop();
-                }
-                st.insert_void_html(t);
-                StepAction::Done
-            }
-            "select" => {
-                if st.in_select_scope("select") {
-                    st.pop_until_html("select");
-                    st.reset_insertion_mode();
-                }
-                StepAction::Done
-            }
-            "input" | "keygen" | "textarea" => {
-                if st.in_select_scope("select") {
-                    st.pop_until_html("select");
-                    st.reset_insertion_mode();
-                    return StepAction::Reprocess(st.mode);
-                }
-                StepAction::Done
-            }
-            "script" | "template" => StepAction::ProcessAsInHead,
-            _ => StepAction::ProcessAsInBody,
-        },
-        Token::EndTag(t) => match t.name.as_str() {
-            "optgroup" => {
-                if st.current_is_html("option") && st.open_elements.len() >= 2 {
-                    let prev = st.open_elements[st.open_elements.len() - 2];
-                    if st.node_is_html(prev, "optgroup") {
-                        st.open_elements.pop();
-                    }
-                }
-                if st.current_is_html("optgroup") {
-                    st.open_elements.pop();
-                }
-                StepAction::Done
-            }
-            "option" => {
-                if st.current_is_html("option") {
-                    st.open_elements.pop();
-                }
-                StepAction::Done
-            }
-            "select" => {
-                if st.in_select_scope("select") {
-                    st.pop_until_html("select");
-                    st.reset_insertion_mode();
-                }
-                StepAction::Done
-            }
-            "template" => StepAction::ProcessAsInHead,
-            _ => StepAction::ProcessAsInBody,
-        },
-        Token::Eof => StepAction::ProcessAsInBody,
-    }
-}
-
-fn step_in_select_in_table(
-    st: &mut TreeState,
-    token: &Token,
-    tok_state: &mut TokenizerState,
-) -> StepAction {
-    match token {
-        Token::StartTag(t)
-            if matches!(
-                t.name.as_str(),
-                "caption" | "table" | "tbody" | "tfoot" | "thead" | "tr" | "td" | "th"
-            ) =>
-        {
-            st.pop_until_html("select");
-            st.reset_insertion_mode();
-            StepAction::Reprocess(st.mode)
-        }
-        Token::EndTag(t)
-            if matches!(
-                t.name.as_str(),
-                "caption" | "table" | "tbody" | "tfoot" | "thead" | "tr" | "td" | "th"
-            ) =>
-        {
-            if st.in_table_scope(&t.name) {
-                st.pop_until_html("select");
-                st.reset_insertion_mode();
-                StepAction::Reprocess(st.mode)
-            } else {
-                StepAction::Done
-            }
-        }
-        _ => step_in_select(st, token, tok_state),
     }
 }
 

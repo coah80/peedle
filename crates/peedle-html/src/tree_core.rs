@@ -110,6 +110,11 @@ impl TreeState {
         self.current_node().map_or(false, |id| self.node_is_html(id, tag))
     }
 
+    pub fn fragment_context_is_html(&self, tag: &str) -> bool {
+        self.fragment_context
+            .map_or(false, |id| self.node_is_html(id, tag))
+    }
+
     pub fn insertion_location(&self, override_target: Option<NodeId>) -> (NodeId, Option<NodeId>) {
         let target = override_target.or_else(|| self.current_node()).unwrap_or(self.doc.root);
         if self.foster_parenting {
@@ -710,21 +715,6 @@ impl TreeState {
                 continue;
             }
             match el.tag_name.as_str() {
-                "select" => {
-                    if !last {
-                        for anc in (1..idx).rev() {
-                            if self.node_is_html(self.open_elements[anc], "template") {
-                                break;
-                            }
-                            if self.node_is_html(self.open_elements[anc], "table") {
-                                self.mode = Mode::InSelectInTable;
-                                return;
-                            }
-                        }
-                    }
-                    self.mode = Mode::InSelect;
-                    return;
-                }
                 "td" | "th" if !last => {
                     self.mode = Mode::InCell;
                     return;
@@ -860,6 +850,7 @@ const DEFAULT_SCOPE_BARRIERS: &[(&str, Namespace)] = &[
     ("th", Namespace::Html),
     ("marquee", Namespace::Html),
     ("object", Namespace::Html),
+    ("select", Namespace::Html),
     ("template", Namespace::Html),
     ("mi", Namespace::MathMl),
     ("mo", Namespace::MathMl),
@@ -881,6 +872,7 @@ const BUTTON_SCOPE_BARRIERS: &[(&str, Namespace)] = &[
     ("th", Namespace::Html),
     ("marquee", Namespace::Html),
     ("object", Namespace::Html),
+    ("select", Namespace::Html),
     ("template", Namespace::Html),
     ("button", Namespace::Html),
     ("mi", Namespace::MathMl),
@@ -903,6 +895,7 @@ const LIST_ITEM_SCOPE_BARRIERS: &[(&str, Namespace)] = &[
     ("th", Namespace::Html),
     ("marquee", Namespace::Html),
     ("object", Namespace::Html),
+    ("select", Namespace::Html),
     ("template", Namespace::Html),
     ("ol", Namespace::Html),
     ("ul", Namespace::Html),

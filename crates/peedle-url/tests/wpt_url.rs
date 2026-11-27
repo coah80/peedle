@@ -131,6 +131,7 @@ fn wpt_url_setters_conformance() {
 
     let mut total = 0usize;
     let mut passed = 0usize;
+    let mut failures = Vec::new();
 
     for (prop, cases_val) in obj {
         if prop == "comment" {
@@ -169,6 +170,7 @@ fn wpt_url_setters_conformance() {
                 _ => continue,
             }
             let mut ok = true;
+            let mut diff = String::new();
             for (ek, ev) in expected {
                 let Some(exp_str) = ev.as_str() else {
                     continue;
@@ -188,16 +190,33 @@ fn wpt_url_setters_conformance() {
                 };
                 if got_str != exp_str {
                     ok = false;
+                    diff = format!("{} got={:?} exp={:?}", ek, got_str, exp_str);
                     break;
                 }
             }
             if ok {
                 passed += 1;
+            } else {
+                failures.push(format!(
+                    "[{}] href={:?} new_value={:?} -> {} (full href={:?})",
+                    prop,
+                    href,
+                    new_val,
+                    diff,
+                    url.href()
+                ));
             }
         }
     }
 
     let pct = (passed as f64 / total.max(1) as f64) * 100.0;
     eprintln!("WPT url setters: {}/{} ({:.1}%)", passed, total, pct);
-    assert!(pct >= 80.0, "WPT URL setters pass rate too low: {:.1}%", pct);
+    for f in &failures {
+        eprintln!("  {}", f);
+    }
+    assert_eq!(
+        passed, total,
+        "WPT URL setters pass rate regressed: {}/{}",
+        passed, total
+    );
 }

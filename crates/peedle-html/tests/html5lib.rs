@@ -159,10 +159,10 @@ fn html5lib_tree_construction_suite() {
     for f in &sample_failures {
         eprintln!("  {}", f);
     }
-    assert!(
-        pct >= 70.0,
-        "html5lib tree-construction pass rate too low: {:.1}%",
-        pct
+    assert_eq!(
+        passed, total,
+        "html5lib tree-construction pass rate regressed: {}/{}",
+        passed, total
     );
 }
 
@@ -303,10 +303,13 @@ fn parse_dat_tests(raw: &str) -> Vec<DatTest> {
                 }
                 "#document" => {
                     while i < lines.len() && lines[i] != "#data" && !lines[i].starts_with("#new-errors") {
-                        if lines[i].starts_with("| ") || !doc_lines.is_empty() && !lines[i].is_empty() {
+                        if lines[i].starts_with("| ") || !doc_lines.is_empty() {
                             doc_lines.push(lines[i]);
                         }
                         i += 1;
+                    }
+                    while doc_lines.last() == Some(&"") {
+                        doc_lines.pop();
                     }
                 }
                 _ => {
@@ -364,20 +367,26 @@ fn serialize_tree_node(doc: &Document, id: NodeId, depth: usize, out: &mut Strin
                 Namespace::MathMl => "math ",
             };
             out.push_str(&format!("| {}<{}{}>\n", indent, prefix, e.tag_name));
-            let mut attrs = e.attributes.clone();
-            attrs.sort_by(|a, b| a.name.cmp(&b.name));
-            let attr_indent = "  ".repeat(depth + 1);
-            for a in attrs {
-                let aname = if let Some((p, local)) = a.name.split_once(':') {
-                    if a.namespace.is_some() {
-                        format!("{} {}", p, local)
+            let mut attrs: Vec<(String, String)> = e
+                .attributes
+                .iter()
+                .map(|a| {
+                    let aname = if let Some((p, local)) = a.name.split_once(':') {
+                        if a.namespace.is_some() {
+                            format!("{} {}", p, local)
+                        } else {
+                            a.name.clone()
+                        }
                     } else {
                         a.name.clone()
-                    }
-                } else {
-                    a.name.clone()
-                };
-                out.push_str(&format!("| {}{}=\"{}\"\n", attr_indent, aname, a.value));
+                    };
+                    (aname, a.value.clone())
+                })
+                .collect();
+            attrs.sort_by(|a, b| a.0.cmp(&b.0));
+            let attr_indent = "  ".repeat(depth + 1);
+            for (aname, value) in attrs {
+                out.push_str(&format!("| {}{}=\"{}\"\n", attr_indent, aname, value));
             }
             if let Some(tc) = e.template_contents {
                 out.push_str(&format!("| {}content\n", attr_indent));
