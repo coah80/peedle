@@ -1,5 +1,8 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod chrome;
+mod icon;
 
 use std::path::Path;
 
@@ -11,14 +14,65 @@ fn main() {
         run_headless(&args);
         return;
     }
-    let url = args
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "peedle://newtab".to_string());
-    if let Err(e) = app::BrowserApp::run(url) {
+    if let Some(pos) = args.iter().position(|a| a == "--write-ico") {
+        if let Some(out) = args.get(pos + 1) {
+            if let Err(e) = write_ico_file(Path::new(out)) {
+                eprintln!("icon error: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+    let urls: Vec<String> = args
+        .into_iter()
+        .filter(|a| !a.starts_with("-psn_") && !a.starts_with('-'))
+        .collect();
+    let initial_urls = if urls.is_empty() {
+        vec!["peedle://newtab".to_string()]
+    } else {
+        urls
+    };
+    if let Err(e) = app::BrowserApp::run(initial_urls) {
         eprintln!("peedle error: {}", e);
         std::process::exit(1);
     }
+}
+
+fn write_ico_file(path: &Path) -> Result<(), String> {
+    let sizes = [16usize, 32, 48, 64, 128, 256];
+    let mut pngs: Vec<(u32, Vec<u8>)> = Vec::with_capacity(sizes.len());
+    for sz in sizes {
+        let rgba = icon::render_icon_rgba(sz);
+        let img: image::ImageBuffer<image::Rgba<u8>, _> =
+            image::ImageBuffer::from_raw(sz as u32, sz as u32, rgba)
+                .ok_or_else(|| "icon buffer error".to_string())?;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|e| e.to_string())?;
+        pngs.push((sz as u32, cursor.into_inner()));
+    }
+    let count = pngs.len() as u16;
+    let mut out = Vec::new();
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    let mut offset = 6u32 + (pngs.len() as u32) * 16;
+    for (sz, data) in &pngs {
+        let dim = if *sz >= 256 { 0u8 } else { *sz as u8 };
+        out.push(dim);
+        out.push(dim);
+        out.push(0);
+        out.push(0);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        offset += data.len() as u32;
+    }
+    for (_, data) in &pngs {
+        out.extend_from_slice(data);
+    }
+    std::fs::write(path, out).map_err(|e| e.to_string())
 }
 
 fn run_headless(args: &[String]) {

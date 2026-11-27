@@ -784,6 +784,26 @@ impl Page {
         peedle_css::Cursor::Default
     }
 
+    pub fn has_focused_input(&self) -> bool {
+        self.js_env.dom.borrow().focused_node.is_some()
+    }
+
+    pub fn href_at(&self, vx: f32, vy: f32) -> Option<String> {
+        let href = {
+            let st = self.js_env.dom.borrow();
+            let nid = st.layout.hit_test(vx + self.scroll_x, vy + self.scroll_y)?;
+            find_ancestor_href(&st.doc, nid)?
+        };
+        if href.starts_with("javascript:") {
+            return None;
+        }
+        if href.starts_with("peedle://") || href.starts_with("about:") {
+            Some(href)
+        } else {
+            self.resolve_subresource_url(&href)
+        }
+    }
+
     pub fn on_click(&mut self, vx: f32, vy: f32) -> Option<String> {
         let hit = {
             let st = self.js_env.dom.borrow();
@@ -1160,6 +1180,14 @@ pub fn normalize_navigation_input(raw: &str) -> String {
     }
     if trimmed.starts_with('/') {
         return format!("file://{}", trimmed);
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return format!("file:///{}", trimmed.replace('\\', "/"));
     }
     if trimmed.contains('.') && !trimmed.contains(' ') {
         return format!("https://{}", trimmed);

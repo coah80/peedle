@@ -898,6 +898,58 @@ impl Framebuffer {
         }
     }
 
+    pub fn blit_rgba_opaque(
+        &mut self,
+        src_w: u32,
+        src_h: u32,
+        src: &[u8],
+        dst_x: f32,
+        dst_y: f32,
+        dst_w: f32,
+        dst_h: f32,
+    ) {
+        if src_w == 0 || src_h == 0 || dst_w <= 0.0 || dst_h <= 0.0 {
+            return;
+        }
+        let clip = self.current_clip();
+        let x0 = (dst_x.floor() as i32).max(clip.x).max(0);
+        let y0 = (dst_y.floor() as i32).max(clip.y).max(0);
+        let x1 = ((dst_x + dst_w).ceil() as i32)
+            .min(clip.x + clip.w)
+            .min(self.width as i32);
+        let y1 = ((dst_y + dst_h).ceil() as i32)
+            .min(clip.y + clip.h)
+            .min(self.height as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let span_w = (x1 - x0) as usize;
+        let mut sx_table = Vec::with_capacity(span_w);
+        for px in x0..x1 {
+            let u = ((px as f32 + 0.5 - dst_x) / dst_w).clamp(0.0, 0.9999);
+            let sx = ((u * src_w as f32) as u32).min(src_w - 1) as usize;
+            sx_table.push(sx * 4);
+        }
+        let dst_stride = self.width as usize * 4;
+        let src_stride = src_w as usize * 4;
+        for py in y0..y1 {
+            let v = ((py as f32 + 0.5 - dst_y) / dst_h).clamp(0.0, 0.9999);
+            let sy = ((v * src_h as f32) as u32).min(src_h - 1) as usize;
+            let src_row = sy * src_stride;
+            let dst_row = py as usize * dst_stride + x0 as usize * 4;
+            for (i, &sx_off) in sx_table.iter().enumerate() {
+                let sidx = src_row + sx_off;
+                let didx = dst_row + i * 4;
+                if sidx + 3 < src.len() && didx + 3 < self.data.len() {
+                    self.data[didx] = src[sidx];
+                    self.data[didx + 1] = src[sidx + 1];
+                    self.data[didx + 2] = src[sidx + 2];
+                    self.data[didx + 3] = 255;
+                }
+            }
+        }
+    }
+
     pub fn blit_rgba_rounded(
         &mut self,
         src_w: u32,

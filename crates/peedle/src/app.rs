@@ -1,4 +1,6 @@
+use std::io::Write;
 use std::num::NonZeroU32;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 
 use peedle_engine::Page;
@@ -8,7 +10,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use crate::chrome::{
@@ -17,7 +19,7 @@ use crate::chrome::{
 };
 
 pub struct BrowserApp {
-    initial_url: String,
+    initial_urls: Vec<String>,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     tabs: Vec<Page>,
@@ -28,15 +30,16 @@ pub struct BrowserApp {
     cursor_y: f32,
     modifiers: ModifiersState,
     scrollbar_dragging: bool,
-    width: u32,
-    height: u32,
+    phys_w: u32,
+    phys_h: u32,
+    scale_factor: f32,
 }
 
 impl BrowserApp {
-    pub fn run(initial_url: String) -> Result<(), String> {
+    pub fn run(initial_urls: Vec<String>) -> Result<(), String> {
         let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
         let mut app = Self {
-            initial_url,
+            initial_urls,
             window: None,
             surface: None,
             tabs: Vec::new(),
@@ -47,10 +50,19 @@ impl BrowserApp {
             cursor_y: 0.0,
             modifiers: ModifiersState::empty(),
             scrollbar_dragging: false,
-            width: 1280,
-            height: 800,
+            phys_w: 1280,
+            phys_h: 800,
+            scale_factor: 1.0,
         };
         event_loop.run_app(&mut app).map_err(|e| e.to_string())
+    }
+
+    fn logical_w(&self) -> f32 {
+        (self.phys_w as f32 / self.scale_factor.max(1.0)).max(200.0)
+    }
+
+    fn logical_h(&self) -> f32 {
+        (self.phys_h as f32 / self.scale_factor.max(1.0)).max(200.0)
     }
 
     fn active_page(&self) -> &Page {
@@ -63,6 +75,13 @@ impl BrowserApp {
 
     fn sync_omnibox(&mut self) {
         self.chrome.omnibox_text = self.active_page().url.clone();
+        self.chrome.omnibox_selected = false;
+    }
+
+    fn set_loading_title(&self) {
+        if let Some(ref win) = self.window {
+            win.set_title("Loading... - Peedle");
+        }
     }
 
     fn sync_window_title(&self) {
@@ -70,6 +89,13 @@ impl BrowserApp {
             let t = self.active_page().title();
             win.set_title(&format!("{} - Peedle", t));
         }
+    }
+
+    fn navigate_active(&mut self, target: &str) {
+        self.set_loading_title();
+        let _ = self.active_page_mut().navigate(target);
+        self.sync_omnibox();
+        self.sync_window_title();
     }
 
     fn toggle_current_bookmark(&mut self) {
@@ -125,8 +151,11 @@ impl BrowserApp {
 
     fn open_new_tab(&mut self, url: &str) {
         let z = self.chrome.zoom.clamp(0.5, 2.0);
-        let vw = (self.width as f32 / z).max(200.0);
-        let vh = (content_viewport_height(self.height as f32, &self.chrome) / z).max(100.0);
+        let vw = (self.logical_w() / z).max(200.0);
+        let vh = (content_viewport_height(self.logical_h(), &self.chrome) / z).max(100.0);
+        if url != "peedle://newtab" {
+            self.set_loading_title();
+        }
         let mut page = Page::new(vw, vh);
         if url != "peedle://newtab" {
             let _ = page.navigate(url);
@@ -139,8 +168,7 @@ impl BrowserApp {
 
     fn close_tab(&mut self, idx: usize) {
         if self.tabs.len() <= 1 {
-            let _ = self.active_page_mut().navigate("peedle://newtab");
-            self.sync_omnibox();
+            self.navigate_active("peedle://newtab");
             return;
         }
         self.tabs.remove(idx);
@@ -151,10 +179,20 @@ impl BrowserApp {
         self.sync_window_title();
     }
 
+    fn switch_tab_delta(&mut self, delta: isize) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        let n = self.tabs.len() as isize;
+        self.active_tab = (self.active_tab as isize + delta).rem_euclid(n) as usize;
+        self.sync_omnibox();
+        self.sync_window_title();
+    }
+
     fn resize_all_tabs(&mut self) {
         let z = self.chrome.zoom.clamp(0.5, 2.0);
-        let w = (self.width as f32 / z).max(200.0);
-        let vh = (content_viewport_height(self.height as f32, &self.chrome) / z).max(100.0);
+        let w = (self.logical_w() / z).max(200.0);
+        let vh = (content_viewport_height(self.logical_h(), &self.chrome) / z).max(100.0);
         for tab in &mut self.tabs {
             tab.resize(w, vh);
         }
@@ -162,7 +200,7 @@ impl BrowserApp {
 
     fn scroll_to_scrollbar_y(&mut self, y: f32) {
         let top_h = top_chrome_height(&self.chrome);
-        let vh = content_viewport_height(self.height as f32, &self.chrome);
+        let vh = content_viewport_height(self.logical_h(), &self.chrome);
         let ratio = ((y - top_h) / vh.max(1.0)).clamp(0.0, 1.0);
         let page = self.active_page_mut();
         let content_h = page.js_env.dom.borrow().layout.content_height;
@@ -178,8 +216,8 @@ impl BrowserApp {
         let hit = hit_test_chrome(
             self.cursor_x,
             self.cursor_y,
-            self.width as f32,
-            self.height as f32,
+            self.logical_w(),
+            self.logical_h(),
             self.tabs.len(),
             &self.chrome,
         );
@@ -215,14 +253,43 @@ impl BrowserApp {
         win.set_cursor(icon);
     }
 
-    fn render(&mut self) {
-        if self.width == 0 || self.height == 0 || self.tabs.is_empty() {
+    fn paste_text(&mut self, raw: &str) {
+        let cleaned: String = raw
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\t')
+            .collect();
+        if cleaned.is_empty() {
             return;
         }
+        if self.chrome.omnibox_focused {
+            if self.chrome.omnibox_selected {
+                self.chrome.omnibox_text.clear();
+                self.chrome.omnibox_selected = false;
+            }
+            self.chrome.omnibox_text.push_str(cleaned.trim());
+        } else if self.chrome.find_open {
+            self.chrome.find_query.push_str(&cleaned);
+            self.run_find(0);
+        } else if self.chrome.console_focused {
+            self.chrome.console_input.push_str(&cleaned);
+        } else if self.active_page().has_focused_input() {
+            for c in cleaned.chars() {
+                self.active_page_mut().on_text_input(c);
+            }
+        }
+    }
+
+    fn render(&mut self) {
+        if self.phys_w == 0 || self.phys_h == 0 || self.tabs.is_empty() {
+            return;
+        }
+        let s = self.scale_factor.max(1.0);
+        let lw = self.logical_w();
+        let lh = self.logical_h();
         let top_h = top_chrome_height(&self.chrome);
-        let vh = content_viewport_height(self.height as f32, &self.chrome);
+        let vh = content_viewport_height(lh, &self.chrome);
         let z = self.chrome.zoom.clamp(0.5, 2.0);
-        let pw = (self.width as f32 / z).ceil().max(1.0) as u32;
+        let pw = (lw / z).ceil().max(1.0) as u32;
         let ph = (vh / z).ceil().max(1.0) as u32;
         let mut page_fb = Framebuffer::new(pw, ph);
         self.tabs[self.active_tab].render_to_framebuffer(&mut page_fb);
@@ -256,29 +323,37 @@ impl BrowserApp {
             }
         }
 
-        let mut full_fb = Framebuffer::new(self.width, self.height);
+        let mut full_fb = Framebuffer::new(self.phys_w, self.phys_h);
+        let top_phys = top_h * s;
+        let vh_phys = vh * s;
         full_fb.push_clip(ClipRect {
             x: 0,
-            y: top_h as i32,
-            w: self.width as i32,
-            h: vh.ceil() as i32,
+            y: top_phys.floor() as i32,
+            w: self.phys_w as i32,
+            h: vh_phys.ceil() as i32,
         });
-        full_fb.blit_rgba(
+        full_fb.blit_rgba_opaque(
             page_fb.width,
             page_fb.height,
             &page_fb.data,
             0.0,
-            top_h,
-            self.width as f32,
-            vh,
-            1.0,
+            top_phys,
+            self.phys_w as f32,
+            vh_phys,
         );
         full_fb.pop_clip();
 
-        draw_chrome(&mut full_fb, &self.fonts, &self.tabs, self.active_tab, &self.chrome);
+        draw_chrome(
+            &mut full_fb,
+            &self.fonts,
+            &self.tabs,
+            self.active_tab,
+            &self.chrome,
+            s,
+        );
 
         if let Some(ref mut surface) = self.surface {
-            if let (Some(w), Some(h)) = (NonZeroU32::new(self.width), NonZeroU32::new(self.height)) {
+            if let (Some(w), Some(h)) = (NonZeroU32::new(self.phys_w), NonZeroU32::new(self.phys_h)) {
                 let _ = surface.resize(w, h);
                 if let Ok(mut buffer) = surface.buffer_mut() {
                     full_fb.to_xrgb_slice(&mut buffer);
@@ -300,23 +375,32 @@ impl ApplicationHandler for BrowserApp {
         if self.window.is_some() {
             return;
         }
-        let attrs = WindowAttributes::default()
+        let mut attrs = WindowAttributes::default()
             .with_title("Peedle")
-            .with_inner_size(LogicalSize::new(self.width, self.height));
+            .with_inner_size(LogicalSize::new(1280.0, 800.0));
+        if let Some(win_icon) = crate::icon::build_window_icon() {
+            attrs = attrs.with_window_icon(Some(win_icon));
+        }
         let win = Rc::new(event_loop.create_window(attrs).unwrap());
         let ctx = Context::new(win.clone()).unwrap();
         let surface = Surface::new(&ctx, win.clone()).unwrap();
 
+        self.scale_factor = (win.scale_factor() as f32).max(1.0);
         let sz = win.inner_size();
         if sz.width > 0 && sz.height > 0 {
-            self.width = sz.width;
-            self.height = sz.height;
+            self.phys_w = sz.width;
+            self.phys_h = sz.height;
         }
         self.window = Some(win);
         self.surface = Some(surface);
 
-        let url = self.initial_url.clone();
-        self.open_new_tab(&url);
+        let urls = self.initial_urls.clone();
+        for url in &urls {
+            self.open_new_tab(url);
+        }
+        if self.tabs.is_empty() {
+            self.open_new_tab("peedle://newtab");
+        }
         self.render();
         self.request_redraw();
     }
@@ -324,10 +408,18 @@ impl ApplicationHandler for BrowserApp {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.scale_factor = (scale_factor as f32).max(1.0);
+                self.resize_all_tabs();
+                self.request_redraw();
+            }
             WindowEvent::Resized(sz) => {
                 if sz.width > 0 && sz.height > 0 {
-                    self.width = sz.width;
-                    self.height = sz.height;
+                    self.phys_w = sz.width;
+                    self.phys_h = sz.height;
+                    if let Some(ref win) = self.window {
+                        self.scale_factor = (win.scale_factor() as f32).max(1.0);
+                    }
                     self.resize_all_tabs();
                     self.request_redraw();
                 }
@@ -336,8 +428,9 @@ impl ApplicationHandler for BrowserApp {
                 self.modifiers = m.state();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_x = position.x as f32;
-                self.cursor_y = position.y as f32;
+                let s = self.scale_factor.max(1.0);
+                self.cursor_x = position.x as f32 / s;
+                self.cursor_y = position.y as f32 / s;
                 if self.scrollbar_dragging {
                     self.scroll_to_scrollbar_y(self.cursor_y);
                     self.request_redraw();
@@ -348,7 +441,7 @@ impl ApplicationHandler for BrowserApp {
                 let top_h = top_chrome_height(&self.chrome);
                 if self.cursor_y >= top_h {
                     let vy = (self.cursor_y - top_h) / z;
-                    let vh = content_viewport_height(self.height as f32, &self.chrome) / z;
+                    let vh = content_viewport_height(self.logical_h(), &self.chrome) / z;
                     if vy < vh && self.active_page_mut().on_mouse_move(cx, vy) {
                         self.request_redraw();
                     }
@@ -356,9 +449,10 @@ impl ApplicationHandler for BrowserApp {
                 self.update_cursor_icon();
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let s = self.scale_factor.max(1.0);
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (-x * 40.0, -y * 48.0),
-                    MouseScrollDelta::PixelDelta(p) => (-p.x as f32, -p.y as f32),
+                    MouseScrollDelta::PixelDelta(p) => (-p.x as f32 / s, -p.y as f32 / s),
                 };
                 self.active_page_mut().scroll_by(dx, dy);
                 self.request_redraw();
@@ -372,18 +466,50 @@ impl ApplicationHandler for BrowserApp {
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => {
+                let hit = hit_test_chrome(
+                    self.cursor_x,
+                    self.cursor_y,
+                    self.logical_w(),
+                    self.logical_h(),
+                    self.tabs.len(),
+                    &self.chrome,
+                );
+                match hit {
+                    ChromeHit::Tab(i) => {
+                        self.close_tab(i);
+                        self.request_redraw();
+                    }
+                    ChromeHit::Content => {
+                        let z = self.chrome.zoom.clamp(0.5, 2.0);
+                        let cx = self.cursor_x / z;
+                        let vy = (self.cursor_y - top_chrome_height(&self.chrome)) / z;
+                        if let Some(url) = self.active_page().href_at(cx, vy) {
+                            self.open_new_tab(&url);
+                            self.request_redraw();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
             } => {
                 let hit = hit_test_chrome(
                     self.cursor_x,
                     self.cursor_y,
-                    self.width as f32,
-                    self.height as f32,
+                    self.logical_w(),
+                    self.logical_h(),
                     self.tabs.len(),
                     &self.chrome,
                 );
+                let was_omni = self.chrome.omnibox_focused;
                 self.chrome.omnibox_focused = false;
+                self.chrome.omnibox_selected = false;
                 self.chrome.console_focused = false;
                 match hit {
                     ChromeHit::Tab(i) => {
@@ -392,32 +518,38 @@ impl ApplicationHandler for BrowserApp {
                         self.sync_window_title();
                     }
                     ChromeHit::CloseTab(i) => self.close_tab(i),
-                    ChromeHit::NewTab => self.open_new_tab("peedle://newtab"),
+                    ChromeHit::NewTab => {
+                        self.open_new_tab("peedle://newtab");
+                        self.chrome.omnibox_focused = true;
+                        self.chrome.omnibox_selected = true;
+                    }
                     ChromeHit::Back => {
+                        self.set_loading_title();
                         let _ = self.active_page_mut().go_back();
                         self.sync_omnibox();
                         self.sync_window_title();
                     }
                     ChromeHit::Forward => {
+                        self.set_loading_title();
                         let _ = self.active_page_mut().go_forward();
                         self.sync_omnibox();
                         self.sync_window_title();
                     }
                     ChromeHit::Reload => {
+                        self.set_loading_title();
                         let _ = self.active_page_mut().reload();
                         self.sync_window_title();
                     }
                     ChromeHit::Omnibox => {
                         self.chrome.omnibox_focused = true;
+                        self.chrome.omnibox_selected = !was_omni;
                     }
                     ChromeHit::ToggleBookmark => {
                         self.toggle_current_bookmark();
                     }
                     ChromeHit::BookmarkItem(i) => {
                         if let Some(bm) = self.chrome.bookmarks.get(i).cloned() {
-                            let _ = self.active_page_mut().navigate(&bm.url);
-                            self.sync_omnibox();
-                            self.sync_window_title();
+                            self.navigate_active(&bm.url);
                         }
                     }
                     ChromeHit::ToggleDevTools => {
@@ -442,8 +574,21 @@ impl ApplicationHandler for BrowserApp {
                         let z = self.chrome.zoom.clamp(0.5, 2.0);
                         let cx = self.cursor_x / z;
                         let vy = (self.cursor_y - top_chrome_height(&self.chrome)) / z;
+                        let cmd = self.modifiers.super_key() || self.modifiers.control_key();
+                        if cmd {
+                            if let Some(url) = self.active_page().href_at(cx, vy) {
+                                self.open_new_tab(&url);
+                                self.request_redraw();
+                                return;
+                            }
+                        }
+                        if self.active_page().href_at(cx, vy).is_some() {
+                            self.set_loading_title();
+                        }
                         if self.active_page_mut().on_click(cx, vy).is_some() {
                             self.sync_omnibox();
+                            self.sync_window_title();
+                        } else {
                             self.sync_window_title();
                         }
                     }
@@ -455,11 +600,14 @@ impl ApplicationHandler for BrowserApp {
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
+                let cmd = self.modifiers.control_key() || self.modifiers.super_key();
                 let alt = self.modifiers.alt_key();
-                if alt {
-                    match event.logical_key {
+                let shift = self.modifiers.shift_key();
+
+                if alt && !cmd {
+                    match &event.logical_key {
                         Key::Named(NamedKey::ArrowLeft) => {
+                            self.set_loading_title();
                             let _ = self.active_page_mut().go_back();
                             self.sync_omnibox();
                             self.sync_window_title();
@@ -467,55 +615,153 @@ impl ApplicationHandler for BrowserApp {
                             return;
                         }
                         Key::Named(NamedKey::ArrowRight) => {
+                            self.set_loading_title();
                             let _ = self.active_page_mut().go_forward();
                             self.sync_omnibox();
                             self.sync_window_title();
                             self.request_redraw();
                             return;
                         }
+                        Key::Character(ch) if ch.eq_ignore_ascii_case("d") => {
+                            self.chrome.omnibox_focused = true;
+                            self.chrome.omnibox_selected = true;
+                            self.chrome.find_open = false;
+                            self.chrome.console_focused = false;
+                            self.request_redraw();
+                            return;
+                        }
                         _ => {}
                     }
                 }
-                if ctrl {
-                    if matches!(event.logical_key, Key::Named(NamedKey::Tab)) && self.tabs.len() > 1 {
-                        if self.modifiers.shift_key() {
-                            self.active_tab = if self.active_tab == 0 {
-                                self.tabs.len() - 1
-                            } else {
-                                self.active_tab - 1
-                            };
-                        } else {
-                            self.active_tab = (self.active_tab + 1) % self.tabs.len();
-                        }
-                        self.sync_omnibox();
-                        self.sync_window_title();
+
+                if cmd {
+                    if (alt || shift) && event.physical_key == PhysicalKey::Code(KeyCode::KeyI) {
+                        self.chrome.devtools_open = !self.chrome.devtools_open;
+                        self.resize_all_tabs();
                         self.request_redraw();
                         return;
                     }
+                    match event.logical_key {
+                        Key::Named(NamedKey::Tab) => {
+                            self.switch_tab_delta(if shift { -1 } else { 1 });
+                            self.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            self.set_loading_title();
+                            let _ = self.active_page_mut().go_back();
+                            self.sync_omnibox();
+                            self.sync_window_title();
+                            self.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            self.set_loading_title();
+                            let _ = self.active_page_mut().go_forward();
+                            self.sync_omnibox();
+                            self.sync_window_title();
+                            self.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            let page = self.active_page_mut();
+                            page.scroll_y = 0.0;
+                            page.scroll_by(0.0, 0.0);
+                            self.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            let max_y = self.active_page().js_env.dom.borrow().layout.content_height;
+                            let page = self.active_page_mut();
+                            page.scroll_y = max_y;
+                            page.scroll_by(0.0, 0.0);
+                            self.request_redraw();
+                            return;
+                        }
+                        _ => {}
+                    }
                     if let Key::Character(ref ch) = event.logical_key {
-                        match ch.to_ascii_lowercase().as_str() {
+                        let lower = ch.to_ascii_lowercase();
+                        match lower.as_str() {
+                            "q" => {
+                                event_loop.exit();
+                                return;
+                            }
                             "t" => {
                                 self.open_new_tab("peedle://newtab");
                                 self.chrome.omnibox_focused = true;
-                                self.request_redraw();
-                                return;
-                            }
-                            "w" => {
-                                let idx = self.active_tab;
-                                self.close_tab(idx);
-                                self.request_redraw();
-                                return;
-                            }
-                            "l" => {
-                                self.chrome.omnibox_focused = true;
-                                self.chrome.find_open = false;
-                                self.chrome.console_focused = false;
+                                self.chrome.omnibox_selected = false;
                                 self.chrome.omnibox_text.clear();
                                 self.request_redraw();
                                 return;
                             }
+                            "w" => {
+                                if self.tabs.len() <= 1 {
+                                    event_loop.exit();
+                                } else {
+                                    let idx = self.active_tab;
+                                    self.close_tab(idx);
+                                    self.request_redraw();
+                                }
+                                return;
+                            }
+                            "l" => {
+                                self.chrome.omnibox_focused = true;
+                                self.chrome.omnibox_selected = true;
+                                self.chrome.find_open = false;
+                                self.chrome.console_focused = false;
+                                self.request_redraw();
+                                return;
+                            }
+                            "a" => {
+                                if self.chrome.omnibox_focused {
+                                    self.chrome.omnibox_selected = true;
+                                    self.request_redraw();
+                                }
+                                return;
+                            }
+                            "c" => {
+                                let copied = if self.chrome.omnibox_focused {
+                                    self.chrome.omnibox_text.clone()
+                                } else if self.chrome.find_open {
+                                    self.chrome.find_query.clone()
+                                } else if self.chrome.console_focused {
+                                    self.chrome.console_input.clone()
+                                } else {
+                                    self.active_page().url.clone()
+                                };
+                                write_clipboard(&copied);
+                                return;
+                            }
+                            "x" => {
+                                if self.chrome.omnibox_focused {
+                                    write_clipboard(&self.chrome.omnibox_text);
+                                    self.chrome.omnibox_text.clear();
+                                    self.chrome.omnibox_selected = false;
+                                    self.request_redraw();
+                                } else if self.chrome.find_open {
+                                    write_clipboard(&self.chrome.find_query);
+                                    self.chrome.find_query.clear();
+                                    self.run_find(0);
+                                    self.request_redraw();
+                                } else if self.chrome.console_focused {
+                                    write_clipboard(&self.chrome.console_input);
+                                    self.chrome.console_input.clear();
+                                    self.request_redraw();
+                                }
+                                return;
+                            }
+                            "v" => {
+                                if let Some(clip) = read_clipboard() {
+                                    self.paste_text(&clip);
+                                    self.request_redraw();
+                                }
+                                return;
+                            }
                             "r" => {
+                                self.set_loading_title();
                                 let _ = self.active_page_mut().reload();
+                                self.sync_window_title();
                                 self.request_redraw();
                                 return;
                             }
@@ -530,17 +776,58 @@ impl ApplicationHandler for BrowserApp {
                                 self.request_redraw();
                                 return;
                             }
+                            "i" if alt => {
+                                self.chrome.devtools_open = !self.chrome.devtools_open;
+                                self.resize_all_tabs();
+                                self.request_redraw();
+                                return;
+                            }
+                            "[" | "{" => {
+                                if shift {
+                                    self.switch_tab_delta(-1);
+                                } else {
+                                    self.set_loading_title();
+                                    let _ = self.active_page_mut().go_back();
+                                    self.sync_omnibox();
+                                    self.sync_window_title();
+                                }
+                                self.request_redraw();
+                                return;
+                            }
+                            "]" | "}" => {
+                                if shift {
+                                    self.switch_tab_delta(1);
+                                } else {
+                                    self.set_loading_title();
+                                    let _ = self.active_page_mut().go_forward();
+                                    self.sync_omnibox();
+                                    self.sync_window_title();
+                                }
+                                self.request_redraw();
+                                return;
+                            }
                             "f" => {
-                                self.chrome.find_open = !self.chrome.find_open;
+                                self.chrome.find_open = true;
                                 self.chrome.omnibox_focused = false;
+                                self.chrome.omnibox_selected = false;
                                 self.chrome.console_focused = false;
                                 self.request_redraw();
                                 return;
                             }
-                            "h" => {
-                                let _ = self.active_page_mut().navigate("peedle://history");
-                                self.sync_omnibox();
-                                self.sync_window_title();
+                            "g" => {
+                                if self.chrome.find_open {
+                                    self.run_find(if shift { -1 } else { 1 });
+                                    self.request_redraw();
+                                }
+                                return;
+                            }
+                            "y" => {
+                                self.navigate_active("peedle://history");
+                                self.request_redraw();
+                                return;
+                            }
+                            "h" if !cfg!(target_os = "macos") => {
+                                self.navigate_active("peedle://history");
                                 self.request_redraw();
                                 return;
                             }
@@ -563,20 +850,25 @@ impl ApplicationHandler for BrowserApp {
                                 return;
                             }
                             "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
-                                if let Ok(n) = ch.parse::<usize>() {
-                                    let idx = n.saturating_sub(1);
+                                if let Ok(n) = lower.parse::<usize>() {
+                                    let idx = if n == 9 {
+                                        self.tabs.len().saturating_sub(1)
+                                    } else {
+                                        n.saturating_sub(1)
+                                    };
                                     if idx < self.tabs.len() {
                                         self.active_tab = idx;
                                         self.sync_omnibox();
                                         self.sync_window_title();
                                         self.request_redraw();
-                                        return;
                                     }
                                 }
+                                return;
                             }
-                            _ => {}
+                            _ => return,
                         }
                     }
+                    return;
                 }
 
                 if matches!(event.logical_key, Key::Named(NamedKey::F12)) {
@@ -586,7 +878,9 @@ impl ApplicationHandler for BrowserApp {
                     return;
                 }
                 if matches!(event.logical_key, Key::Named(NamedKey::F5)) {
+                    self.set_loading_title();
                     let _ = self.active_page_mut().reload();
+                    self.sync_window_title();
                     self.request_redraw();
                     return;
                 }
@@ -597,7 +891,7 @@ impl ApplicationHandler for BrowserApp {
                             self.chrome.find_open = false;
                         }
                         Key::Named(NamedKey::Enter) => {
-                            let step = if self.modifiers.shift_key() { -1 } else { 1 };
+                            let step = if shift { -1 } else { 1 };
                             self.run_find(step);
                         }
                         Key::Named(NamedKey::Backspace) => {
@@ -653,24 +947,39 @@ impl ApplicationHandler for BrowserApp {
                         Key::Named(NamedKey::Enter) => {
                             let target = self.chrome.omnibox_text.clone();
                             self.chrome.omnibox_focused = false;
-                            let _ = self.active_page_mut().navigate(&target);
-                            self.sync_omnibox();
-                            self.sync_window_title();
+                            self.chrome.omnibox_selected = false;
+                            self.navigate_active(&target);
                         }
                         Key::Named(NamedKey::Escape) => {
                             self.chrome.omnibox_focused = false;
+                            self.chrome.omnibox_selected = false;
                             self.sync_omnibox();
                         }
                         Key::Named(NamedKey::Backspace) => {
-                            self.chrome.omnibox_text.pop();
+                            if self.chrome.omnibox_selected {
+                                self.chrome.omnibox_text.clear();
+                                self.chrome.omnibox_selected = false;
+                            } else {
+                                self.chrome.omnibox_text.pop();
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::ArrowRight) => {
+                            self.chrome.omnibox_selected = false;
                         }
                         _ => {
                             if let Some(txt) = &event.text {
+                                let mut pushed = false;
                                 for c in txt.chars() {
                                     if !c.is_control() {
+                                        if self.chrome.omnibox_selected {
+                                            self.chrome.omnibox_text.clear();
+                                            self.chrome.omnibox_selected = false;
+                                        }
                                         self.chrome.omnibox_text.push(c);
+                                        pushed = true;
                                     }
                                 }
+                                let _ = pushed;
                             }
                         }
                     }
@@ -678,16 +987,37 @@ impl ApplicationHandler for BrowserApp {
                     return;
                 }
 
+                let page_input = self.active_page().has_focused_input();
                 match &event.logical_key {
-                    Key::Named(NamedKey::PageDown) => self.active_page_mut().scroll_by(0.0, 420.0),
-                    Key::Named(NamedKey::PageUp) => self.active_page_mut().scroll_by(0.0, -420.0),
+                    Key::Named(NamedKey::PageDown) => self.active_page_mut().scroll_by(0.0, 480.0),
+                    Key::Named(NamedKey::PageUp) => self.active_page_mut().scroll_by(0.0, -480.0),
+                    Key::Named(NamedKey::Home) if !page_input => {
+                        let page = self.active_page_mut();
+                        page.scroll_y = 0.0;
+                        page.scroll_by(0.0, 0.0);
+                    }
+                    Key::Named(NamedKey::End) if !page_input => {
+                        let max_y = self.active_page().js_env.dom.borrow().layout.content_height;
+                        let page = self.active_page_mut();
+                        page.scroll_y = max_y;
+                        page.scroll_by(0.0, 0.0);
+                    }
+                    Key::Named(NamedKey::Space) if !page_input => {
+                        let step = (content_viewport_height(self.logical_h(), &self.chrome) * 0.85)
+                            .max(200.0);
+                        self.active_page_mut()
+                            .scroll_by(0.0, if shift { -step } else { step });
+                    }
                     Key::Named(NamedKey::ArrowDown) => self.active_page_mut().scroll_by(0.0, 48.0),
                     Key::Named(NamedKey::ArrowUp) => self.active_page_mut().scroll_by(0.0, -48.0),
                     Key::Named(NamedKey::Backspace) => {
                         self.active_page_mut().on_text_input('\u{0008}');
                     }
                     Key::Named(NamedKey::Enter) => {
-                        self.active_page_mut().on_text_input('\n');
+                        if self.active_page_mut().on_text_input('\n') {
+                            self.sync_omnibox();
+                            self.sync_window_title();
+                        }
                     }
                     _ => {
                         if let Some(txt) = &event.text {
@@ -703,6 +1033,95 @@ impl ApplicationHandler for BrowserApp {
                 self.render();
             }
             _ => {}
+        }
+    }
+}
+
+fn read_clipboard() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("pbpaste").output().ok()?;
+        if out.status.success() {
+            return String::from_utf8(out.stdout).ok();
+        }
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let out = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-Clipboard -Raw",
+            ])
+            .creation_flags(0x08000000)
+            .output()
+            .ok()?;
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).to_string();
+            return Some(s.trim_end_matches(&['\r', '\n'][..]).to_string());
+        }
+        return None;
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        for (bin, args) in [
+            ("wl-paste", &["-n"][..]),
+            ("xclip", &["-selection", "clipboard", "-o"][..]),
+            ("xsel", &["--clipboard", "--output"][..]),
+        ] {
+            if let Ok(out) = Command::new(bin).args(args).output() {
+                if out.status.success() {
+                    if let Ok(s) = String::from_utf8(out.stdout) {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+fn write_clipboard(text: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        if let Ok(mut child) = Command::new("clip.exe")
+            .stdin(Stdio::piped())
+            .creation_flags(0x08000000)
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        for (bin, args) in [
+            ("wl-copy", &[][..]),
+            ("xclip", &["-selection", "clipboard"][..]),
+            ("xsel", &["--clipboard", "--input"][..]),
+        ] {
+            if let Ok(mut child) = Command::new(bin).args(args).stdin(Stdio::piped()).spawn() {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                if child.wait().map_or(false, |s| s.success()) {
+                    return;
+                }
+            }
         }
     }
 }

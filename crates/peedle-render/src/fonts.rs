@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fontdue::{Font, FontSettings, Metrics};
 
 use crate::framebuffer::{Framebuffer, RgbaColor};
+
+static SYSTEM_FONT_CACHE: OnceLock<FontSystem> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FontFaceKey {
@@ -35,6 +37,16 @@ impl Default for FontSystem {
 
 impl FontSystem {
     pub fn load_system_fonts() -> Self {
+        let base = SYSTEM_FONT_CACHE.get_or_init(Self::load_system_fonts_uncached);
+        Self {
+            faces: base.faces.clone(),
+            custom_names: Vec::new(),
+            fallback_keys: base.fallback_keys.clone(),
+            glyph_cache: Arc::clone(&base.glyph_cache),
+        }
+    }
+
+    fn load_system_fonts_uncached() -> Self {
         let mut faces = HashMap::new();
         let candidates: &[(FontFaceKey, &[&str])] = &[
             (
@@ -43,7 +55,10 @@ impl FontSystem {
                     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
                     "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial.ttf",
+                    "/System/Library/Fonts/SFNS.ttf",
                     "/System/Library/Fonts/Helvetica.ttc",
+                    "C:\\Windows\\Fonts\\segoeui.ttf",
                     "C:\\Windows\\Fonts\\arial.ttf",
                 ],
             ),
@@ -53,6 +68,10 @@ impl FontSystem {
                     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
                     "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                    "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
+                    "C:\\Windows\\Fonts\\segoeuib.ttf",
+                    "C:\\Windows\\Fonts\\arialbd.ttf",
                 ],
             ),
             (
@@ -61,6 +80,10 @@ impl FontSystem {
                     "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
                     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
                     "/usr/share/fonts/truetype/freefont/FreeSansOblique.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial Italic.ttf",
+                    "/System/Library/Fonts/Supplemental/Verdana Italic.ttf",
+                    "C:\\Windows\\Fonts\\segoeuii.ttf",
+                    "C:\\Windows\\Fonts\\ariali.ttf",
                 ],
             ),
             (
@@ -69,6 +92,10 @@ impl FontSystem {
                     "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
                     "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
+                    "/System/Library/Fonts/Supplemental/Georgia.ttf",
+                    "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+                    "C:\\Windows\\Fonts\\georgia.ttf",
+                    "C:\\Windows\\Fonts\\times.ttf",
                 ],
             ),
             (
@@ -77,6 +104,10 @@ impl FontSystem {
                     "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
                     "/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf",
+                    "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
+                    "/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf",
+                    "C:\\Windows\\Fonts\\georgiab.ttf",
+                    "C:\\Windows\\Fonts\\timesbd.ttf",
                 ],
             ),
             (
@@ -85,6 +116,11 @@ impl FontSystem {
                     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
                     "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+                    "/System/Library/Fonts/Monaco.ttf",
+                    "/System/Library/Fonts/Supplemental/Courier New.ttf",
+                    "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
+                    "C:\\Windows\\Fonts\\consola.ttf",
+                    "C:\\Windows\\Fonts\\cour.ttf",
                 ],
             ),
             (
@@ -92,6 +128,9 @@ impl FontSystem {
                 &[
                     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+                    "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
+                    "C:\\Windows\\Fonts\\consolab.ttf",
+                    "C:\\Windows\\Fonts\\courbd.ttf",
                 ],
             ),
         ];
@@ -114,6 +153,12 @@ impl FontSystem {
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/opentype/unifont/unifont.otf",
             "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/Apple Symbols.ttf",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "C:\\Windows\\Fonts\\seguisym.ttf",
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\msgothic.ttc",
         ];
         let mut fallback_keys = Vec::new();
         for &path in &fallback_paths {
@@ -164,6 +209,7 @@ impl FontSystem {
                 || low.contains("courier")
                 || low.contains("consolas")
                 || low.contains("menlo")
+                || low.contains("monaco")
                 || low.contains("fira code")
             {
                 return if bold && self.faces.contains_key(&FontFaceKey::MonoBold) {
@@ -189,6 +235,10 @@ impl FontSystem {
                 || low.contains("inter")
                 || low.contains("roboto")
                 || low.contains("system-ui")
+                || low.contains("-apple-system")
+                || low.contains("blinkmacsystemfont")
+                || low.contains("sf pro")
+                || low.contains("avenir")
                 || low.contains("segoe")
             {
                 if bold && self.faces.contains_key(&FontFaceKey::SansBold) {
