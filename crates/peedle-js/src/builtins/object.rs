@@ -22,7 +22,7 @@ pub fn init(rt: &mut JsRuntime) {
         0,
         Rc::new(|rt, this, _| {
             let oid = rt.to_object(&this)?;
-            let to_str = rt.get_property(oid, "toString")?;
+            let to_str = rt.get_property_key_receiver(oid, &PropertyKey::from("toString"), this.clone())?;
             rt.call_function(to_str, this, &[])
         }),
     );
@@ -764,37 +764,31 @@ pub fn object_to_string(rt: &mut JsRuntime, val: &JsValue) -> Result<String, JsE
         _ => {}
     }
     let oid = rt.to_object(val)?;
-    let builtin_tag = match &rt.heap.get_obj(oid).kind {
-        ObjectKind::Array(_) => "Array",
-        ObjectKind::Arguments(_) => "Arguments",
-        ObjectKind::Function(_) | ObjectKind::NativeFunction(_) => "Function",
-        ObjectKind::Error(_) => "Error",
-        ObjectKind::BooleanObj(_) => "Boolean",
-        ObjectKind::NumberObj(_) => "Number",
-        ObjectKind::StringObj(_) => "String",
-        ObjectKind::Date(_) => "Date",
-        ObjectKind::RegExp(_) => "RegExp",
-        ObjectKind::Map(_) => "Map",
-        ObjectKind::Set(_) => "Set",
-        ObjectKind::WeakMap(_) => "WeakMap",
-        ObjectKind::WeakSet(_) => "WeakSet",
-        ObjectKind::WeakRef(_) => "WeakRef",
-        ObjectKind::FinalizationRegistry(_) => "FinalizationRegistry",
-        ObjectKind::Promise(_) => "Promise",
-        ObjectKind::ArrayBuffer(_) => "ArrayBuffer",
-        ObjectKind::DataView(_) => "DataView",
-        ObjectKind::TypedArray(ta) => ta.kind.name(),
-        ObjectKind::Proxy(p) => {
-            if !p.revoked && rt.is_callable(&JsValue::Object(p.target)) {
-                "Function"
-            } else {
-                "Object"
+    let is_arr = crate::builtins::array::is_array_val_checked(rt, &JsValue::Object(oid))?;
+    let builtin_tag = if is_arr {
+        "Array"
+    } else {
+        match &rt.heap.get_obj(oid).kind {
+            ObjectKind::Arguments(_) => "Arguments",
+            ObjectKind::Function(_) | ObjectKind::NativeFunction(_) => "Function",
+            ObjectKind::Error(_) => "Error",
+            ObjectKind::BooleanObj(_) => "Boolean",
+            ObjectKind::NumberObj(_) => "Number",
+            ObjectKind::StringObj(_) => "String",
+            ObjectKind::Date(_) => "Date",
+            ObjectKind::RegExp(_) => "RegExp",
+            ObjectKind::Proxy(p) => {
+                if !p.revoked && rt.is_callable(&JsValue::Object(p.target)) {
+                    "Function"
+                } else {
+                    "Object"
+                }
             }
+            _ => "Object",
         }
-        _ => "Object",
     };
     let tag_key = PropertyKey::Symbol(rt.symbols.to_string_tag);
-    if let Ok(JsValue::String(tag)) = rt.get_property_key(oid, &tag_key) {
+    if let JsValue::String(tag) = rt.get_property_key(oid, &tag_key)? {
         return Ok(format!("[object {}]", tag));
     }
     Ok(format!("[object {}]", builtin_tag))

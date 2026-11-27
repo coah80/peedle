@@ -178,6 +178,49 @@ pub fn init(rt: &mut JsRuntime) {
     );
     rt.heap.get_obj_mut(agg_ctor).prototype = Some(err_ctor);
     set_global(rt, "AggregateError", JsValue::Object(agg_ctor));
+
+    let sup_proto = rt.intrinsics.suppressed_error_proto;
+    rt.heap.get_obj_mut(sup_proto).set_own_prop(
+        PropertyKey::from("name"),
+        PropEntry::data(JsValue::String("SuppressedError".into()), true, false, true),
+    );
+    rt.heap.get_obj_mut(sup_proto).set_own_prop(
+        PropertyKey::from("message"),
+        PropEntry::data(JsValue::String(String::new()), true, false, true),
+    );
+    let sup_ctor = rt.create_spec_constructor(
+        "SuppressedError",
+        3,
+        sup_proto,
+        Rc::new(move |rt, _, args| {
+            let obj_proto = rt.get_prototype_from_new_target(sup_proto)?;
+            let has_msg = !matches!(args.get(2), None | Some(JsValue::Undefined));
+            let msg = if has_msg {
+                rt.to_string(&args[2])?
+            } else {
+                String::new()
+            };
+            let err_obj = rt.create_error_object_with_proto(
+                ErrorKind::SuppressedError,
+                &msg,
+                has_msg,
+                obj_proto,
+            );
+            let error_val = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let suppressed_val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            rt.heap.get_obj_mut(err_obj).set_own_prop(
+                PropertyKey::from("error"),
+                PropEntry::data(error_val, true, false, true),
+            );
+            rt.heap.get_obj_mut(err_obj).set_own_prop(
+                PropertyKey::from("suppressed"),
+                PropEntry::data(suppressed_val, true, false, true),
+            );
+            Ok(JsValue::Object(err_obj))
+        }),
+    );
+    rt.heap.get_obj_mut(sup_ctor).prototype = Some(err_ctor);
+    set_global(rt, "SuppressedError", JsValue::Object(sup_ctor));
 }
 
 fn make_error_ctor(

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 pub type ModuleLoader = Box<dyn Fn(&str) -> Result<String, JsError>>;
+pub type ModuleBytesLoader = Box<dyn Fn(&str) -> Result<Vec<u8>, JsError>>;
 
 #[derive(Clone, Copy)]
 pub struct WellKnownSymbols {
@@ -49,6 +50,9 @@ pub struct Intrinsics {
     pub uri_error_proto: ObjectId,
     pub eval_error_proto: ObjectId,
     pub aggregate_error_proto: ObjectId,
+    pub suppressed_error_proto: ObjectId,
+    pub disposable_stack_proto: ObjectId,
+    pub async_disposable_stack_proto: ObjectId,
     pub map_proto: ObjectId,
     pub set_proto: ObjectId,
     pub weak_map_proto: ObjectId,
@@ -107,6 +111,35 @@ pub enum Microtask {
     Native(Box<dyn FnOnce(&mut JsRuntime)>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ModuleEvalState {
+    Linking,
+    Linked,
+    Evaluating,
+    Evaluated,
+}
+
+#[derive(Clone)]
+pub struct ModuleDep {
+    pub key: String,
+    pub is_deferred: bool,
+}
+
+#[derive(Clone)]
+pub struct ModuleRecord {
+    pub key: String,
+    pub path: String,
+    pub env: EnvId,
+    pub ns: ObjectId,
+    pub deferred_ns: Option<ObjectId>,
+    pub chunk: Option<Rc<Chunk>>,
+    pub deps: Vec<ModuleDep>,
+    pub eval_state: ModuleEvalState,
+    pub eval_promise: Option<ObjectId>,
+    pub eval_error: Option<JsValue>,
+    pub has_tla: bool,
+}
+
 pub struct JsRuntime {
     pub heap: Heap,
     pub global_object: ObjectId,
@@ -119,8 +152,15 @@ pub struct JsRuntime {
     pub console_lines: Vec<String>,
     pub active_frames: Vec<EnvId>,
     pub module_cache: HashMap<String, ObjectId>,
+    pub module_records: HashMap<String, ModuleRecord>,
+    pub current_module_stack: Vec<String>,
+    pub module_link_depth: usize,
+    pub pending_link_stars: Vec<(ObjectId, Vec<ObjectId>)>,
+    pub pending_link_checks: Vec<(ObjectId, String)>,
+    pub pending_link_keys: Vec<String>,
     pub current_module_exports: Vec<ObjectId>,
     pub module_loader: Option<ModuleLoader>,
+    pub module_bytes_loader: Option<ModuleBytesLoader>,
     pub call_depth: usize,
     pub max_call_depth: usize,
     pub max_steps: Option<usize>,
@@ -178,6 +218,12 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
         heap.alloc_object(JsObject::new(Some(error_proto), ObjectKind::Ordinary));
     let aggregate_error_proto =
         heap.alloc_object(JsObject::new(Some(error_proto), ObjectKind::Ordinary));
+    let suppressed_error_proto =
+        heap.alloc_object(JsObject::new(Some(error_proto), ObjectKind::Ordinary));
+    let disposable_stack_proto =
+        heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
+    let async_disposable_stack_proto =
+        heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
     let map_proto = heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
     let set_proto = heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
     let weak_map_proto =
@@ -281,6 +327,9 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
         uri_error_proto,
         eval_error_proto,
         aggregate_error_proto,
+        suppressed_error_proto,
+        disposable_stack_proto,
+        async_disposable_stack_proto,
         map_proto,
         set_proto,
         weak_map_proto,
@@ -366,8 +415,15 @@ impl JsRuntime {
             console_lines: Vec::new(),
             active_frames: Vec::new(),
             module_cache: HashMap::new(),
+            module_records: HashMap::new(),
+            current_module_stack: Vec::new(),
+            module_link_depth: 0,
+            pending_link_stars: Vec::new(),
+            pending_link_checks: Vec::new(),
+            pending_link_keys: Vec::new(),
             current_module_exports: Vec::new(),
             module_loader: None,
+            module_bytes_loader: None,
             call_depth: 0,
             max_call_depth: 256,
             max_steps: None,
@@ -494,6 +550,9 @@ impl JsRuntime {
         if default_proto == cur.uri_error_proto { return tgt.uri_error_proto; }
         if default_proto == cur.eval_error_proto { return tgt.eval_error_proto; }
         if default_proto == cur.aggregate_error_proto { return tgt.aggregate_error_proto; }
+        if default_proto == cur.suppressed_error_proto { return tgt.suppressed_error_proto; }
+        if default_proto == cur.disposable_stack_proto { return tgt.disposable_stack_proto; }
+        if default_proto == cur.async_disposable_stack_proto { return tgt.async_disposable_stack_proto; }
         if default_proto == cur.map_proto { return tgt.map_proto; }
         if default_proto == cur.set_proto { return tgt.set_proto; }
         if default_proto == cur.weak_map_proto { return tgt.weak_map_proto; }
@@ -530,6 +589,13 @@ impl JsRuntime {
         F: Fn(&str) -> Result<String, JsError> + 'static,
     {
         self.module_loader = Some(Box::new(loader));
+    }
+
+    pub fn set_module_bytes_loader<F>(&mut self, loader: F)
+    where
+        F: Fn(&str) -> Result<Vec<u8>, JsError> + 'static,
+    {
+        self.module_bytes_loader = Some(Box::new(loader));
     }
 
     pub fn global_object(&self) -> ObjectId {
@@ -742,8 +808,23 @@ impl JsRuntime {
     }
 
     pub fn eval_module(&mut self, specifier: &str, src: &str) -> Result<JsValue, JsError> {
-        let ns = self.eval_module_namespace(specifier, src)?;
+        let key = normalize_module_path(specifier);
+        let ns = self.link_module_from_source(&key, &key, src, &[])?;
+        let eval_p = self.evaluate_module(&key)?;
         self.drain_microtasks();
+        if let Some(p) = eval_p {
+            let state = match &self.heap.get_obj(p).kind {
+                ObjectKind::Promise(pd) => pd.state.clone(),
+                _ => PromiseState::Fulfilled(JsValue::Undefined),
+            };
+            if let PromiseState::Rejected(err) = state {
+                return Err(JsError::Thrown(err));
+            }
+        } else if let Some(rec) = self.module_records.get(&key) {
+            if let Some(ref err) = rec.eval_error {
+                return Err(JsError::Thrown(err.clone()));
+            }
+        }
         Ok(JsValue::Object(ns))
     }
 
@@ -752,41 +833,1169 @@ impl JsRuntime {
         specifier: &str,
         src: &str,
     ) -> Result<ObjectId, JsError> {
-        if let Some(&cached) = self.module_cache.get(specifier) {
-            return Ok(cached);
+        let key = normalize_module_path(specifier);
+        let ns = self.link_module_from_source(&key, &key, src, &[])?;
+        let eval_p = self.evaluate_module(&key)?;
+        self.drain_microtasks();
+        if let Some(p) = eval_p {
+            let state = match &self.heap.get_obj(p).kind {
+                ObjectKind::Promise(pd) => pd.state.clone(),
+                _ => PromiseState::Fulfilled(JsValue::Undefined),
+            };
+            if let PromiseState::Rejected(err) = state {
+                return Err(JsError::Thrown(err));
+            }
         }
-        let program = Parser::parse_module(src)?;
-        let chunk = Compiler::compile_program(&program)?;
-        let ns = self.heap.alloc_object(JsObject::new(
-            None,
-            ObjectKind::ModuleNamespace(ModuleNamespaceData {
-                exports: Vec::new(),
-            }),
-        ));
-        self.module_cache.insert(specifier.to_string(), ns);
-        let mut mod_env = EnvRecord::new(Some(self.global_env), true, true);
-        mod_env.this_binding = Some(JsValue::Undefined);
-        let env_id = self.heap.alloc_env(mod_env);
-        self.current_module_exports.push(ns);
-        let res = self.exec_script_chunk(chunk, env_id, true);
-        self.current_module_exports.pop();
-        res?;
         Ok(ns)
     }
 
     pub fn load_module(&mut self, specifier: &str) -> Result<ObjectId, JsError> {
-        if let Some(&cached) = self.module_cache.get(specifier) {
-            return Ok(cached);
+        let (ns, eval_p) = self.load_module_async(specifier, &[])?;
+        if let Some(p) = eval_p {
+            self.drain_microtasks();
+            let state = match &self.heap.get_obj(p).kind {
+                ObjectKind::Promise(pd) => pd.state.clone(),
+                _ => PromiseState::Fulfilled(JsValue::Undefined),
+            };
+            if let PromiseState::Rejected(err) = state {
+                return Err(JsError::Thrown(err));
+            }
+        }
+        Ok(ns)
+    }
+
+    pub fn load_module_async(
+        &mut self,
+        specifier: &str,
+        attrs: &[(String, String)],
+    ) -> Result<(ObjectId, Option<ObjectId>), JsError> {
+        let (key, path) = self.resolve_module_key_and_path(specifier, attrs);
+        let ns = self.link_module_by_key(&key, &path, attrs)?;
+        let eval_p = self.evaluate_module(&key)?;
+        Ok((ns, eval_p))
+    }
+
+    pub fn load_module_deferred(
+        &mut self,
+        specifier: &str,
+        attrs: &[(String, String)],
+    ) -> Result<ObjectId, JsError> {
+        let (key, path) = self.resolve_module_key_and_path(specifier, attrs);
+        self.link_module_by_key(&key, &path, attrs)?;
+        Ok(self.get_or_create_deferred_ns(&key))
+    }
+
+    fn resolve_module_key_and_path(
+        &self,
+        specifier: &str,
+        attrs: &[(String, String)],
+    ) -> (String, String) {
+        let resolved = if specifier.starts_with('/') {
+            normalize_module_path(specifier)
+        } else if let Some(referrer) = self.current_module_stack.last() {
+            if let Some(parent) = std::path::Path::new(referrer).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let joined = parent.join(specifier);
+                    normalize_module_path(&joined.to_string_lossy())
+                } else {
+                    specifier.to_string()
+                }
+            } else {
+                specifier.to_string()
+            }
+        } else {
+            specifier.to_string()
+        };
+        let mut key = resolved.clone();
+        if let Some((_, ty)) = attrs.iter().find(|(k, _)| k == "type") {
+            key.push_str("\0type=");
+            key.push_str(ty);
+        }
+        (key, resolved)
+    }
+
+    fn alloc_module_namespace(&mut self, is_deferred: bool, module_key: Option<String>) -> ObjectId {
+        let mut obj = JsObject::new(
+            None,
+            ObjectKind::ModuleNamespace(ModuleNamespaceData {
+                exports: Vec::new(),
+                is_deferred,
+                module_key,
+            }),
+        );
+        obj.extensible = false;
+        let tag = self.symbols.to_string_tag;
+        let tag_str = if is_deferred {
+            "Deferred Module"
+        } else {
+            "Module"
+        };
+        obj.set_own_prop(
+            PropertyKey::Symbol(tag),
+            PropEntry::data(JsValue::String(tag_str.into()), false, false, false),
+        );
+        self.heap.alloc_object(obj)
+    }
+
+    fn get_or_create_deferred_ns(&mut self, key: &str) -> ObjectId {
+        if let Some(rec) = self.module_records.get(key) {
+            if let Some(dns) = rec.deferred_ns {
+                return dns;
+            }
+            let exports = match &self.heap.get_obj(rec.ns).kind {
+                ObjectKind::ModuleNamespace(m) => m.exports.clone(),
+                _ => Vec::new(),
+            };
+            let dns = self.alloc_module_namespace(true, Some(key.to_string()));
+            if let ObjectKind::ModuleNamespace(ref mut m) = self.heap.get_obj_mut(dns).kind {
+                m.exports = exports;
+            }
+            if let Some(rec_mut) = self.module_records.get_mut(key) {
+                rec_mut.deferred_ns = Some(dns);
+            }
+            return dns;
+        }
+        self.alloc_module_namespace(true, Some(key.to_string()))
+    }
+
+    fn link_module_by_key(
+        &mut self,
+        key: &str,
+        path: &str,
+        attrs: &[(String, String)],
+    ) -> Result<ObjectId, JsError> {
+        if let Some(rec) = self.module_records.get(key) {
+            return Ok(rec.ns);
+        }
+        if attrs.iter().any(|(k, v)| k == "type" && v == "bytes") {
+            let bytes = if let Some(ref bl) = self.module_bytes_loader {
+                bl(path)?
+            } else if let Some(ref loader) = self.module_loader {
+                loader(path)?.into_bytes()
+            } else {
+                return Err(JsError::error(format!(
+                    "Cannot load module '{}': no module loader configured",
+                    path
+                )));
+            };
+            let len = bytes.len();
+            let buf = self.heap.alloc_object(JsObject::new(
+                Some(self.intrinsics.array_buffer_proto),
+                ObjectKind::ArrayBuffer(ArrayBufferData {
+                    bytes,
+                    detached: false,
+                }),
+            ));
+            self.heap.buffer_meta.insert(
+                buf,
+                BufferMeta {
+                    max_byte_length: None,
+                    is_shared: false,
+                    immutable: true,
+                },
+            );
+            let ta_proto = self.intrinsics.typed_array_protos[1];
+            let ta = self.heap.alloc_object(JsObject::new(
+                Some(ta_proto),
+                ObjectKind::TypedArray(TypedArrayData {
+                    kind: TypedArrayKind::Uint8,
+                    buffer: buf,
+                    byte_offset: 0,
+                    length: len,
+                }),
+            ));
+            let ns = self.alloc_module_namespace(false, Some(key.to_string()));
+            if let ObjectKind::ModuleNamespace(ref mut m) = self.heap.get_obj_mut(ns).kind {
+                m.exports
+                    .push(("default".to_string(), ExportTarget::Value(JsValue::Object(ta))));
+            }
+            let mod_env = self
+                .heap
+                .alloc_env(EnvRecord::new(Some(self.global_env), true, true));
+            self.module_cache.insert(key.to_string(), ns);
+            self.module_records.insert(
+                key.to_string(),
+                ModuleRecord {
+                    key: key.to_string(),
+                    path: path.to_string(),
+                    env: mod_env,
+                    ns,
+                    deferred_ns: None,
+                    chunk: None,
+                    deps: Vec::new(),
+                    eval_state: ModuleEvalState::Evaluated,
+                    eval_promise: None,
+                    eval_error: None,
+                    has_tla: false,
+                },
+            );
+            return Ok(ns);
         }
         let src = if let Some(ref loader) = self.module_loader {
-            loader(specifier)?
+            loader(path)?
         } else {
             return Err(JsError::error(format!(
                 "Cannot load module '{}': no module loader configured",
-                specifier
+                path
             )));
         };
-        self.eval_module_namespace(specifier, &src)
+        self.link_module_from_source(key, path, &src, attrs)
+    }
+
+    fn link_module_from_source(
+        &mut self,
+        key: &str,
+        path: &str,
+        src: &str,
+        attrs: &[(String, String)],
+    ) -> Result<ObjectId, JsError> {
+        if let Some(rec) = self.module_records.get(key) {
+            return Ok(rec.ns);
+        }
+        if let Some((_, ty)) = attrs.iter().find(|(k, _)| k == "type") {
+            let val = match ty.as_str() {
+                "json" => crate::builtins::json::parse_json_str(self, src)?,
+                "text" => JsValue::String(src.to_string()),
+                "bytes" => {
+                    let bytes = src.as_bytes().to_vec();
+                    let len = bytes.len();
+                    let buf = self.heap.alloc_object(JsObject::new(
+                        Some(self.intrinsics.array_buffer_proto),
+                        ObjectKind::ArrayBuffer(ArrayBufferData {
+                            bytes,
+                            detached: false,
+                        }),
+                    ));
+                    self.heap.buffer_meta.insert(
+                        buf,
+                        BufferMeta {
+                            max_byte_length: None,
+                            is_shared: false,
+                            immutable: true,
+                        },
+                    );
+                    let ta_proto = self.intrinsics.typed_array_protos[1];
+                    let ta = self.heap.alloc_object(JsObject::new(
+                        Some(ta_proto),
+                        ObjectKind::TypedArray(TypedArrayData {
+                            kind: TypedArrayKind::Uint8,
+                            buffer: buf,
+                            byte_offset: 0,
+                            length: len,
+                        }),
+                    ));
+                    JsValue::Object(ta)
+                }
+                other => {
+                    return Err(JsError::type_err(format!(
+                        "Unsupported import attribute type '{}'",
+                        other
+                    )));
+                }
+            };
+            let ns = self.alloc_module_namespace(false, Some(key.to_string()));
+            if let ObjectKind::ModuleNamespace(ref mut m) = self.heap.get_obj_mut(ns).kind {
+                m.exports.push(("default".to_string(), ExportTarget::Value(val)));
+            }
+            let mod_env = self
+                .heap
+                .alloc_env(EnvRecord::new(Some(self.global_env), true, true));
+            self.module_cache.insert(key.to_string(), ns);
+            self.module_records.insert(
+                key.to_string(),
+                ModuleRecord {
+                    key: key.to_string(),
+                    path: path.to_string(),
+                    env: mod_env,
+                    ns,
+                    deferred_ns: None,
+                    chunk: None,
+                    deps: Vec::new(),
+                    eval_state: ModuleEvalState::Evaluated,
+                    eval_promise: None,
+                    eval_error: None,
+                    has_tla: false,
+                },
+            );
+            return Ok(ns);
+        }
+
+        let program = Parser::parse_module(src)?;
+        let chunk = Compiler::compile_program(&program)?;
+        let has_tla = chunk.ops.iter().any(|op| matches!(op, crate::bytecode::Op::Await));
+
+        let mut mod_env_rec = EnvRecord::new(Some(self.global_env), true, true);
+        mod_env_rec.this_binding = Some(JsValue::Undefined);
+        let mod_env = self.heap.alloc_env(mod_env_rec);
+        let meta_obj = self.create_object_with_proto(None);
+        self.heap.get_env_mut(mod_env).bindings.insert(
+            "\0__import_meta".to_string(),
+            Binding {
+                value: JsValue::Object(meta_obj),
+                mutable: false,
+                initialized: true,
+                deletable: false,
+                strict_immutable: true,
+            },
+        );
+        self.heap.get_env_mut(mod_env).bindings.insert(
+            "\0__module_path".to_string(),
+            Binding {
+                value: JsValue::String(path.to_string()),
+                mutable: false,
+                initialized: true,
+                deletable: false,
+                strict_immutable: true,
+            },
+        );
+
+        let ns = self.alloc_module_namespace(false, Some(key.to_string()));
+        self.module_cache.insert(key.to_string(), ns);
+        self.module_records.insert(
+            key.to_string(),
+            ModuleRecord {
+                key: key.to_string(),
+                path: path.to_string(),
+                env: mod_env,
+                ns,
+                deferred_ns: None,
+                chunk: Some(chunk.clone()),
+                deps: Vec::new(),
+                eval_state: ModuleEvalState::Linking,
+                eval_promise: None,
+                eval_error: None,
+                has_tla,
+            },
+        );
+
+        self.module_link_depth += 1;
+        self.pending_link_keys.push(key.to_string());
+
+        let link_res: Result<(), JsError> = (|| {
+            self.hoist_into_env(&chunk, mod_env, true)?;
+
+            let mut local_exports: Vec<(String, ExportTarget)> = Vec::new();
+            for stmt in &program.body {
+                if let crate::ast::Stmt::Export(exp) = stmt {
+                    match exp {
+                        crate::ast::ExportDecl::DefaultExpr(_) => {
+                            local_exports.push((
+                                "default".to_string(),
+                                ExportTarget::Local {
+                                    env: mod_env,
+                                    name: "\0__default".to_string(),
+                                },
+                            ));
+                        }
+                        crate::ast::ExportDecl::DefaultFunc(f) => {
+                            let local_name = f
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| "\0__default".to_string());
+                            local_exports.push((
+                                "default".to_string(),
+                                ExportTarget::Local {
+                                    env: mod_env,
+                                    name: local_name,
+                                },
+                            ));
+                        }
+                        crate::ast::ExportDecl::DefaultClass(c) => {
+                            let local_name = c
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| "\0__default".to_string());
+                            local_exports.push((
+                                "default".to_string(),
+                                ExportTarget::Local {
+                                    env: mod_env,
+                                    name: local_name,
+                                },
+                            ));
+                        }
+                        crate::ast::ExportDecl::Decl(inner) => {
+                            let mut names = Vec::new();
+                            match inner.as_ref() {
+                                crate::ast::Stmt::VarDecl { decls, .. } => {
+                                    for d in decls {
+                                        crate::compiler::collect_pattern_names(
+                                            &d.pattern, &mut names, false,
+                                        );
+                                    }
+                                }
+                                crate::ast::Stmt::FuncDecl(f) => {
+                                    if let Some(ref n) = f.name {
+                                        names.push((n.clone(), false));
+                                    }
+                                }
+                                crate::ast::Stmt::ClassDecl(c) => {
+                                    if let Some(ref n) = c.name {
+                                        names.push((n.clone(), false));
+                                    }
+                                }
+                                _ => {}
+                            }
+                            for (n, _) in names {
+                                local_exports.push((
+                                    n.clone(),
+                                    ExportTarget::Local {
+                                        env: mod_env,
+                                        name: n,
+                                    },
+                                ));
+                            }
+                        }
+                        crate::ast::ExportDecl::Named {
+                            specifiers,
+                            source: None,
+                            ..
+                        } => {
+                            for sp in specifiers {
+                                local_exports.push((
+                                    sp.exported.clone(),
+                                    ExportTarget::Local {
+                                        env: mod_env,
+                                        name: sp.local.clone(),
+                                    },
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let ObjectKind::ModuleNamespace(ref mut m) = self.heap.get_obj_mut(ns).kind {
+                m.exports = local_exports;
+            }
+
+            let mut deps: Vec<ModuleDep> = Vec::new();
+            let mut extra_exports: Vec<(String, ExportTarget)> = Vec::new();
+            let mut star_sources: Vec<ObjectId> = Vec::new();
+            let mut import_wires: Vec<(String, ObjectId, Option<String>, bool, String)> = Vec::new();
+
+            self.current_module_stack.push(path.to_string());
+            let body_res: Result<(), JsError> = (|| {
+                for stmt in &program.body {
+                    match stmt {
+                        crate::ast::Stmt::Import(imp) => {
+                            if imp.phase == crate::ast::ImportPhase::Source {
+                                return Err(JsError::syntax(
+                                    "Source phase import is not supported for source text modules",
+                                ));
+                            }
+                            let (dep_key, dep_path) =
+                                self.resolve_module_key_and_path(&imp.source, &imp.attributes);
+                            let dep_ns =
+                                self.link_module_by_key(&dep_key, &dep_path, &imp.attributes)?;
+                            let is_def = imp.phase == crate::ast::ImportPhase::Defer;
+                            deps.push(ModuleDep {
+                                key: dep_key.clone(),
+                                is_deferred: is_def,
+                            });
+                            for sp in &imp.specifiers {
+                                match sp {
+                                    crate::ast::ImportSpecifier::Default(local) => {
+                                        self.pending_link_checks
+                                            .push((dep_ns, "default".to_string()));
+                                        import_wires.push((
+                                            local.clone(),
+                                            dep_ns,
+                                            Some("default".to_string()),
+                                            false,
+                                            dep_key.clone(),
+                                        ));
+                                    }
+                                    crate::ast::ImportSpecifier::Named { imported, local } => {
+                                        self.pending_link_checks.push((dep_ns, imported.clone()));
+                                        import_wires.push((
+                                            local.clone(),
+                                            dep_ns,
+                                            Some(imported.clone()),
+                                            false,
+                                            dep_key.clone(),
+                                        ));
+                                    }
+                                    crate::ast::ImportSpecifier::Namespace(local) => {
+                                        import_wires.push((
+                                            local.clone(),
+                                            dep_ns,
+                                            None,
+                                            is_def,
+                                            dep_key.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        crate::ast::Stmt::Export(exp) => match exp {
+                            crate::ast::ExportDecl::Named {
+                                specifiers,
+                                source: Some(ref src_spec),
+                                attributes,
+                            } => {
+                                let (dep_key, dep_path) =
+                                    self.resolve_module_key_and_path(src_spec, attributes);
+                                let dep_ns =
+                                    self.link_module_by_key(&dep_key, &dep_path, attributes)?;
+                                deps.push(ModuleDep {
+                                    key: dep_key,
+                                    is_deferred: false,
+                                });
+                                for sp in specifiers {
+                                    self.pending_link_checks.push((dep_ns, sp.local.clone()));
+                                    extra_exports.push((
+                                        sp.exported.clone(),
+                                        ExportTarget::Indirect {
+                                            ns: dep_ns,
+                                            export_name: sp.local.clone(),
+                                        },
+                                    ));
+                                }
+                            }
+                            crate::ast::ExportDecl::All {
+                                exported,
+                                source,
+                                attributes,
+                            } => {
+                                let (dep_key, dep_path) =
+                                    self.resolve_module_key_and_path(source, attributes);
+                                let dep_ns =
+                                    self.link_module_by_key(&dep_key, &dep_path, attributes)?;
+                                deps.push(ModuleDep {
+                                    key: dep_key,
+                                    is_deferred: false,
+                                });
+                                if let Some(ref name) = exported {
+                                    extra_exports.push((
+                                        name.clone(),
+                                        ExportTarget::Value(JsValue::Object(dep_ns)),
+                                    ));
+                                } else {
+                                    star_sources.push(dep_ns);
+                                }
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+                Ok(())
+            })();
+            self.current_module_stack.pop();
+            body_res?;
+
+            for (local, dep_ns, maybe_imp, is_def, dep_key) in import_wires {
+                if let Some(imp_name) = maybe_imp {
+                    self.heap
+                        .get_env_mut(mod_env)
+                        .import_bindings
+                        .insert(local, (dep_ns, imp_name));
+                } else {
+                    let target_ns = if is_def {
+                        self.get_or_create_deferred_ns(&dep_key)
+                    } else {
+                        dep_ns
+                    };
+                    self.heap.get_env_mut(mod_env).bindings.insert(
+                        local,
+                        Binding {
+                            value: JsValue::Object(target_ns),
+                            mutable: false,
+                            initialized: true,
+                            deletable: false,
+                            strict_immutable: true,
+                        },
+                    );
+                }
+            }
+
+            if !extra_exports.is_empty() {
+                if let ObjectKind::ModuleNamespace(ref mut m) = self.heap.get_obj_mut(ns).kind {
+                    m.exports.extend(extra_exports);
+                }
+            }
+            if !star_sources.is_empty() {
+                self.pending_link_stars.push((ns, star_sources));
+            }
+            if let Some(rec) = self.module_records.get_mut(key) {
+                rec.deps = deps;
+                rec.eval_state = ModuleEvalState::Linked;
+            }
+            Ok(())
+        })();
+
+        self.module_link_depth -= 1;
+
+        if let Err(e) = link_res {
+            if self.module_link_depth == 0 {
+                let keys = std::mem::take(&mut self.pending_link_keys);
+                self.pending_link_stars.clear();
+                self.pending_link_checks.clear();
+                for k in keys {
+                    self.module_records.remove(&k);
+                    self.module_cache.remove(&k);
+                }
+            }
+            return Err(e);
+        }
+
+        if self.module_link_depth == 0 {
+            let stars = std::mem::take(&mut self.pending_link_stars);
+            let checks = std::mem::take(&mut self.pending_link_checks);
+            let keys = std::mem::take(&mut self.pending_link_keys);
+
+            let rounds = stars.len().max(1);
+            for _ in 0..rounds {
+                for (target_ns, star_sources) in &stars {
+                    let direct_names: std::collections::HashSet<String> =
+                        match &self.heap.get_obj(*target_ns).kind {
+                            ObjectKind::ModuleNamespace(m) => {
+                                m.exports.iter().map(|(k, _)| k.clone()).collect()
+                            }
+                            _ => std::collections::HashSet::new(),
+                        };
+                    let mut star_map: HashMap<String, ExportTarget> = HashMap::new();
+                    for src_ns in star_sources {
+                        let mut collected = Vec::new();
+                        let mut vis = std::collections::HashSet::new();
+                        vis.insert(*target_ns);
+                        self.collect_star_exports(*src_ns, &mut vis, &mut collected);
+                        for (name, target) in collected {
+                            if name == "default" || direct_names.contains(&name) {
+                                continue;
+                            }
+                            if let Some(prev) = star_map.get(&name) {
+                                if !self.same_export_target(prev, &target) {
+                                    star_map.insert(name, ExportTarget::Ambiguous);
+                                }
+                            } else {
+                                star_map.insert(name, target);
+                            }
+                        }
+                    }
+                    if let ObjectKind::ModuleNamespace(ref mut m) =
+                        self.heap.get_obj_mut(*target_ns).kind
+                    {
+                        for (name, target) in star_map {
+                            if let Some(existing) = m.exports.iter_mut().find(|(k, _)| k == &name) {
+                                existing.1 = target;
+                            } else {
+                                m.exports.push((name, target));
+                            }
+                        }
+                    }
+                }
+            }
+
+            for k in &keys {
+                if let Some(rec) = self.module_records.get(k).cloned() {
+                    if let ObjectKind::ModuleNamespace(ref mut m) =
+                        self.heap.get_obj_mut(rec.ns).kind
+                    {
+                        m.exports
+                            .sort_by(|a, b| a.0.encode_utf16().cmp(b.0.encode_utf16()));
+                    }
+                    if let Some(dns) = rec.deferred_ns {
+                        let exps = match &self.heap.get_obj(rec.ns).kind {
+                            ObjectKind::ModuleNamespace(m) => m.exports.clone(),
+                            _ => Vec::new(),
+                        };
+                        if let ObjectKind::ModuleNamespace(ref mut dm) =
+                            self.heap.get_obj_mut(dns).kind
+                        {
+                            dm.exports = exps;
+                        }
+                    }
+                }
+            }
+
+            for (dep_ns, imp_name) in checks {
+                let mut vis = std::collections::HashSet::new();
+                match self.resolve_export_canonical(dep_ns, &imp_name, &mut vis) {
+                    ExportResolution::Found(_) => {}
+                    ExportResolution::Ambiguous => {
+                        for k in &keys {
+                            self.module_records.remove(k);
+                            self.module_cache.remove(k);
+                        }
+                        return Err(JsError::syntax(format!(
+                            "Ambiguous indirect export '{}'",
+                            imp_name
+                        )));
+                    }
+                    ExportResolution::NotFound => {
+                        for k in &keys {
+                            self.module_records.remove(k);
+                            self.module_cache.remove(k);
+                        }
+                        return Err(JsError::syntax(format!(
+                            "The requested module does not provide an export named '{}'",
+                            imp_name
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(ns)
+    }
+
+    fn collect_star_exports(
+        &self,
+        ns: ObjectId,
+        visited: &mut std::collections::HashSet<ObjectId>,
+        out: &mut Vec<(String, ExportTarget)>,
+    ) {
+        if !visited.insert(ns) {
+            return;
+        }
+        let exports = match &self.heap.get_obj(ns).kind {
+            ObjectKind::ModuleNamespace(m) => m.exports.clone(),
+            _ => return,
+        };
+        for (name, target) in exports {
+            if name == "default" {
+                continue;
+            }
+            out.push((name, target));
+        }
+    }
+
+    fn same_export_target(&self, a: &ExportTarget, b: &ExportTarget) -> bool {
+        let ca = self.canonicalize_export_target(a, 0);
+        let cb = self.canonicalize_export_target(b, 0);
+        match (ca, cb) {
+            (
+                ExportTarget::Local { env: e1, name: n1 },
+                ExportTarget::Local { env: e2, name: n2 },
+            ) => e1 == e2 && n1 == n2,
+            (ExportTarget::Value(v1), ExportTarget::Value(v2)) => v1.same_value(&v2),
+            _ => false,
+        }
+    }
+
+    fn canonicalize_export_target(&self, target: &ExportTarget, depth: usize) -> ExportTarget {
+        if depth > 64 {
+            return ExportTarget::Ambiguous;
+        }
+        match target {
+            ExportTarget::Local { env, name } => {
+                let rec = self.heap.get_env(*env);
+                if let Some((imp_ns, imp_name)) = rec.import_bindings.get(name) {
+                    return self.canonicalize_export_target(
+                        &ExportTarget::Indirect {
+                            ns: *imp_ns,
+                            export_name: imp_name.clone(),
+                        },
+                        depth + 1,
+                    );
+                }
+                if let Some(b) = rec.bindings.get(name) {
+                    if !b.mutable && b.initialized {
+                        if let JsValue::Object(oid) = b.value {
+                            if matches!(self.heap.get_obj(oid).kind, ObjectKind::ModuleNamespace(_)) {
+                                return ExportTarget::Value(JsValue::Object(oid));
+                            }
+                        }
+                    }
+                }
+                target.clone()
+            }
+            ExportTarget::Indirect { ns, export_name } => {
+                let found = match &self.heap.get_obj(*ns).kind {
+                    ObjectKind::ModuleNamespace(m) => m
+                        .exports
+                        .iter()
+                        .find(|(k, _)| k == export_name)
+                        .map(|(_, t)| t.clone()),
+                    _ => None,
+                };
+                if let Some(inner) = found {
+                    self.canonicalize_export_target(&inner, depth + 1)
+                } else {
+                    ExportTarget::Ambiguous
+                }
+            }
+            other => other.clone(),
+        }
+    }
+
+    fn resolve_export_canonical(
+        &self,
+        ns: ObjectId,
+        name: &str,
+        visited: &mut std::collections::HashSet<(ObjectId, String)>,
+    ) -> ExportResolution {
+        if !visited.insert((ns, name.to_string())) {
+            return ExportResolution::NotFound;
+        }
+        let target = match &self.heap.get_obj(ns).kind {
+            ObjectKind::ModuleNamespace(m) => m
+                .exports
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, t)| t.clone()),
+            _ => None,
+        };
+        match target {
+            None => ExportResolution::NotFound,
+            Some(ExportTarget::Ambiguous) => ExportResolution::Ambiguous,
+            Some(ExportTarget::Indirect {
+                ns: next_ns,
+                export_name,
+            }) => self.resolve_export_canonical(next_ns, &export_name, visited),
+            Some(ExportTarget::Local { env, name: ref lname }) => {
+                if let Some((imp_ns, imp_name)) = self.heap.get_env(env).import_bindings.get(lname) {
+                    return self.resolve_export_canonical(*imp_ns, imp_name, visited);
+                }
+                ExportResolution::Found(ExportTarget::Local {
+                    env,
+                    name: lname.clone(),
+                })
+            }
+            Some(ExportTarget::Value(v)) => ExportResolution::Found(ExportTarget::Value(v)),
+        }
+    }
+
+    pub fn get_module_export_value(
+        &mut self,
+        ns: ObjectId,
+        export_name: &str,
+    ) -> Result<JsValue, JsError> {
+        self.ensure_deferred_ns_evaluated(ns)?;
+        let mut vis = std::collections::HashSet::new();
+        match self.resolve_export_canonical(ns, export_name, &mut vis) {
+            ExportResolution::Found(ExportTarget::Local { env, name }) => {
+                let b = self.heap.get_env(env).bindings.get(&name).cloned();
+                if let Some(binding) = b {
+                    if !binding.initialized {
+                        return Err(JsError::reference(format!(
+                            "Cannot access '{}' before initialization",
+                            export_name
+                        )));
+                    }
+                    Ok(binding.value)
+                } else {
+                    Err(JsError::reference(format!(
+                        "Cannot access '{}' before initialization",
+                        export_name
+                    )))
+                }
+            }
+            ExportResolution::Found(ExportTarget::Value(v)) => Ok(v),
+            _ => Ok(JsValue::Undefined),
+        }
+    }
+
+    pub fn ensure_deferred_ns_evaluated(&mut self, ns: ObjectId) -> Result<(), JsError> {
+        let mod_key = match &self.heap.get_obj(ns).kind {
+            ObjectKind::ModuleNamespace(m) if m.is_deferred => m.module_key.clone(),
+            _ => return Ok(()),
+        };
+        let Some(key) = mod_key else {
+            return Ok(());
+        };
+        if let Some(rec) = self.module_records.get(&key) {
+            if rec.eval_state == ModuleEvalState::Evaluated {
+                if let Some(ref err) = rec.eval_error {
+                    return Err(JsError::Thrown(err.clone()));
+                }
+                return Ok(());
+            }
+            if rec.eval_state == ModuleEvalState::Evaluating {
+                return Err(JsError::type_err(
+                    "Cannot synchronously evaluate a module that is currently evaluating",
+                ));
+            }
+            if rec.has_tla {
+                return Err(JsError::type_err(
+                    "Cannot synchronously evaluate an async module via deferred namespace",
+                ));
+            }
+        }
+        let p = self.evaluate_module(&key)?;
+        if let Some(ep) = p {
+            let state = match &self.heap.get_obj(ep).kind {
+                ObjectKind::Promise(pd) => pd.state.clone(),
+                _ => PromiseState::Fulfilled(JsValue::Undefined),
+            };
+            if let PromiseState::Rejected(err) = state {
+                return Err(JsError::Thrown(err));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn evaluate_module(&mut self, key: &str) -> Result<Option<ObjectId>, JsError> {
+        let Some(rec) = self.module_records.get(key).cloned() else {
+            return Ok(None);
+        };
+        match rec.eval_state {
+            ModuleEvalState::Evaluated => {
+                if let Some(err) = rec.eval_error {
+                    return Err(JsError::Thrown(err));
+                }
+                return Ok(None);
+            }
+            ModuleEvalState::Evaluating => {
+                return Ok(rec.eval_promise);
+            }
+            ModuleEvalState::Linking | ModuleEvalState::Linked => {}
+        }
+        if let Some(r) = self.module_records.get_mut(key) {
+            r.eval_state = ModuleEvalState::Evaluating;
+        }
+
+        let mut pending_dep_promises: Vec<ObjectId> = Vec::new();
+        for dep in &rec.deps {
+            if dep.is_deferred {
+                continue;
+            }
+            match self.evaluate_module(&dep.key) {
+                Ok(Some(dp)) => pending_dep_promises.push(dp),
+                Ok(None) => {}
+                Err(e) => {
+                    let ev = self.error_to_js_value(e.clone());
+                    if let Some(r) = self.module_records.get_mut(key) {
+                        r.eval_state = ModuleEvalState::Evaluated;
+                        r.eval_error = Some(ev);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        if pending_dep_promises.is_empty() {
+            return self.execute_module_body(key);
+        }
+
+        let mod_p = self.create_promise();
+        if let Some(r) = self.module_records.get_mut(key) {
+            r.eval_promise = Some(mod_p);
+        }
+        let key_owned = key.to_string();
+        self.wait_dep_promises_and_exec(pending_dep_promises, 0, key_owned, mod_p);
+        Ok(Some(mod_p))
+    }
+
+    fn wait_dep_promises_and_exec(
+        &mut self,
+        dep_promises: Vec<ObjectId>,
+        idx: usize,
+        key: String,
+        mod_p: ObjectId,
+    ) {
+        if idx >= dep_promises.len() {
+            match self.execute_module_body(&key) {
+                Ok(None) => self.resolve_promise(mod_p, JsValue::Undefined),
+                Ok(Some(inner_p)) => {
+                    let key_ok = key.clone();
+                    let on_ok = self.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, _| {
+                            if let Some(r) = rt.module_records.get_mut(&key_ok) {
+                                r.eval_state = ModuleEvalState::Evaluated;
+                            }
+                            rt.resolve_promise(mod_p, JsValue::Undefined);
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    let key_err = key.clone();
+                    let on_err = self.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, args| {
+                            let err = args.first().cloned().unwrap_or(JsValue::Undefined);
+                            if let Some(r) = rt.module_records.get_mut(&key_err) {
+                                r.eval_state = ModuleEvalState::Evaluated;
+                                r.eval_error = Some(err.clone());
+                            }
+                            rt.reject_promise(mod_p, err);
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    self.promise_then(
+                        inner_p,
+                        Some(JsValue::Object(on_ok)),
+                        Some(JsValue::Object(on_err)),
+                    );
+                }
+                Err(e) => {
+                    let ev = self.error_to_js_value(e);
+                    if let Some(r) = self.module_records.get_mut(&key) {
+                        r.eval_state = ModuleEvalState::Evaluated;
+                        r.eval_error = Some(ev.clone());
+                    }
+                    self.reject_promise(mod_p, ev);
+                }
+            }
+            return;
+        }
+        let dp = dep_promises[idx];
+        let deps_next = dep_promises.clone();
+        let key_ok = key.clone();
+        let on_ok = self.create_native_function(
+            "",
+            1,
+            Rc::new(move |rt, _, _| {
+                rt.wait_dep_promises_and_exec(deps_next.clone(), idx + 1, key_ok.clone(), mod_p);
+                Ok(JsValue::Undefined)
+            }),
+        );
+        let key_err = key.clone();
+        let on_err = self.create_native_function(
+            "",
+            1,
+            Rc::new(move |rt, _, args| {
+                let err = args.first().cloned().unwrap_or(JsValue::Undefined);
+                if let Some(r) = rt.module_records.get_mut(&key_err) {
+                    r.eval_state = ModuleEvalState::Evaluated;
+                    r.eval_error = Some(err.clone());
+                }
+                rt.reject_promise(mod_p, err);
+                Ok(JsValue::Undefined)
+            }),
+        );
+        self.promise_then(dp, Some(JsValue::Object(on_ok)), Some(JsValue::Object(on_err)));
+    }
+
+    fn execute_module_body(&mut self, key: &str) -> Result<Option<ObjectId>, JsError> {
+        let Some(rec) = self.module_records.get(key).cloned() else {
+            return Ok(None);
+        };
+        let Some(chunk) = rec.chunk else {
+            if let Some(r) = self.module_records.get_mut(key) {
+                r.eval_state = ModuleEvalState::Evaluated;
+            }
+            return Ok(None);
+        };
+        let mut frame = CallFrame::new(chunk, rec.env, None);
+        self.current_module_stack.push(rec.path.clone());
+        self.current_module_exports.push(rec.ns);
+        self.active_frames.push(rec.env);
+        let res = self.run_frame(&mut frame);
+        self.active_frames.pop();
+        self.current_module_exports.pop();
+        self.current_module_stack.pop();
+        match res {
+            Ok(crate::exec::FrameOutcome::Return(_)) => {
+                if let Some(r) = self.module_records.get_mut(key) {
+                    r.eval_state = ModuleEvalState::Evaluated;
+                }
+                Ok(None)
+            }
+            Ok(crate::exec::FrameOutcome::Await(awaited)) => {
+                let mod_p = self.create_promise();
+                if let Some(r) = self.module_records.get_mut(key) {
+                    r.eval_promise = Some(mod_p);
+                }
+                let awaited_p = self.promise_resolve_value(awaited);
+                let holder = self.heap.alloc_object(JsObject::new(
+                    None,
+                    ObjectKind::Generator(GeneratorData {
+                        state: GeneratorState::SuspendedYield,
+                        frame: Some(Box::new(frame)),
+                        is_async: true,
+                        delegating: None,
+                        result_promise: Some(mod_p),
+                    }),
+                ));
+                let key_ok = key.to_string();
+                let key_err = key.to_string();
+                let mod_inner_p = self.create_promise();
+                let on_fin_ok = self.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, _| {
+                        if let Some(r) = rt.module_records.get_mut(&key_ok) {
+                            r.eval_state = ModuleEvalState::Evaluated;
+                        }
+                        rt.resolve_promise(mod_p, JsValue::Undefined);
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+                let on_fin_err = self.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, args| {
+                        let err = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        if let Some(r) = rt.module_records.get_mut(&key_err) {
+                            r.eval_state = ModuleEvalState::Evaluated;
+                            r.eval_error = Some(err.clone());
+                        }
+                        rt.reject_promise(mod_p, err);
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+                self.promise_then(
+                    mod_inner_p,
+                    Some(JsValue::Object(on_fin_ok)),
+                    Some(JsValue::Object(on_fin_err)),
+                );
+                let path_ok = rec.path.clone();
+                let on_ok = self.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, args| {
+                        let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let opt_frame = match &mut rt.heap.get_obj_mut(holder).kind {
+                            ObjectKind::Generator(g) => g.frame.take(),
+                            _ => None,
+                        };
+                        if let Some(mut fr) = opt_frame {
+                            fr.stack.push(val);
+                            rt.current_module_stack.push(path_ok.clone());
+                            rt.run_async_frame(*fr, mod_inner_p);
+                            rt.current_module_stack.pop();
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+                let path_err = rec.path.clone();
+                let on_err = self.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, args| {
+                        let err = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let opt_frame = match &mut rt.heap.get_obj_mut(holder).kind {
+                            ObjectKind::Generator(g) => g.frame.take(),
+                            _ => None,
+                        };
+                        if let Some(mut fr) = opt_frame {
+                            if let Err(e) = rt.unwind_throw(&mut fr, JsError::thrown(err)) {
+                                let ev = rt.error_to_js_value(e);
+                                rt.reject_promise(mod_inner_p, ev);
+                            } else {
+                                rt.current_module_stack.push(path_err.clone());
+                                rt.run_async_frame(*fr, mod_inner_p);
+                                rt.current_module_stack.pop();
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+                self.promise_then(
+                    awaited_p,
+                    Some(JsValue::Object(on_ok)),
+                    Some(JsValue::Object(on_err)),
+                );
+                Ok(Some(mod_p))
+            }
+            Ok(_) => {
+                if let Some(r) = self.module_records.get_mut(key) {
+                    r.eval_state = ModuleEvalState::Evaluated;
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                let ev = self.error_to_js_value(e.clone());
+                if let Some(r) = self.module_records.get_mut(key) {
+                    r.eval_state = ModuleEvalState::Evaluated;
+                    r.eval_error = Some(ev);
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn create_object(&mut self) -> ObjectId {
@@ -973,8 +2182,28 @@ impl JsRuntime {
             ErrorKind::UriError => self.intrinsics.uri_error_proto,
             ErrorKind::EvalError => self.intrinsics.eval_error_proto,
             ErrorKind::AggregateError => self.intrinsics.aggregate_error_proto,
+            ErrorKind::SuppressedError => self.intrinsics.suppressed_error_proto,
         };
         self.create_error_object_with_proto(kind, message, !message.is_empty(), proto)
+    }
+
+    pub fn create_suppressed_error(&mut self, error: JsValue, suppressed: JsValue) -> JsValue {
+        let proto = self.intrinsics.suppressed_error_proto;
+        let obj = self.create_error_object_with_proto(
+            ErrorKind::SuppressedError,
+            "An error was suppressed during disposal",
+            true,
+            proto,
+        );
+        self.heap.get_obj_mut(obj).set_own_prop(
+            PropertyKey::from("error"),
+            PropEntry::data(error, true, false, true),
+        );
+        self.heap.get_obj_mut(obj).set_own_prop(
+            PropertyKey::from("suppressed"),
+            PropEntry::data(suppressed, true, false, true),
+        );
+        JsValue::Object(obj)
     }
 
     pub fn create_error_object_with_proto(
@@ -1061,6 +2290,7 @@ impl JsRuntime {
             ErrorKind::UriError => intr.uri_error_proto,
             ErrorKind::EvalError => intr.eval_error_proto,
             ErrorKind::AggregateError => intr.aggregate_error_proto,
+            ErrorKind::SuppressedError => intr.suppressed_error_proto,
         };
         self.create_error_object_with_proto(kind, message, !message.is_empty(), proto)
     }
@@ -1088,6 +2318,7 @@ impl JsRuntime {
                 is_generator: tmpl.is_generator,
                 is_arrow: tmpl.is_arrow,
                 is_method: tmpl.is_method,
+                is_decl: tmpl.is_decl,
                 is_class_ctor: false,
                 is_derived_ctor: false,
                 strict: tmpl.strict,
@@ -1195,6 +2426,9 @@ impl JsRuntime {
             self.intrinsics.uri_error_proto,
             self.intrinsics.eval_error_proto,
             self.intrinsics.aggregate_error_proto,
+            self.intrinsics.suppressed_error_proto,
+            self.intrinsics.disposable_stack_proto,
+            self.intrinsics.async_disposable_stack_proto,
             self.intrinsics.map_proto,
             self.intrinsics.set_proto,
             self.intrinsics.weak_map_proto,
@@ -1236,6 +2470,18 @@ impl JsRuntime {
         for &m in self.module_cache.values() {
             root_objs.push(m);
         }
+        for rec in self.module_records.values() {
+            root_objs.push(rec.ns);
+            if let Some(dns) = rec.deferred_ns {
+                root_objs.push(dns);
+            }
+            if let Some(ep) = rec.eval_promise {
+                root_objs.push(ep);
+            }
+            if let Some(ref ev) = rec.eval_error {
+                trace_value(ev, &mut root_objs);
+            }
+        }
         for &t in self.template_cache.values() {
             root_objs.push(t);
         }
@@ -1250,6 +2496,9 @@ impl JsRuntime {
             }
         }
         let mut root_envs = vec![self.global_env];
+        for rec in self.module_records.values() {
+            root_envs.push(rec.env);
+        }
         for r in &self.realms {
             root_objs.push(r.global_object);
             root_objs.push(r.intrinsics.object_proto);
@@ -1270,6 +2519,9 @@ impl JsRuntime {
             root_objs.push(r.intrinsics.uri_error_proto);
             root_objs.push(r.intrinsics.eval_error_proto);
             root_objs.push(r.intrinsics.aggregate_error_proto);
+            root_objs.push(r.intrinsics.suppressed_error_proto);
+            root_objs.push(r.intrinsics.disposable_stack_proto);
+            root_objs.push(r.intrinsics.async_disposable_stack_proto);
             root_objs.push(r.intrinsics.map_proto);
             root_objs.push(r.intrinsics.set_proto);
             root_objs.push(r.intrinsics.weak_map_proto);
@@ -1716,10 +2968,18 @@ impl JsRuntime {
                 }
             }
             ObjectKind::ModuleNamespace(m) => {
-                for (name, val) in &m.exports {
-                    if name == k {
-                        return Ok(Some(val.clone()));
-                    }
+                if m.is_deferred && k == "then" {
+                    return Ok(None);
+                }
+                let is_exported = m
+                    .exports
+                    .iter()
+                    .any(|(name, t)| name == k && !matches!(t, ExportTarget::Ambiguous));
+                if is_exported {
+                    return Ok(Some(self.get_module_export_value(obj, k)?));
+                }
+                if m.is_deferred {
+                    self.ensure_deferred_ns_evaluated(obj)?;
                 }
             }
             _ => {}
@@ -1755,6 +3015,9 @@ impl JsRuntime {
         val: JsValue,
         receiver: JsValue,
     ) -> Result<bool, JsError> {
+        if matches!(self.heap.get_obj(obj).kind, ObjectKind::ModuleNamespace(_)) {
+            return Ok(false);
+        }
         let proxy_info = match &self.heap.get_obj(obj).kind {
             ObjectKind::Proxy(p) => Some((p.target, p.handler, p.revoked)),
             _ => None,
@@ -2041,6 +3304,43 @@ impl JsRuntime {
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, JsError> {
+        if matches!(self.heap.get_obj(obj).kind, ObjectKind::ModuleNamespace(_)) {
+            if let PropertyKey::String(ref k) = key {
+                let is_def_then = matches!(
+                    &self.heap.get_obj(obj).kind,
+                    ObjectKind::ModuleNamespace(m) if m.is_deferred && k == "then"
+                );
+                if is_def_then {
+                    return self.ordinary_define_own_property(obj, key, desc);
+                }
+                self.ensure_deferred_ns_evaluated(obj)?;
+                let is_exported = match &self.heap.get_obj(obj).kind {
+                    ObjectKind::ModuleNamespace(m) => m
+                        .exports
+                        .iter()
+                        .any(|(name, t)| name == k && !matches!(t, ExportTarget::Ambiguous)),
+                    _ => false,
+                };
+                if !is_exported {
+                    return Ok(false);
+                }
+                let cur_val = self.get_module_export_value(obj, k)?;
+                if desc.is_accessor()
+                    || desc.configurable == Some(true)
+                    || desc.enumerable == Some(false)
+                    || desc.writable == Some(false)
+                {
+                    return Ok(false);
+                }
+                if let Some(ref v) = desc.value {
+                    if !v.same_value(&cur_val) {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+            return self.ordinary_define_own_property(obj, key, desc);
+        }
         let proxy_info = match &self.heap.get_obj(obj).kind {
             ObjectKind::Proxy(p) => Some((p.target, p.handler, p.revoked)),
             _ => None,
@@ -2635,6 +3935,20 @@ impl JsRuntime {
                         return Ok(true);
                     }
                 }
+                ObjectKind::ModuleNamespace(m) => {
+                    if m.is_deferred && k == "then" {
+                        return Ok(true);
+                    }
+                    let is_exported = m
+                        .exports
+                        .iter()
+                        .any(|(name, t)| name == k && !matches!(t, ExportTarget::Ambiguous));
+                    let is_def = m.is_deferred;
+                    if is_def {
+                        self.ensure_deferred_ns_evaluated(obj)?;
+                    }
+                    return Ok(!is_exported);
+                }
                 _ => {}
             }
         }
@@ -2697,6 +4011,27 @@ impl JsRuntime {
                         return Ok(false);
                     }
                 }
+            }
+            if matches!(self.heap.get_obj(cur_id).kind, ObjectKind::ModuleNamespace(_)) {
+                if let PropertyKey::String(ref k) = key {
+                    let is_def_then = matches!(
+                        &self.heap.get_obj(cur_id).kind,
+                        ObjectKind::ModuleNamespace(m) if m.is_deferred && k == "then"
+                    );
+                    if is_def_then {
+                        return Ok(false);
+                    }
+                    self.ensure_deferred_ns_evaluated(cur_id)?;
+                    let is_exported = match &self.heap.get_obj(cur_id).kind {
+                        ObjectKind::ModuleNamespace(m) => m
+                            .exports
+                            .iter()
+                            .any(|(name, t)| name == k && !matches!(t, ExportTarget::Ambiguous)),
+                        _ => false,
+                    };
+                    return Ok(is_exported);
+                }
+                return Ok(self.heap.get_obj(cur_id).get_own_prop(key).is_some());
             }
             if self.has_own_property(cur_id, key)? {
                 return Ok(true);
@@ -2899,15 +4234,20 @@ impl JsRuntime {
                     }
                 }
                 ObjectKind::ModuleNamespace(m) => {
-                    for (name, val) in &m.exports {
-                        if name == k {
-                            return Ok(Some(PropertyDescriptor::data(
-                                val.clone(),
-                                true,
-                                true,
-                                false,
-                            )));
-                        }
+                    if m.is_deferred && k == "then" {
+                        return Ok(None);
+                    }
+                    let is_exported = m
+                        .exports
+                        .iter()
+                        .any(|(name, t)| name == k && !matches!(t, ExportTarget::Ambiguous));
+                    let is_def = m.is_deferred;
+                    if is_def {
+                        self.ensure_deferred_ns_evaluated(obj)?;
+                    }
+                    if is_exported {
+                        let val = self.get_module_export_value(obj, k)?;
+                        return Ok(Some(PropertyDescriptor::data(val, true, true, false)));
                     }
                 }
                 _ => {}
@@ -2983,6 +4323,12 @@ impl JsRuntime {
     }
 
     pub fn own_keys(&mut self, obj: ObjectId) -> Result<Vec<PropertyKey>, JsError> {
+        if matches!(
+            &self.heap.get_obj(obj).kind,
+            ObjectKind::ModuleNamespace(m) if m.is_deferred
+        ) {
+            self.ensure_deferred_ns_evaluated(obj)?;
+        }
         let proxy_info = match &self.heap.get_obj(obj).kind {
             ObjectKind::Proxy(p) => Some((p.target, p.handler, p.revoked)),
             _ => None,
@@ -3138,6 +4484,11 @@ impl JsRuntime {
         obj: ObjectId,
         proto: Option<ObjectId>,
     ) -> Result<bool, JsError> {
+        if obj == self.intrinsics.object_proto
+            || self.realms.iter().any(|r| r.intrinsics.object_proto == obj)
+        {
+            return Ok(proto.is_none());
+        }
         let proxy_info = match &self.heap.get_obj(obj).kind {
             ObjectKind::Proxy(p) => Some((p.target, p.handler, p.revoked)),
             _ => None,
@@ -4206,6 +5557,42 @@ impl JsRuntime {
 impl Default for JsRuntime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+enum ExportResolution {
+    Found(ExportTarget),
+    NotFound,
+    Ambiguous,
+}
+
+fn normalize_module_path(path: &str) -> String {
+    let is_abs = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if let Some(&last) = parts.last() {
+                if last != ".." {
+                    parts.pop();
+                    continue;
+                }
+            }
+            if !is_abs {
+                parts.push("..");
+            }
+        } else {
+            parts.push(seg);
+        }
+    }
+    if is_abs {
+        format!("/{}", parts.join("/"))
+    } else if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
     }
 }
 

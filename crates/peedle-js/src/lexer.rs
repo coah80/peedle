@@ -121,6 +121,7 @@ pub struct Token {
     pub col: usize,
     pub preceded_by_newline: bool,
     pub strict_error: Option<&'static str>,
+    pub has_lone_surrogate: bool,
 }
 
 #[derive(Clone)]
@@ -131,11 +132,17 @@ pub struct Lexer<'a> {
     line: usize,
     col: usize,
     at_line_start: bool,
+    is_module: bool,
     pending_strict_error: Option<&'static str>,
+    pending_lone_surrogate: bool,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
+        Self::new_with_mode(src, false)
+    }
+
+    pub fn new_with_mode(src: &'a str, is_module: bool) -> Self {
         let mut lex = Lexer {
             src,
             bytes: src.as_bytes(),
@@ -143,7 +150,9 @@ impl<'a> Lexer<'a> {
             line: 1,
             col: 1,
             at_line_start: true,
+            is_module,
             pending_strict_error: None,
+            pending_lone_surrogate: false,
         };
         if lex.src.starts_with("\u{FEFF}") {
             lex.pos = 3;
@@ -256,7 +265,8 @@ impl<'a> Lexer<'a> {
                     continue;
                 }
             }
-            if c == '<'
+            if !self.is_module
+                && c == '<'
                 && self.bytes.get(self.pos..self.pos + 4) == Some(b"<!--")
             {
                 self.pos += 4;
@@ -264,7 +274,8 @@ impl<'a> Lexer<'a> {
                 self.skip_line_comment();
                 continue;
             }
-            if (saw_newline || self.at_line_start)
+            if !self.is_module
+                && (saw_newline || self.at_line_start)
                 && c == '-'
                 && self.bytes.get(self.pos..self.pos + 3) == Some(b"-->")
             {
@@ -280,6 +291,7 @@ impl<'a> Lexer<'a> {
 
     pub fn next_token(&mut self, allow_regexp: bool) -> Result<Token, JsError> {
         self.pending_strict_error = None;
+        self.pending_lone_surrogate = false;
         let preceded_by_newline = self.skip_whitespace_and_comments()?;
         self.at_line_start = false;
         let start = self.pos;
@@ -295,6 +307,7 @@ impl<'a> Lexer<'a> {
                 col,
                 preceded_by_newline,
                 strict_error: None,
+                has_lone_surrogate: false,
             });
         };
 
@@ -605,11 +618,13 @@ impl<'a> Lexer<'a> {
             col,
             preceded_by_newline,
             strict_error: self.pending_strict_error.take(),
+            has_lone_surrogate: self.pending_lone_surrogate,
         })
     }
 
     pub fn next_template_continuation(&mut self) -> Result<Token, JsError> {
         self.pending_strict_error = None;
+        self.pending_lone_surrogate = false;
         let start = self.pos;
         let line = self.line;
         let col = self.col;
@@ -622,6 +637,7 @@ impl<'a> Lexer<'a> {
             col,
             preceded_by_newline: false,
             strict_error: None,
+            has_lone_surrogate: self.pending_lone_surrogate,
         })
     }
 
@@ -813,6 +829,9 @@ impl<'a> Lexer<'a> {
             }
             'x' => {
                 let code = self.read_hex_digits(2)?;
+                if (0xD800..=0xDFFF).contains(&code) {
+                    self.pending_lone_surrogate = true;
+                }
                 char::from_u32(code).unwrap_or('\u{FFFD}')
             }
             'u' => {
@@ -835,6 +854,9 @@ impl<'a> Lexer<'a> {
                     self.pos = saved_pos;
                     self.line = saved_line;
                     self.col = saved_col;
+                }
+                if (0xD800..=0xDFFF).contains(&code) {
+                    self.pending_lone_surrogate = true;
                 }
                 char::from_u32(code).unwrap_or('\u{FFFD}')
             }

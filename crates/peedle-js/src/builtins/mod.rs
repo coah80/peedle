@@ -2,6 +2,7 @@ pub mod array;
 pub mod atomics;
 pub mod collections;
 pub mod date;
+pub mod disposable;
 pub mod error;
 pub mod function;
 pub mod globals;
@@ -85,6 +86,7 @@ pub fn init_builtins(rt: &mut JsRuntime) {
     regexp::init(rt);
     date::init(rt);
     error::init(rt);
+    disposable::init(rt);
     json::init(rt);
     collections::init(rt);
     promise::init(rt);

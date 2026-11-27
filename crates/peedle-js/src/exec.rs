@@ -548,7 +548,9 @@ impl JsRuntime {
             ));
         }
 
-        let parent_env = if !func.name.is_empty() && !func.is_arrow && func.home_object.is_none() {
+        let parent_env =
+            if !func.name.is_empty() && !func.is_arrow && !func.is_decl && func.home_object.is_none()
+            {
             let mut name_env = EnvRecord::new(Some(func.env), false, func.strict);
             name_env.bindings.insert(
                 func.name.clone(),
@@ -1818,8 +1820,11 @@ impl JsRuntime {
                 frame.stack.push(nt);
             }
             Op::PushImportMeta => {
-                let meta = self.create_object();
-                frame.stack.push(JsValue::Object(meta));
+                let meta = match self.get_var(frame.env, "\0__import_meta") {
+                    Ok(v) => v,
+                    Err(_) => JsValue::Object(self.create_object_with_proto(None)),
+                };
+                frame.stack.push(meta);
             }
             Op::EnterScope => {
                 let strict = self.heap.get_env(frame.env).strict;
@@ -3037,12 +3042,109 @@ impl JsRuntime {
                     frame.stack.push(JsValue::Object(arr));
                 }
             }
-            Op::DynamicImport => {
-                let spec_val = frame.stack.pop().unwrap();
-                let spec = self.to_string(&spec_val)?;
+            Op::DynamicImport { has_options, phase } => {
+                let options_val = if has_options {
+                    frame.stack.pop().unwrap_or(JsValue::Undefined)
+                } else {
+                    JsValue::Undefined
+                };
+                let spec_val = frame.stack.pop().unwrap_or(JsValue::Undefined);
                 let p = self.create_promise();
-                match self.load_module(&spec) {
-                    Ok(ns) => self.resolve_promise(p, JsValue::Object(ns)),
+                let res: Result<JsValue, JsError> = (|| {
+                    let spec = self.to_string(&spec_val)?;
+                    let mut attrs: Vec<(String, String)> = Vec::new();
+                    if !options_val.is_undefined() {
+                        let JsValue::Object(opts_oid) = options_val else {
+                            return Err(JsError::type_err(
+                                "import() options argument must be an object",
+                            ));
+                        };
+                        let with_val = self.get_property(opts_oid, "with")?;
+                        if !with_val.is_undefined() {
+                            let JsValue::Object(with_oid) = with_val else {
+                                return Err(JsError::type_err(
+                                    "import() options.with must be an object",
+                                ));
+                            };
+                            let keys = self.own_keys(with_oid)?;
+                            for k in keys {
+                                if let PropertyKey::String(ks) = k {
+                                    if let Some(d) = self.get_own_property_descriptor(
+                                        with_oid,
+                                        &PropertyKey::String(ks.clone()),
+                                    )? {
+                                        if d.enumerable == Some(true) {
+                                            let v = self.get_property(with_oid, &ks)?;
+                                            let JsValue::String(vs) = v else {
+                                                return Err(JsError::type_err(
+                                                    "Import attribute value must be a string",
+                                                ));
+                                            };
+                                            attrs.push((ks, vs));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if phase == 2 {
+                        return Err(JsError::syntax(
+                            "Source phase import is not supported for source text modules",
+                        ));
+                    }
+                    let pushed_ref = if self.current_module_stack.is_empty() {
+                        if let Ok(JsValue::String(mp)) = self.get_var(frame.env, "\0__module_path") {
+                            self.current_module_stack.push(mp);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    let load_out = if phase == 1 {
+                        self.load_module_deferred(&spec, &attrs).map(|ns| (ns, None))
+                    } else {
+                        self.load_module_async(&spec, &attrs)
+                    };
+                    if pushed_ref {
+                        self.current_module_stack.pop();
+                    }
+                    let (ns, maybe_p) = load_out?;
+                    if phase == 1 {
+                        return Ok(JsValue::Object(ns));
+                    }
+                    if let Some(eval_p) = maybe_p {
+                        let on_ok = self.create_native_function(
+                            "",
+                            1,
+                            Rc::new(move |rt, _, _| {
+                                rt.resolve_promise(p, JsValue::Object(ns));
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        let on_err = self.create_native_function(
+                            "",
+                            1,
+                            Rc::new(move |rt, _, args| {
+                                let err = args.first().cloned().unwrap_or(JsValue::Undefined);
+                                rt.reject_promise(p, err);
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        self.promise_then(
+                            eval_p,
+                            Some(JsValue::Object(on_ok)),
+                            Some(JsValue::Object(on_err)),
+                        );
+                        return Ok(JsValue::Undefined);
+                    }
+                    self.resolve_promise(p, JsValue::Object(ns));
+                    Ok(JsValue::Undefined)
+                })();
+                match res {
+                    Ok(JsValue::Object(ns)) => self.resolve_promise(p, JsValue::Object(ns)),
+                    Ok(_) => {}
                     Err(e) => {
                         let ev = self.error_to_js_value(e);
                         self.reject_promise(p, ev);
@@ -3050,33 +3152,36 @@ impl JsRuntime {
                 }
                 frame.stack.push(JsValue::Object(p));
             }
+            Op::ExportDefault => {
+                let val = frame.stack.pop().unwrap_or(JsValue::Undefined);
+                let env = self.heap.get_env_mut(frame.env);
+                if let Some(b) = env.bindings.get_mut("\0__default") {
+                    b.value = val;
+                    b.initialized = true;
+                } else {
+                    env.bindings.insert(
+                        "\0__default".to_string(),
+                        Binding {
+                            value: val,
+                            mutable: false,
+                            initialized: true,
+                            deletable: false,
+                            strict_immutable: true,
+                        },
+                    );
+                }
+            }
             Op::ExportBinding(idx) => {
                 let name = get_const_str(&frame.chunk, idx).to_string();
                 let val = frame.stack.pop().unwrap();
                 if let Some(&ns) = self.current_module_exports.last() {
-                    if name == "*" {
-                        if let JsValue::Object(src_ns) = val {
-                            let pairs = match &self.heap.get_obj(src_ns).kind {
-                                ObjectKind::ModuleNamespace(m) => m.exports.clone(),
-                                _ => Vec::new(),
-                            };
-                            if let ObjectKind::ModuleNamespace(ref mut m) =
-                                self.heap.get_obj_mut(ns).kind
-                            {
-                                for (k, v) in pairs {
-                                    if k != "default" {
-                                        m.exports.push((k, v));
-                                    }
-                                }
-                            }
-                        }
-                    } else if let ObjectKind::ModuleNamespace(ref mut m) =
+                    if let ObjectKind::ModuleNamespace(ref mut m) =
                         self.heap.get_obj_mut(ns).kind
                     {
                         if let Some(existing) = m.exports.iter_mut().find(|(k, _)| k == &name) {
-                            existing.1 = val;
+                            existing.1 = ExportTarget::Value(val);
                         } else {
-                            m.exports.push((name, val));
+                            m.exports.push((name, ExportTarget::Value(val)));
                         }
                     }
                 }
@@ -3142,7 +3247,7 @@ impl JsRuntime {
                         let entry = self.create_array(vec![
                             val,
                             JsValue::Undefined,
-                            JsValue::Boolean(true),
+                            JsValue::Number(1.0),
                         ]);
                         if let ObjectKind::Array(ref mut arr) =
                             self.heap.get_obj_mut(stack_oid).kind
@@ -3152,7 +3257,7 @@ impl JsRuntime {
                         }
                     }
                 } else if let JsValue::Object(oid) = val {
-                    let method = if is_async {
+                    let (method, mode) = if is_async {
                         let async_key = PropertyKey::Symbol(self.symbols.async_dispose);
                         let m = self.get_property_key(oid, &async_key)?;
                         if m.is_nullish() {
@@ -3161,11 +3266,11 @@ impl JsRuntime {
                             if !self.is_callable(&sm) {
                                 return Err(JsError::type_err("Object is not async disposable"));
                             }
-                            sm
+                            (sm, 2.0)
                         } else if !self.is_callable(&m) {
                             return Err(JsError::type_err("Symbol.asyncDispose is not callable"));
                         } else {
-                            m
+                            (m, 1.0)
                         }
                     } else {
                         let sync_key = PropertyKey::Symbol(self.symbols.dispose);
@@ -3173,13 +3278,9 @@ impl JsRuntime {
                         if !self.is_callable(&sm) {
                             return Err(JsError::type_err("Object is not disposable"));
                         }
-                        sm
+                        (sm, 0.0)
                     };
-                    let entry = self.create_array(vec![
-                        val,
-                        method,
-                        JsValue::Boolean(is_async),
-                    ]);
+                    let entry = self.create_array(vec![val, method, JsValue::Number(mode)]);
                     if let ObjectKind::Array(ref mut arr) = self.heap.get_obj_mut(stack_oid).kind {
                         let len = arr.length;
                         arr.set(len, JsValue::Object(entry));
@@ -3212,23 +3313,52 @@ impl JsRuntime {
                     frame.ip = end_ip as usize;
                     return Ok(None);
                 };
-                let (res_val, method_val, is_async_val) = match &self.heap.get_obj(entry_oid).kind {
+                let (res_val, method_val, mode) = match &self.heap.get_obj(entry_oid).kind {
                     ObjectKind::Array(a) => (
                         a.get(0).cloned().unwrap_or(JsValue::Undefined),
                         a.get(1).cloned().unwrap_or(JsValue::Undefined),
-                        a.get(2).cloned().unwrap_or(JsValue::Boolean(false)).to_boolean(),
+                        match a.get(2) {
+                            Some(JsValue::Number(n)) => *n as i32,
+                            Some(JsValue::Boolean(true)) => 1,
+                            _ => 0,
+                        },
                     ),
-                    _ => (JsValue::Undefined, JsValue::Undefined, false),
+                    _ => (JsValue::Undefined, JsValue::Undefined, 0),
                 };
                 let call_res = if self.is_callable(&method_val) {
                     self.call_function(method_val, res_val, &[])?
                 } else {
                     JsValue::Undefined
                 };
-                if is_async_val {
+                if mode == 1 {
                     frame.stack.push(call_res);
+                } else if mode == 2 {
+                    frame.stack.push(JsValue::Undefined);
                 } else {
                     frame.ip = sync_ip as usize;
+                }
+            }
+            Op::SuppressDisposeError => {
+                let new_err = frame.stack.pop().unwrap_or(JsValue::Undefined);
+                if let Some(outer) = frame.handlers.last_mut() {
+                    let prev_throw = match std::mem::replace(
+                        &mut outer.pending,
+                        PendingCompletion::Normal,
+                    ) {
+                        PendingCompletion::Throw(prev) => Some(prev),
+                        _ => None,
+                    };
+                    let combined = if let Some(prev) = prev_throw {
+                        let prev_val = self.error_to_js_value(prev);
+                        self.create_suppressed_error(new_err, prev_val)
+                    } else {
+                        new_err
+                    };
+                    if let Some(outer_mut) = frame.handlers.last_mut() {
+                        outer_mut.pending = PendingCompletion::Throw(JsError::Thrown(combined));
+                    }
+                } else {
+                    return Err(JsError::Thrown(new_err));
                 }
             }
         }
@@ -3391,6 +3521,7 @@ impl JsRuntime {
                 is_generator: false,
                 is_arrow: false,
                 is_method: false,
+                is_decl: false,
                 strict: true,
                 source: String::new(),
             })
@@ -3406,6 +3537,7 @@ impl JsRuntime {
                 is_generator: false,
                 is_arrow: false,
                 is_method: false,
+                is_decl: false,
                 strict: true,
                 source: String::new(),
             })
@@ -3956,10 +4088,18 @@ impl JsRuntime {
 
     pub fn get_var(&mut self, mut env: EnvId, name: &str) -> Result<JsValue, JsError> {
         loop {
-            let (binding, obj_env, parent) = {
+            let (binding, import_ref, obj_env, parent) = {
                 let rec = self.heap.get_env(env);
-                (rec.bindings.get(name).cloned(), rec.object_env, rec.parent)
+                (
+                    rec.bindings.get(name).cloned(),
+                    rec.import_bindings.get(name).cloned(),
+                    rec.object_env,
+                    rec.parent,
+                )
             };
+            if let Some((ns, exp_name)) = import_ref {
+                return self.get_module_export_value(ns, &exp_name);
+            }
             if let Some(b) = binding {
                 if !b.initialized {
                     return Err(JsError::reference(format!(
@@ -4002,10 +4142,21 @@ impl JsRuntime {
         strict: bool,
     ) -> Result<(), JsError> {
         loop {
-            let (has_binding, obj_env, parent) = {
+            let (has_binding, has_import, obj_env, parent) = {
                 let rec = self.heap.get_env(env);
-                (rec.bindings.contains_key(name), rec.object_env, rec.parent)
+                (
+                    rec.bindings.contains_key(name),
+                    rec.import_bindings.contains_key(name),
+                    rec.object_env,
+                    rec.parent,
+                )
             };
+            if has_import {
+                return Err(JsError::type_err(format!(
+                    "Assignment to constant variable '{}'",
+                    name
+                )));
+            }
             if has_binding {
                 let b = self.heap.get_env_mut(env).bindings.get_mut(name).unwrap();
                 if !b.initialized {
@@ -4091,7 +4242,11 @@ impl JsRuntime {
         loop {
             let (has_binding, obj_env, parent) = {
                 let rec = self.heap.get_env(env);
-                (rec.bindings.contains_key(name), rec.object_env, rec.parent)
+                (
+                    rec.bindings.contains_key(name) || rec.import_bindings.contains_key(name),
+                    rec.object_env,
+                    rec.parent,
+                )
             };
             if has_binding {
                 return Ok(Some(env));
@@ -4130,14 +4285,18 @@ impl JsRuntime {
         let Some(env) = target_env else {
             return Err(JsError::reference(format!("{} is not defined", name)));
         };
-        let (binding, obj_env, is_with) = {
+        let (binding, import_ref, obj_env, is_with) = {
             let rec = self.heap.get_env(env);
             (
                 rec.bindings.get(name).cloned(),
+                rec.import_bindings.get(name).cloned(),
                 rec.object_env,
                 rec.object_env.is_some() && rec.parent.is_some(),
             )
         };
+        if let Some((ns, exp_name)) = import_ref {
+            return self.get_module_export_value(ns, &exp_name);
+        }
         if let Some(b) = binding {
             if !b.initialized {
                 return Err(JsError::reference(format!(
@@ -4181,10 +4340,20 @@ impl JsRuntime {
             )?;
             return Ok(());
         };
-        let (has_binding, obj_env) = {
+        let (has_binding, has_import, obj_env) = {
             let rec = self.heap.get_env(env);
-            (rec.bindings.contains_key(name), rec.object_env)
+            (
+                rec.bindings.contains_key(name),
+                rec.import_bindings.contains_key(name),
+                rec.object_env,
+            )
         };
+        if has_import {
+            return Err(JsError::type_err(format!(
+                "Assignment to constant variable '{}'",
+                name
+            )));
+        }
         if has_binding {
             let b = self.heap.get_env_mut(env).bindings.get_mut(name).unwrap();
             if !b.initialized {

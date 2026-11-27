@@ -52,7 +52,7 @@ impl<'a> Parser<'a> {
         initial_strict: bool,
         eval_ctx: EvalValidationCtx,
     ) -> Result<Program, JsError> {
-        let mut lexer = Lexer::new(src);
+        let mut lexer = Lexer::new_with_mode(src, is_module);
         let cur = lexer.next_token(true)?;
         let mut parser = Parser {
             lexer,
@@ -101,11 +101,29 @@ impl<'a> Parser<'a> {
             }
             body.push(stmt);
         }
+        if !is_module {
+            for stmt in &body {
+                if matches!(
+                    stmt,
+                    Stmt::VarDecl {
+                        kind: VarKind::Using | VarKind::AwaitUsing,
+                        ..
+                    }
+                ) {
+                    return Err(JsError::syntax(
+                        "using declaration is not allowed at the top level of a script",
+                    ));
+                }
+            }
+        }
         let program = Program {
             body,
             is_module,
             strict: parser.strict,
         };
+        if is_module {
+            validate_module_early_errors(&program)?;
+        }
         validate_program_early_errors(&program, eval_ctx)?;
         Ok(program)
     }
@@ -182,18 +200,90 @@ impl<'a> Parser<'a> {
         self.parse_stmt()
     }
 
+    fn parse_import_attributes(&mut self) -> Result<Vec<(String, String)>, JsError> {
+        if self.cur.preceded_by_newline || self.cur.kind != TokenKind::KwWith {
+            return Ok(Vec::new());
+        }
+        self.advance(true)?;
+        self.expect(&TokenKind::LBrace, true)?;
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        while self.cur.kind != TokenKind::RBrace && self.cur.kind != TokenKind::Eof {
+            let key = match self.cur.kind.clone() {
+                TokenKind::String(s, _) => {
+                    self.advance(true)?;
+                    s
+                }
+                _ => self.parse_ident_name()?,
+            };
+            self.expect(&TokenKind::Colon, true)?;
+            let val = match self.cur.kind.clone() {
+                TokenKind::String(s, _) => {
+                    self.advance(true)?;
+                    s
+                }
+                _ => return Err(JsError::syntax("Import attribute value must be a string literal")),
+            };
+            if attrs.iter().any(|(k, _)| k == &key) {
+                return Err(JsError::syntax(format!(
+                    "Duplicate import attribute key '{}'",
+                    key
+                )));
+            }
+            attrs.push((key, val));
+            if !self.eat(&TokenKind::Comma, true)? {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace, false)?;
+        Ok(attrs)
+    }
+
     fn parse_import(&mut self) -> Result<Stmt, JsError> {
         self.advance(true)?;
         let mut specifiers = Vec::new();
+        let mut phase = ImportPhase::Evaluation;
         if let TokenKind::String(src, _) = self.cur.kind.clone() {
             self.advance(false)?;
+            let attributes = self.parse_import_attributes()?;
             self.eat_semi()?;
             return Ok(Stmt::Import(ImportDecl {
                 specifiers,
                 source: src,
+                phase,
+                attributes,
             }));
         }
-        if !matches!(self.cur.kind, TokenKind::Star | TokenKind::LBrace) {
+        if matches!(&self.cur.kind, TokenKind::Ident(s, false) if s == "defer") {
+            let next = self.peek_next(true)?;
+            if !next.preceded_by_newline && next.kind == TokenKind::Star {
+                self.advance(true)?;
+                phase = ImportPhase::Defer;
+                self.parse_import_clause_tail(&mut specifiers)?;
+            } else {
+                let local = self.parse_binding_ident()?;
+                specifiers.push(ImportSpecifier::Default(local));
+                if self.eat(&TokenKind::Comma, true)? {
+                    self.parse_import_clause_tail(&mut specifiers)?;
+                }
+            }
+        } else if matches!(&self.cur.kind, TokenKind::Ident(s, false) if s == "source") {
+            let next = self.peek_next(true)?;
+            if !next.preceded_by_newline
+                && !matches!(next.kind, TokenKind::Comma)
+                && !matches!(&next.kind, TokenKind::Ident(w, false) if w == "from")
+            {
+                self.advance(true)?;
+                phase = ImportPhase::Source;
+                let local = self.parse_binding_ident()?;
+                specifiers.push(ImportSpecifier::Default(local));
+            } else {
+                let local = self.parse_binding_ident()?;
+                specifiers.push(ImportSpecifier::Default(local));
+                if self.eat(&TokenKind::Comma, true)? {
+                    self.parse_import_clause_tail(&mut specifiers)?;
+                }
+            }
+        } else if !matches!(self.cur.kind, TokenKind::Star | TokenKind::LBrace) {
             let local = self.parse_binding_ident()?;
             specifiers.push(ImportSpecifier::Default(local));
             if self.eat(&TokenKind::Comma, true)? {
@@ -213,8 +303,14 @@ impl<'a> Parser<'a> {
             }
             _ => return Err(JsError::syntax("Expected module specifier string")),
         };
+        let attributes = self.parse_import_attributes()?;
         self.eat_semi()?;
-        Ok(Stmt::Import(ImportDecl { specifiers, source }))
+        Ok(Stmt::Import(ImportDecl {
+            specifiers,
+            source,
+            phase,
+            attributes,
+        }))
     }
 
     fn parse_import_clause_tail(
@@ -230,11 +326,29 @@ impl<'a> Parser<'a> {
             specifiers.push(ImportSpecifier::Namespace(local));
         } else if self.eat(&TokenKind::LBrace, true)? {
             while self.cur.kind != TokenKind::RBrace && self.cur.kind != TokenKind::Eof {
-                let imported = self.parse_module_export_name()?;
+                let (imported, imported_is_str) = if let TokenKind::String(s, _) = self.cur.kind.clone() {
+                    if self.cur.has_lone_surrogate {
+                        return Err(JsError::syntax(
+                            "Module import name must be well-formed Unicode",
+                        ));
+                    }
+                    self.advance(true)?;
+                    (s, true)
+                } else {
+                    (self.parse_ident_name()?, false)
+                };
                 let local = if self.is_ident_word("as") {
                     self.advance(true)?;
                     self.parse_binding_ident()?
                 } else {
+                    if imported_is_str
+                        || is_reserved_word(&imported, true)
+                        || imported == "await"
+                        || imported == "eval"
+                        || imported == "arguments"
+                    {
+                        return Err(JsError::syntax("Invalid imported binding name"));
+                    }
                     imported.clone()
                 };
                 specifiers.push(ImportSpecifier::Named { imported, local });
@@ -249,6 +363,11 @@ impl<'a> Parser<'a> {
 
     fn parse_module_export_name(&mut self) -> Result<String, JsError> {
         if let TokenKind::String(s, _) = self.cur.kind.clone() {
+            if self.cur.has_lone_surrogate {
+                return Err(JsError::syntax(
+                    "Module export name must be well-formed Unicode",
+                ));
+            }
             self.advance(true)?;
             Ok(s)
         } else {
@@ -293,41 +412,88 @@ impl<'a> Parser<'a> {
                 }
                 _ => return Err(JsError::syntax("Expected string after 'from'")),
             };
+            let attributes = self.parse_import_attributes()?;
             self.eat_semi()?;
-            return Ok(Stmt::Export(ExportDecl::All { exported, source }));
+            return Ok(Stmt::Export(ExportDecl::All {
+                exported,
+                source,
+                attributes,
+            }));
         }
         if self.eat(&TokenKind::LBrace, true)? {
             let mut specifiers = Vec::new();
             while self.cur.kind != TokenKind::RBrace && self.cur.kind != TokenKind::Eof {
-                let local = self.parse_module_export_name()?;
+                let (local, local_is_string) = if let TokenKind::String(s, _) = self.cur.kind.clone() {
+                    if self.cur.has_lone_surrogate {
+                        return Err(JsError::syntax(
+                            "Module export name must be well-formed Unicode",
+                        ));
+                    }
+                    self.advance(true)?;
+                    (s, true)
+                } else {
+                    (self.parse_ident_name()?, false)
+                };
                 let exported = if self.is_ident_word("as") {
                     self.advance(true)?;
                     self.parse_module_export_name()?
                 } else {
                     local.clone()
                 };
-                specifiers.push(ExportSpecifier { local, exported });
+                specifiers.push(ExportSpecifier {
+                    local,
+                    exported,
+                    local_is_string,
+                });
                 if !self.eat(&TokenKind::Comma, true)? {
                     break;
                 }
             }
             self.expect(&TokenKind::RBrace, true)?;
-            let source = if self.is_ident_word("from") {
+            let (source, attributes) = if self.is_ident_word("from") {
                 self.advance(true)?;
-                match self.cur.kind.clone() {
+                let s = match self.cur.kind.clone() {
                     TokenKind::String(s, _) => {
                         self.advance(false)?;
-                        Some(s)
+                        s
                     }
                     _ => return Err(JsError::syntax("Expected string after 'from'")),
-                }
+                };
+                let attrs = self.parse_import_attributes()?;
+                (Some(s), attrs)
             } else {
-                None
+                for sp in &specifiers {
+                    if sp.local_is_string {
+                        return Err(JsError::syntax(
+                            "String literal export name requires 'from' clause",
+                        ));
+                    }
+                }
+                (None, Vec::new())
             };
             self.eat_semi()?;
-            return Ok(Stmt::Export(ExportDecl::Named { specifiers, source }));
+            return Ok(Stmt::Export(ExportDecl::Named {
+                specifiers,
+                source,
+                attributes,
+            }));
         }
-        let decl = self.parse_stmt()?;
+        let decl = match &self.cur.kind {
+            TokenKind::KwVar => self.parse_var_decl(VarKind::Var, true)?,
+            TokenKind::KwConst => self.parse_var_decl(VarKind::Const, true)?,
+            TokenKind::Ident(s, false) if s == "let" => self.parse_var_decl(VarKind::Let, true)?,
+            TokenKind::KwFunction => Stmt::FuncDecl(self.parse_function(true, true)?),
+            TokenKind::Ident(s, false) if s == "async" => {
+                let next = self.peek_next(false)?;
+                if !next.preceded_by_newline && next.kind == TokenKind::KwFunction {
+                    Stmt::FuncDecl(self.parse_function(true, true)?)
+                } else {
+                    return Err(JsError::syntax("Invalid export declaration"));
+                }
+            }
+            TokenKind::KwClass => Stmt::ClassDecl(self.parse_class(true)?),
+            _ => return Err(JsError::syntax("Invalid export declaration")),
+        };
         Ok(Stmt::Export(ExportDecl::Decl(Box::new(decl))))
     }
 
@@ -476,6 +642,22 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    fn is_for_using_decl_start(&self) -> Result<bool, JsError> {
+        let mut lex = self.lexer.clone();
+        let t1 = lex.next_token(false)?;
+        if t1.preceded_by_newline {
+            return Ok(false);
+        }
+        if matches!(&t1.kind, TokenKind::Ident(s, false) if s == "of") {
+            let t2 = lex.next_token(true)?;
+            return Ok(matches!(t2.kind, TokenKind::Eq));
+        }
+        Ok(matches!(
+            t1.kind,
+            TokenKind::Ident(_, _) | TokenKind::KwYield | TokenKind::KwAwait
+        ))
+    }
+
     fn is_await_using_decl_start(&self) -> Result<bool, JsError> {
         let mut lex = self.lexer.clone();
         let t1 = lex.next_token(true)?;
@@ -537,6 +719,13 @@ impl<'a> Parser<'a> {
         let mut decls = Vec::new();
         loop {
             let pattern = self.parse_pattern()?;
+            if matches!(kind, VarKind::Using | VarKind::AwaitUsing)
+                && !matches!(pattern, Pattern::Ident(_))
+            {
+                return Err(JsError::syntax(
+                    "using declaration requires a binding identifier",
+                ));
+            }
             let init = if self.eat(&TokenKind::Eq, true)? {
                 Some(self.parse_assign_expr(allow_in)?)
             } else {
@@ -619,15 +808,31 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(s, false) if s == "let" && self.is_let_decl_start()? => {
                 Some(VarKind::Let)
             }
+            TokenKind::Ident(s, false) if s == "using" && self.is_for_using_decl_start()? => {
+                Some(VarKind::Using)
+            }
+            TokenKind::KwAwait if self.in_async && self.is_await_using_decl_start()? => {
+                self.advance(true)?;
+                Some(VarKind::AwaitUsing)
+            }
             _ => None,
         };
 
         if let Some(kind) = var_kind {
             self.advance(true)?;
             let first_pat = self.parse_pattern()?;
+            let is_using = matches!(kind, VarKind::Using | VarKind::AwaitUsing);
+            if is_using && !matches!(first_pat, Pattern::Ident(_)) {
+                return Err(JsError::syntax(
+                    "using declaration requires a binding identifier",
+                ));
+            }
             if self.cur.kind == TokenKind::KwIn {
                 if is_await {
                     return Err(JsError::syntax("for await cannot be used with in"));
+                }
+                if is_using {
+                    return Err(JsError::syntax("using declaration not allowed in for-in"));
                 }
                 self.advance(true)?;
                 let right = self.parse_expr(true)?;
@@ -643,6 +848,9 @@ impl<'a> Parser<'a> {
                 });
             }
             if self.is_ident_word("of") {
+                if kind == VarKind::Using && matches!(&first_pat, Pattern::Ident(n) if n == "of") {
+                    return Err(JsError::syntax("using of is not allowed in for-of"));
+                }
                 self.advance(true)?;
                 let right = self.parse_assign_expr(true)?;
                 self.expect(&TokenKind::RParen, true)?;
@@ -662,17 +870,28 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            if is_using && first_init.is_none() {
+                return Err(JsError::syntax("Missing initializer in using declaration"));
+            }
             let mut decls = vec![VarDeclarator {
                 pattern: first_pat,
                 init: first_init,
             }];
             while self.eat(&TokenKind::Comma, true)? {
                 let pat = self.parse_pattern()?;
+                if is_using && !matches!(pat, Pattern::Ident(_)) {
+                    return Err(JsError::syntax(
+                        "using declaration requires a binding identifier",
+                    ));
+                }
                 let init = if self.eat(&TokenKind::Eq, true)? {
                     Some(self.parse_assign_expr(false)?)
                 } else {
                     None
                 };
+                if is_using && init.is_none() {
+                    return Err(JsError::syntax("Missing initializer in using declaration"));
+                }
                 decls.push(VarDeclarator { pattern: pat, init });
             }
             if self.cur.kind == TokenKind::KwIn && decls.len() == 1 {
@@ -783,7 +1002,19 @@ impl<'a> Parser<'a> {
                 self.cur.kind,
                 TokenKind::KwCase | TokenKind::KwDefault | TokenKind::RBrace | TokenKind::Eof
             ) {
-                consequent.push(self.parse_stmt()?);
+                let s = self.parse_stmt()?;
+                if matches!(
+                    s,
+                    Stmt::VarDecl {
+                        kind: VarKind::Using | VarKind::AwaitUsing,
+                        ..
+                    }
+                ) {
+                    return Err(JsError::syntax(
+                        "using declaration is not allowed directly in a switch clause",
+                    ));
+                }
+                consequent.push(s);
             }
             cases.push(SwitchCase { test, consequent });
         }
@@ -986,6 +1217,7 @@ impl<'a> Parser<'a> {
             is_async,
             is_generator,
             is_arrow: false,
+            is_decl,
             strict,
             source: self.lexer.source()[func_start..func_end].trim().to_string(),
         }))
@@ -1268,6 +1500,7 @@ impl<'a> Parser<'a> {
             is_async,
             is_generator,
             is_arrow: false,
+            is_decl: false,
             strict,
             source: self.lexer.source()[start..end].trim().to_string(),
         }))
@@ -1583,6 +1816,7 @@ impl<'a> Parser<'a> {
             is_async,
             is_generator: false,
             is_arrow: true,
+            is_decl: false,
             strict,
             source: self.lexer.source()[start..end].trim().to_string(),
         })))
@@ -1815,6 +2049,8 @@ impl<'a> Parser<'a> {
     fn parse_lhs_expr(&mut self, allow_call: bool) -> Result<Expr, JsError> {
         let mut expr = if self.cur.kind == TokenKind::KwNew {
             self.parse_new_expr()?
+        } else if self.cur.kind == TokenKind::KwImport {
+            self.parse_import_expr(allow_call)?
         } else {
             self.parse_primary_expr()?
         };
@@ -1907,6 +2143,56 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_import_expr(&mut self, allow_call: bool) -> Result<Expr, JsError> {
+        self.advance(true)?;
+        let phase = if self.eat(&TokenKind::Dot, true)? {
+            match self.cur.kind.clone() {
+                TokenKind::Ident(s, false) if s == "meta" => {
+                    if !self.is_module {
+                        return Err(JsError::syntax("import.meta may only be used in a module"));
+                    }
+                    self.advance(false)?;
+                    return Ok(Expr::ImportMeta);
+                }
+                TokenKind::Ident(s, false) if s == "defer" => {
+                    self.advance(true)?;
+                    ImportPhase::Defer
+                }
+                TokenKind::Ident(s, false) if s == "source" => {
+                    self.advance(true)?;
+                    ImportPhase::Source
+                }
+                _ => {
+                    return Err(JsError::syntax("Unknown meta property on import"));
+                }
+            }
+        } else {
+            ImportPhase::Evaluation
+        };
+        if !allow_call {
+            return Err(JsError::syntax("Cannot use new with import()"));
+        }
+        self.expect(&TokenKind::LParen, true)?;
+        let spec = self.parse_assign_expr(true)?;
+        let options = if self.eat(&TokenKind::Comma, true)? {
+            if self.cur.kind != TokenKind::RParen {
+                let opt = self.parse_assign_expr(true)?;
+                let _ = self.eat(&TokenKind::Comma, true);
+                Some(Box::new(opt))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.expect(&TokenKind::RParen, false)?;
+        Ok(Expr::DynamicImport {
+            spec: Box::new(spec),
+            options,
+            phase,
+        })
+    }
+
     fn parse_new_expr(&mut self) -> Result<Expr, JsError> {
         self.advance(true)?;
         if self.eat(&TokenKind::Dot, true)? {
@@ -1984,28 +2270,7 @@ impl<'a> Parser<'a> {
                 self.advance(false)?;
                 Ok(Expr::Super)
             }
-            TokenKind::KwImport => {
-                self.advance(true)?;
-                if self.eat(&TokenKind::Dot, true)? {
-                    let prop = self.parse_ident_name_after_dot()?;
-                    if prop == "meta" {
-                        return Ok(Expr::ImportMeta);
-                    }
-                    return Err(JsError::syntax(format!(
-                        "Unknown meta property import.{}",
-                        prop
-                    )));
-                }
-                self.expect(&TokenKind::LParen, true)?;
-                let spec = self.parse_assign_expr(true)?;
-                let _ = self.eat(&TokenKind::Comma, true);
-                if self.cur.kind != TokenKind::RParen {
-                    let _ = self.parse_assign_expr(true)?;
-                    let _ = self.eat(&TokenKind::Comma, true);
-                }
-                self.expect(&TokenKind::RParen, false)?;
-                Ok(Expr::DynamicImport(Box::new(spec)))
-            }
+            TokenKind::KwImport => self.parse_import_expr(true),
             TokenKind::Ident(s, false) if s == "async" => {
                 let next = self.peek_next(false)?;
                 if !next.preceded_by_newline && next.kind == TokenKind::KwFunction {
@@ -3642,8 +3907,14 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx<'_>) -> Result<(), JsError> {
             }
             Ok(())
         }
+        Expr::DynamicImport { spec, options, .. } => {
+            validate_expr(spec, ctx)?;
+            if let Some(opt) = options {
+                validate_expr(opt, ctx)?;
+            }
+            Ok(())
+        }
         Expr::OptionalChain(e)
-        | Expr::DynamicImport(e)
         | Expr::Unary { arg: e, .. } => validate_expr(e, ctx),
         Expr::Update { arg: e, .. } => {
             if let Expr::Ident(n) = e.as_ref() {
@@ -3733,5 +4004,357 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx<'_>) -> Result<(), JsError> {
         | Expr::RegExp { .. }
         | Expr::This
         | Expr::ImportMeta => Ok(()),
+    }
+}
+
+fn validate_module_early_errors(program: &Program) -> Result<(), JsError> {
+    let mut lex_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut var_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut exported_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut local_export_refs: Vec<String> = Vec::new();
+
+    let add_lex = |name: &str, lex: &mut std::collections::HashSet<String>| -> Result<(), JsError> {
+        if name == "eval" || name == "arguments" {
+            return Err(JsError::syntax(format!(
+                "Unexpected '{}' binding in module",
+                name
+            )));
+        }
+        if !lex.insert(name.to_string()) {
+            return Err(JsError::syntax(format!(
+                "Identifier '{}' has already been declared",
+                name
+            )));
+        }
+        Ok(())
+    };
+
+    let add_export =
+        |name: &str, exps: &mut std::collections::HashSet<String>| -> Result<(), JsError> {
+            if !exps.insert(name.to_string()) {
+                return Err(JsError::syntax(format!(
+                    "Duplicate export of '{}'",
+                    name
+                )));
+            }
+            Ok(())
+        };
+
+    for stmt in &program.body {
+        match stmt {
+            Stmt::Import(imp) => {
+                for sp in &imp.specifiers {
+                    let local = match sp {
+                        ImportSpecifier::Default(n)
+                        | ImportSpecifier::Namespace(n)
+                        | ImportSpecifier::Named { local: n, .. } => n,
+                    };
+                    add_lex(local, &mut lex_names)?;
+                }
+            }
+            Stmt::Export(exp) => match exp {
+                ExportDecl::DefaultExpr(_) => {
+                    add_export("default", &mut exported_names)?;
+                }
+                ExportDecl::DefaultFunc(f) => {
+                    add_export("default", &mut exported_names)?;
+                    if let Some(ref n) = f.name {
+                        add_lex(n, &mut lex_names)?;
+                    }
+                }
+                ExportDecl::DefaultClass(c) => {
+                    add_export("default", &mut exported_names)?;
+                    if let Some(ref n) = c.name {
+                        add_lex(n, &mut lex_names)?;
+                    }
+                }
+                ExportDecl::Decl(inner) => match inner.as_ref() {
+                    Stmt::VarDecl {
+                        kind: VarKind::Var,
+                        decls,
+                    } => {
+                        let mut names = Vec::new();
+                        for d in decls {
+                            collect_pat_bound_names(&d.pattern, &mut names);
+                        }
+                        for n in names {
+                            var_names.insert(n.clone());
+                            add_export(&n, &mut exported_names)?;
+                        }
+                    }
+                    Stmt::VarDecl { decls, .. } => {
+                        let mut names = Vec::new();
+                        for d in decls {
+                            collect_pat_bound_names(&d.pattern, &mut names);
+                        }
+                        for n in names {
+                            add_lex(&n, &mut lex_names)?;
+                            add_export(&n, &mut exported_names)?;
+                        }
+                    }
+                    Stmt::FuncDecl(f) => {
+                        if let Some(ref n) = f.name {
+                            add_lex(n, &mut lex_names)?;
+                            add_export(n, &mut exported_names)?;
+                        }
+                    }
+                    Stmt::ClassDecl(c) => {
+                        if let Some(ref n) = c.name {
+                            add_lex(n, &mut lex_names)?;
+                            add_export(n, &mut exported_names)?;
+                        }
+                    }
+                    _ => {}
+                },
+                ExportDecl::Named {
+                    specifiers, source, ..
+                } => {
+                    for sp in specifiers {
+                        add_export(&sp.exported, &mut exported_names)?;
+                        if source.is_none() {
+                            local_export_refs.push(sp.local.clone());
+                        }
+                    }
+                }
+                ExportDecl::All {
+                    exported: Some(name),
+                    ..
+                } => {
+                    add_export(name, &mut exported_names)?;
+                }
+                ExportDecl::All { exported: None, .. } => {}
+            },
+            Stmt::VarDecl {
+                kind: VarKind::Var, ..
+            } => {
+                collect_stmt_var_names(stmt, &mut var_names);
+            }
+            Stmt::VarDecl { decls, .. } => {
+                let mut names = Vec::new();
+                for d in decls {
+                    collect_pat_bound_names(&d.pattern, &mut names);
+                }
+                for n in names {
+                    add_lex(&n, &mut lex_names)?;
+                }
+            }
+            Stmt::FuncDecl(f) => {
+                if let Some(ref n) = f.name {
+                    add_lex(n, &mut lex_names)?;
+                }
+            }
+            Stmt::ClassDecl(c) => {
+                if let Some(ref n) = c.name {
+                    add_lex(n, &mut lex_names)?;
+                }
+            }
+            other => {
+                collect_stmt_var_names(other, &mut var_names);
+            }
+        }
+    }
+
+    for vn in &var_names {
+        if lex_names.contains(vn) {
+            return Err(JsError::syntax(format!(
+                "Identifier '{}' has already been declared",
+                vn
+            )));
+        }
+    }
+    for local in &local_export_refs {
+        if !lex_names.contains(local) && !var_names.contains(local) {
+            return Err(JsError::syntax(format!(
+                "Export '{}' is not defined in module",
+                local
+            )));
+        }
+    }
+    let mut active_labels = Vec::new();
+    for stmt in &program.body {
+        check_duplicate_labels(stmt, &mut active_labels)?;
+    }
+    Ok(())
+}
+
+fn check_duplicate_labels(stmt: &Stmt, active: &mut Vec<String>) -> Result<(), JsError> {
+    match stmt {
+        Stmt::Labeled { label, body } => {
+            if active.contains(label) {
+                return Err(JsError::syntax(format!(
+                    "Duplicate label '{}'",
+                    label
+                )));
+            }
+            active.push(label.clone());
+            check_duplicate_labels(body, active)?;
+            active.pop();
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                check_duplicate_labels(s, active)?;
+            }
+        }
+        Stmt::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            check_duplicate_labels(consequent, active)?;
+            if let Some(alt) = alternate {
+                check_duplicate_labels(alt, active)?;
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForIn { body, .. }
+        | Stmt::ForOf { body, .. }
+        | Stmt::With { body, .. } => check_duplicate_labels(body, active)?,
+        Stmt::Switch { cases, .. } => {
+            for c in cases {
+                for s in &c.consequent {
+                    check_duplicate_labels(s, active)?;
+                }
+            }
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            for s in block {
+                check_duplicate_labels(s, active)?;
+            }
+            if let Some(h) = handler {
+                for s in &h.body {
+                    check_duplicate_labels(s, active)?;
+                }
+            }
+            if let Some(f) = finalizer {
+                for s in f {
+                    check_duplicate_labels(s, active)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_pat_bound_names(pat: &Pattern, out: &mut Vec<String>) {
+    match pat {
+        Pattern::Ident(n) => out.push(n.clone()),
+        Pattern::Assign { left, .. } => collect_pat_bound_names(left, out),
+        Pattern::Array { elements, rest } => {
+            for el in elements.iter().flatten() {
+                collect_pat_bound_names(el, out);
+            }
+            if let Some(r) = rest {
+                collect_pat_bound_names(r, out);
+            }
+        }
+        Pattern::Object { props, rest } => {
+            for p in props {
+                collect_pat_bound_names(&p.value, out);
+            }
+            if let Some(r) = rest {
+                collect_pat_bound_names(r, out);
+            }
+        }
+        Pattern::Member(_) => {}
+    }
+}
+
+fn collect_stmt_var_names(stmt: &Stmt, out: &mut std::collections::HashSet<String>) {
+    match stmt {
+        Stmt::VarDecl {
+            kind: VarKind::Var,
+            decls,
+        } => {
+            let mut names = Vec::new();
+            for d in decls {
+                collect_pat_bound_names(&d.pattern, &mut names);
+            }
+            for n in names {
+                out.insert(n);
+            }
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                collect_stmt_var_names(s, out);
+            }
+        }
+        Stmt::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            collect_stmt_var_names(consequent, out);
+            if let Some(alt) = alternate {
+                collect_stmt_var_names(alt, out);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::With { body, .. } => collect_stmt_var_names(body, out),
+        Stmt::For { init, body, .. } => {
+            if let Some(ForInit::VarDecl {
+                kind: VarKind::Var,
+                decls,
+            }) = init
+            {
+                let mut names = Vec::new();
+                for d in decls {
+                    collect_pat_bound_names(&d.pattern, &mut names);
+                }
+                for n in names {
+                    out.insert(n);
+                }
+            }
+            collect_stmt_var_names(body, out);
+        }
+        Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
+            if let ForInOfLeft::VarDecl {
+                kind: VarKind::Var,
+                pattern,
+            } = left
+            {
+                let mut names = Vec::new();
+                collect_pat_bound_names(pattern, &mut names);
+                for n in names {
+                    out.insert(n);
+                }
+            }
+            collect_stmt_var_names(body, out);
+        }
+        Stmt::Switch { cases, .. } => {
+            for c in cases {
+                for s in &c.consequent {
+                    collect_stmt_var_names(s, out);
+                }
+            }
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            for s in block {
+                collect_stmt_var_names(s, out);
+            }
+            if let Some(h) = handler {
+                for s in &h.body {
+                    collect_stmt_var_names(s, out);
+                }
+            }
+            if let Some(f) = finalizer {
+                for s in f {
+                    collect_stmt_var_names(s, out);
+                }
+            }
+        }
+        _ => {}
     }
 }

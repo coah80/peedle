@@ -12,6 +12,7 @@ pub struct FuncTemplate {
     pub is_generator: bool,
     pub is_arrow: bool,
     pub is_method: bool,
+    pub is_decl: bool,
     pub strict: bool,
     pub source: String,
 }
@@ -184,8 +185,12 @@ pub enum Op {
     Await,
 
     CreateTemplateObject(u32),
-    DynamicImport,
+    DynamicImport {
+        has_options: bool,
+        phase: u8,
+    },
     ExportBinding(u32),
+    ExportDefault,
     ImportModule(u32),
     ImportBinding(u32, u32),
     ImportNamespace(u32),
@@ -202,6 +207,7 @@ pub enum Op {
         sync_ip: u32,
         end_ip: u32,
     },
+    SuppressDisposeError,
     RecordExcludedKey,
     ObjectRestDyn(u32),
     DeleteSuper,

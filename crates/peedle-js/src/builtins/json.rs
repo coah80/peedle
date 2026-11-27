@@ -7,6 +7,16 @@ use crate::vm::JsRuntime;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+pub fn parse_json_str(rt: &mut JsRuntime, text: &str) -> Result<JsValue, JsError> {
+    let mut parser = JsonParser::new(text);
+    let (val, _) = parser.parse_value(rt)?;
+    parser.skip_ws();
+    if parser.pos < parser.bytes.len() {
+        return Err(JsError::syntax("Unexpected trailing data in JSON"));
+    }
+    Ok(val)
+}
+
 pub fn init(rt: &mut JsRuntime) {
     let json = rt.create_object();
     let tag = rt.symbols.to_string_tag;

@@ -11,6 +11,7 @@ pub enum ErrorKind {
     UriError,
     EvalError,
     AggregateError,
+    SuppressedError,
     InternalError,
 }
 
@@ -25,6 +26,7 @@ impl ErrorKind {
             ErrorKind::UriError => "URIError",
             ErrorKind::EvalError => "EvalError",
             ErrorKind::AggregateError => "AggregateError",
+            ErrorKind::SuppressedError => "SuppressedError",
             ErrorKind::InternalError => "InternalError",
         }
     }

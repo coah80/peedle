@@ -153,6 +153,22 @@ pub fn init(rt: &mut JsRuntime) {
 
     set_method(
         rt,
+        ctor,
+        "zip",
+        1,
+        Rc::new(|rt, _, args| iterator_zip(rt, args)),
+    );
+
+    set_method(
+        rt,
+        ctor,
+        "zipKeyed",
+        1,
+        Rc::new(|rt, _, args| iterator_zip_keyed(rt, args)),
+    );
+
+    set_method(
+        rt,
         proto,
         "map",
         1,
@@ -524,6 +540,188 @@ pub fn init(rt: &mut JsRuntime) {
                 counter += 1;
             }
             Ok(JsValue::Undefined)
+        }),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "includes",
+        1,
+        Rc::new(|rt, this, args| {
+            let JsValue::Object(_) = this else {
+                return Err(JsError::type_err(
+                    "Iterator.prototype.includes requires an object",
+                ));
+            };
+            let search = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let to_skip = match args.get(1) {
+                None | Some(JsValue::Undefined) => 0.0,
+                Some(JsValue::Number(n)) => {
+                    if !n.is_infinite() && !(n.is_finite() && n.fract() == 0.0) {
+                        rt.iterator_close(&this);
+                        return Err(JsError::type_err(
+                            "skippedElements must be an integral number or infinity",
+                        ));
+                    }
+                    if *n < 0.0 || (n.is_finite() && *n > 9_007_199_254_740_991.0) {
+                        rt.iterator_close(&this);
+                        return Err(JsError::range("skippedElements out of range"));
+                    }
+                    *n
+                }
+                Some(_) => {
+                    rt.iterator_close(&this);
+                    return Err(JsError::type_err("skippedElements must be a number"));
+                }
+            };
+            let iterated = get_iterator_direct(rt, &this)?;
+            let mut skipped = 0.0_f64;
+            while let Some(v) = step_record(rt, &iterated)? {
+                if skipped < to_skip {
+                    skipped += 1.0;
+                    continue;
+                }
+                if v.same_value_zero(&search) {
+                    rt.iterator_close_checked(&iterated.iterator, false)?;
+                    return Ok(JsValue::Boolean(true));
+                }
+            }
+            Ok(JsValue::Boolean(false))
+        }),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "join",
+        1,
+        Rc::new(|rt, this, args| {
+            let JsValue::Object(_) = this else {
+                return Err(JsError::type_err(
+                    "Iterator.prototype.join requires an object",
+                ));
+            };
+            let sep = match args.first() {
+                None | Some(JsValue::Undefined) => ",".to_string(),
+                Some(v) => match rt.to_string(v) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rt.iterator_close(&this);
+                        return Err(e);
+                    }
+                },
+            };
+            let iterated = get_iterator_direct(rt, &this)?;
+            let mut out = String::new();
+            let mut first = true;
+            while let Some(v) = step_record(rt, &iterated)? {
+                if !first {
+                    out.push_str(&sep);
+                }
+                first = false;
+                if !v.is_nullish() {
+                    match rt.to_string(&v) {
+                        Ok(s) => out.push_str(&s),
+                        Err(e) => {
+                            rt.iterator_close(&iterated.iterator);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::String(out))
+        }),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "chunks",
+        1,
+        Rc::new(|rt, this, args| {
+            let JsValue::Object(_) = this else {
+                return Err(JsError::type_err(
+                    "Iterator.prototype.chunks requires an object",
+                ));
+            };
+            let chunk_size = match args.first() {
+                Some(JsValue::Number(n)) if n.is_finite() && n.fract() == 0.0 => {
+                    if *n < 1.0 || *n > 4_294_967_295.0 {
+                        rt.iterator_close(&this);
+                        return Err(JsError::range("chunkSize out of range"));
+                    }
+                    *n as usize
+                }
+                _ => {
+                    rt.iterator_close(&this);
+                    return Err(JsError::type_err("chunkSize must be an integral number"));
+                }
+            };
+            let iterated = get_iterator_direct(rt, &this)?;
+            let helper = rt.create_builtin_iterator(BuiltinIteratorKind::Helper(
+                IteratorHelperData {
+                    state: IteratorHelperState::SuspendedStart,
+                    kind: IteratorHelperKind::Chunks {
+                        iterated,
+                        chunk_size,
+                        exhausted: false,
+                    },
+                },
+            ));
+            Ok(JsValue::Object(helper))
+        }),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "windows",
+        1,
+        Rc::new(|rt, this, args| {
+            let JsValue::Object(_) = this else {
+                return Err(JsError::type_err(
+                    "Iterator.prototype.windows requires an object",
+                ));
+            };
+            let window_size = match args.first() {
+                Some(JsValue::Number(n)) if n.is_finite() && n.fract() == 0.0 => {
+                    if *n < 1.0 || *n > 4_294_967_295.0 {
+                        rt.iterator_close(&this);
+                        return Err(JsError::range("windowSize out of range"));
+                    }
+                    *n as usize
+                }
+                _ => {
+                    rt.iterator_close(&this);
+                    return Err(JsError::type_err("windowSize must be an integral number"));
+                }
+            };
+            let allow_partial = match args.get(1) {
+                None | Some(JsValue::Undefined) => false,
+                Some(JsValue::String(s)) if s == "only-full" => false,
+                Some(JsValue::String(s)) if s == "allow-partial" => true,
+                _ => {
+                    rt.iterator_close(&this);
+                    return Err(JsError::type_err(
+                        "undersized must be 'only-full' or 'allow-partial'",
+                    ));
+                }
+            };
+            let iterated = get_iterator_direct(rt, &this)?;
+            let helper = rt.create_builtin_iterator(BuiltinIteratorKind::Helper(
+                IteratorHelperData {
+                    state: IteratorHelperState::SuspendedStart,
+                    kind: IteratorHelperKind::Windows {
+                        iterated,
+                        window_size,
+                        allow_partial,
+                        buffer: Vec::new(),
+                        exhausted: false,
+                    },
+                },
+            ));
+            Ok(JsValue::Object(helper))
         }),
     );
 
@@ -937,6 +1135,276 @@ fn helper_next(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, JsError> {
             let rec = get_iterator_direct(rt, &iter)?;
             inner = Some(rec);
         })(),
+        IteratorHelperKind::Chunks {
+            iterated,
+            chunk_size,
+            mut exhausted,
+        } => (|| {
+            if exhausted {
+                return Ok((
+                    None,
+                    IteratorHelperKind::Chunks {
+                        iterated,
+                        chunk_size,
+                        exhausted: true,
+                    },
+                ));
+            }
+            let mut buf = Vec::new();
+            while buf.len() < chunk_size {
+                match step_record(rt, &iterated)? {
+                    Some(v) => buf.push(v),
+                    None => {
+                        exhausted = true;
+                        break;
+                    }
+                }
+            }
+            if buf.is_empty() {
+                Ok((
+                    None,
+                    IteratorHelperKind::Chunks {
+                        iterated,
+                        chunk_size,
+                        exhausted: true,
+                    },
+                ))
+            } else {
+                let arr = rt.create_array(buf);
+                Ok((
+                    Some(JsValue::Object(arr)),
+                    IteratorHelperKind::Chunks {
+                        iterated,
+                        chunk_size,
+                        exhausted,
+                    },
+                ))
+            }
+        })(),
+        IteratorHelperKind::Windows {
+            iterated,
+            window_size,
+            allow_partial,
+            mut buffer,
+            mut exhausted,
+        } => (|| {
+            if exhausted {
+                return Ok((
+                    None,
+                    IteratorHelperKind::Windows {
+                        iterated,
+                        window_size,
+                        allow_partial,
+                        buffer,
+                        exhausted: true,
+                    },
+                ));
+            }
+            if buffer.len() == window_size {
+                buffer.remove(0);
+                match step_record(rt, &iterated)? {
+                    Some(v) => {
+                        buffer.push(v);
+                        let arr = rt.create_array(buffer.clone());
+                        Ok((
+                            Some(JsValue::Object(arr)),
+                            IteratorHelperKind::Windows {
+                                iterated,
+                                window_size,
+                                allow_partial,
+                                buffer,
+                                exhausted: false,
+                            },
+                        ))
+                    }
+                    None => Ok((
+                        None,
+                        IteratorHelperKind::Windows {
+                            iterated,
+                            window_size,
+                            allow_partial,
+                            buffer: Vec::new(),
+                            exhausted: true,
+                        },
+                    )),
+                }
+            } else {
+                while buffer.len() < window_size {
+                    match step_record(rt, &iterated)? {
+                        Some(v) => buffer.push(v),
+                        None => {
+                            exhausted = true;
+                            if allow_partial && !buffer.is_empty() {
+                                let arr = rt.create_array(std::mem::take(&mut buffer));
+                                return Ok((
+                                    Some(JsValue::Object(arr)),
+                                    IteratorHelperKind::Windows {
+                                        iterated,
+                                        window_size,
+                                        allow_partial,
+                                        buffer: Vec::new(),
+                                        exhausted: true,
+                                    },
+                                ));
+                            }
+                            return Ok((
+                                None,
+                                IteratorHelperKind::Windows {
+                                    iterated,
+                                    window_size,
+                                    allow_partial,
+                                    buffer: Vec::new(),
+                                    exhausted: true,
+                                },
+                            ));
+                        }
+                    }
+                }
+                let arr = rt.create_array(buffer.clone());
+                Ok((
+                    Some(JsValue::Object(arr)),
+                    IteratorHelperKind::Windows {
+                        iterated,
+                        window_size,
+                        allow_partial,
+                        buffer,
+                        exhausted: false,
+                    },
+                ))
+            }
+        })(),
+        IteratorHelperKind::Zip {
+            mut iters,
+            mode,
+            padding,
+            keys,
+        } => (|| {
+            let count = iters.len();
+            if count == 0 {
+                return Ok((
+                    None,
+                    IteratorHelperKind::Zip {
+                        iters,
+                        mode,
+                        padding,
+                        keys,
+                    },
+                ));
+            }
+            let mut results = Vec::with_capacity(count);
+            for i in 0..count {
+                let Some(rec) = iters[i].clone() else {
+                    results.push(padding[i].clone());
+                    continue;
+                };
+                match step_record(rt, &rec) {
+                    Err(e) => {
+                        iters[i] = None;
+                        iterator_close_all(rt, &iters, Some(e))?;
+                        unreachable!();
+                    }
+                    Ok(Some(v)) => results.push(v),
+                    Ok(None) => {
+                        iters[i] = None;
+                        match mode {
+                            ZipMode::Shortest => {
+                                iterator_close_all(rt, &iters, None)?;
+                                return Ok((
+                                    None,
+                                    IteratorHelperKind::Zip {
+                                        iters,
+                                        mode,
+                                        padding,
+                                        keys,
+                                    },
+                                ));
+                            }
+                            ZipMode::Strict => {
+                                if i != 0 {
+                                    iterator_close_all(
+                                        rt,
+                                        &iters,
+                                        Some(JsError::type_err(
+                                            "Iterator.zip strict mode: iterators have different lengths",
+                                        )),
+                                    )?;
+                                    unreachable!();
+                                }
+                                for k in 1..count {
+                                    let Some(rk) = iters[k].clone() else {
+                                        continue;
+                                    };
+                                    match step_record(rt, &rk) {
+                                        Err(e) => {
+                                            iters[k] = None;
+                                            iterator_close_all(rt, &iters, Some(e))?;
+                                            unreachable!();
+                                        }
+                                        Ok(None) => {
+                                            iters[k] = None;
+                                        }
+                                        Ok(Some(_)) => {
+                                            iterator_close_all(
+                                                rt,
+                                                &iters,
+                                                Some(JsError::type_err(
+                                                    "Iterator.zip strict mode: iterators have different lengths",
+                                                )),
+                                            )?;
+                                            unreachable!();
+                                        }
+                                    }
+                                }
+                                return Ok((
+                                    None,
+                                    IteratorHelperKind::Zip {
+                                        iters,
+                                        mode,
+                                        padding,
+                                        keys,
+                                    },
+                                ));
+                            }
+                            ZipMode::Longest => {
+                                if iters.iter().all(|it| it.is_none()) {
+                                    return Ok((
+                                        None,
+                                        IteratorHelperKind::Zip {
+                                            iters,
+                                            mode,
+                                            padding,
+                                            keys,
+                                        },
+                                    ));
+                                }
+                                results.push(padding[i].clone());
+                            }
+                        }
+                    }
+                }
+            }
+            let out_val = if let Some(ref ks) = keys {
+                let obj = rt.create_object_with_proto(None);
+                for (k, v) in ks.iter().zip(results) {
+                    rt.heap.get_obj_mut(obj).set_own_prop(
+                        k.clone(),
+                        PropEntry::data(v, true, true, true),
+                    );
+                }
+                JsValue::Object(obj)
+            } else {
+                JsValue::Object(rt.create_array(results))
+            };
+            Ok((
+                Some(out_val),
+                IteratorHelperKind::Zip {
+                    iters,
+                    mode,
+                    padding,
+                    keys,
+                },
+            ))
+        })(),
     };
 
     match step_res {
@@ -977,6 +1445,7 @@ fn helper_return(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, JsError> 
         }) => (hd.state, hd.kind.clone()),
         _ => return Err(JsError::type_err("Incompatible receiver for Iterator Helper")),
     };
+    let was_suspended_start = matches!(state, IteratorHelperState::SuspendedStart);
     match state {
         IteratorHelperState::Executing => {
             return Err(JsError::type_err("Iterator Helper is already executing"));
@@ -986,7 +1455,11 @@ fn helper_return(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, JsError> 
         }
         IteratorHelperState::SuspendedStart | IteratorHelperState::SuspendedYield => {}
     }
-    set_helper_state(rt, oid, IteratorHelperState::Executing);
+    if was_suspended_start {
+        set_helper_state(rt, oid, IteratorHelperState::Completed);
+    } else {
+        set_helper_state(rt, oid, IteratorHelperState::Executing);
+    }
     let close_res: Result<(), JsError> = match kind {
         IteratorHelperKind::Map { iterated, .. }
         | IteratorHelperKind::Filter { iterated, .. }
@@ -1017,8 +1490,250 @@ fn helper_return(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, JsError> 
                 Ok(())
             }
         }
+        IteratorHelperKind::Chunks {
+            iterated,
+            exhausted,
+            ..
+        }
+        | IteratorHelperKind::Windows {
+            iterated,
+            exhausted,
+            ..
+        } => {
+            if exhausted {
+                Ok(())
+            } else {
+                rt.iterator_close_checked(&iterated.iterator, false)
+            }
+        }
+        IteratorHelperKind::Zip { iters, .. } => iterator_close_all(rt, &iters, None),
     };
     set_helper_state(rt, oid, IteratorHelperState::Completed);
     close_res?;
     Ok(rt.create_iter_result(JsValue::Undefined, true))
+}
+
+fn parse_zip_options(
+    rt: &mut JsRuntime,
+    options_val: Option<&JsValue>,
+) -> Result<(ZipMode, Option<JsValue>), JsError> {
+    let opts_oid = match options_val {
+        None | Some(JsValue::Undefined) => None,
+        Some(JsValue::Object(o)) => Some(*o),
+        _ => return Err(JsError::type_err("options must be an object or undefined")),
+    };
+    let mode_val = if let Some(o) = opts_oid {
+        rt.get_property(o, "mode")?
+    } else {
+        JsValue::Undefined
+    };
+    let mode = match &mode_val {
+        JsValue::Undefined => ZipMode::Shortest,
+        JsValue::String(s) if s == "shortest" => ZipMode::Shortest,
+        JsValue::String(s) if s == "longest" => ZipMode::Longest,
+        JsValue::String(s) if s == "strict" => ZipMode::Strict,
+        _ => return Err(JsError::type_err("Invalid mode option for Iterator.zip")),
+    };
+    let padding_opt = if mode == ZipMode::Longest {
+        let p = if let Some(o) = opts_oid {
+            rt.get_property(o, "padding")?
+        } else {
+            JsValue::Undefined
+        };
+        if p.is_undefined() {
+            None
+        } else if matches!(p, JsValue::Object(_)) {
+            Some(p)
+        } else {
+            return Err(JsError::type_err("padding option must be an object or undefined"));
+        }
+    } else {
+        None
+    };
+    Ok((mode, padding_opt))
+}
+
+fn iterator_close_all(
+    rt: &mut JsRuntime,
+    iters: &[Option<IterRecord>],
+    mut err: Option<JsError>,
+) -> Result<(), JsError> {
+    for it in iters.iter().rev().flatten() {
+        if err.is_some() {
+            rt.iterator_close(&it.iterator);
+        } else if let Err(e) = rt.iterator_close_checked(&it.iterator, false) {
+            err = Some(e);
+        }
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn get_sync_iterator(rt: &mut JsRuntime, obj: &JsValue) -> Result<IterRecord, JsError> {
+    let JsValue::Object(oid) = obj else {
+        return Err(JsError::type_err("Value is not iterable"));
+    };
+    let sym_iter = PropertyKey::Symbol(rt.symbols.iterator);
+    let method = rt.get_property_key(*oid, &sym_iter)?;
+    if !rt.is_callable(&method) {
+        return Err(JsError::type_err("Value is not iterable"));
+    }
+    let iter = rt.call_function(method, obj.clone(), &[])?;
+    let JsValue::Object(_) = iter else {
+        return Err(JsError::type_err("Iterator must be an object"));
+    };
+    get_iterator_direct(rt, &iter)
+}
+
+fn iterator_zip(rt: &mut JsRuntime, args: &[JsValue]) -> Result<JsValue, JsError> {
+    let iterables = args.first().cloned().unwrap_or(JsValue::Undefined);
+    let JsValue::Object(_) = iterables else {
+        return Err(JsError::type_err("Iterator.zip iterables must be an object"));
+    };
+    let (mode, padding_opt) = parse_zip_options(rt, args.get(1))?;
+    let input_iter = get_sync_iterator(rt, &iterables)?;
+    let mut iters: Vec<Option<IterRecord>> = Vec::new();
+    loop {
+        let item = match step_record(rt, &input_iter) {
+            Ok(Some(v)) => v,
+            Ok(None) => break,
+            Err(e) => {
+                iterator_close_all(rt, &iters, Some(e))?;
+                unreachable!();
+            }
+        };
+        match get_iterator_flattenable(rt, &item, false) {
+            Ok(rec) => iters.push(Some(rec)),
+            Err(e) => {
+                let _ = iterator_close_all(rt, &iters, Some(e.clone()));
+                rt.iterator_close(&input_iter.iterator);
+                return Err(e);
+            }
+        }
+    }
+    let mut padding = Vec::with_capacity(iters.len());
+    if mode == ZipMode::Longest {
+        if let Some(pad_obj) = padding_opt {
+            let pad_iter = match get_sync_iterator(rt, &pad_obj) {
+                Ok(r) => r,
+                Err(e) => {
+                    iterator_close_all(rt, &iters, Some(e))?;
+                    unreachable!();
+                }
+            };
+            let mut using_padding = true;
+            for _ in 0..iters.len() {
+                if using_padding {
+                    match step_record(rt, &pad_iter) {
+                        Ok(Some(v)) => padding.push(v),
+                        Ok(None) => {
+                            using_padding = false;
+                            padding.push(JsValue::Undefined);
+                        }
+                        Err(e) => {
+                            iterator_close_all(rt, &iters, Some(e))?;
+                            unreachable!();
+                        }
+                    }
+                } else {
+                    padding.push(JsValue::Undefined);
+                }
+            }
+            if using_padding {
+                if let Err(e) = rt.iterator_close_checked(&pad_iter.iterator, false) {
+                    iterator_close_all(rt, &iters, Some(e))?;
+                    unreachable!();
+                }
+            }
+        } else {
+            padding.resize(iters.len(), JsValue::Undefined);
+        }
+    }
+    let helper = rt.create_builtin_iterator(BuiltinIteratorKind::Helper(
+        IteratorHelperData {
+            state: IteratorHelperState::SuspendedStart,
+            kind: IteratorHelperKind::Zip {
+                iters,
+                mode,
+                padding,
+                keys: None,
+            },
+        },
+    ));
+    Ok(JsValue::Object(helper))
+}
+
+fn iterator_zip_keyed(rt: &mut JsRuntime, args: &[JsValue]) -> Result<JsValue, JsError> {
+    let iterables = args.first().cloned().unwrap_or(JsValue::Undefined);
+    let JsValue::Object(iterables_oid) = iterables else {
+        return Err(JsError::type_err(
+            "Iterator.zipKeyed iterables must be an object",
+        ));
+    };
+    let (mode, padding_opt) = parse_zip_options(rt, args.get(1))?;
+    let all_keys = rt.own_keys(iterables_oid)?;
+    let mut keys: Vec<PropertyKey> = Vec::new();
+    let mut iters: Vec<Option<IterRecord>> = Vec::new();
+    for k in all_keys {
+        let desc = match rt.get_own_property_descriptor(iterables_oid, &k) {
+            Ok(d) => d,
+            Err(e) => {
+                iterator_close_all(rt, &iters, Some(e))?;
+                unreachable!();
+            }
+        };
+        if let Some(d) = desc {
+            if d.enumerable == Some(true) {
+                let val = match rt.get_property_key(iterables_oid, &k) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        iterator_close_all(rt, &iters, Some(e))?;
+                        unreachable!();
+                    }
+                };
+                if !val.is_undefined() {
+                    match get_iterator_flattenable(rt, &val, false) {
+                        Ok(rec) => {
+                            keys.push(k);
+                            iters.push(Some(rec));
+                        }
+                        Err(e) => {
+                            iterator_close_all(rt, &iters, Some(e))?;
+                            unreachable!();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut padding = Vec::with_capacity(iters.len());
+    if mode == ZipMode::Longest {
+        if let Some(JsValue::Object(pad_oid)) = padding_opt {
+            for k in &keys {
+                match rt.get_property_key(pad_oid, k) {
+                    Ok(v) => padding.push(v),
+                    Err(e) => {
+                        iterator_close_all(rt, &iters, Some(e))?;
+                        unreachable!();
+                    }
+                }
+            }
+        } else {
+            padding.resize(iters.len(), JsValue::Undefined);
+        }
+    }
+    let helper = rt.create_builtin_iterator(BuiltinIteratorKind::Helper(
+        IteratorHelperData {
+            state: IteratorHelperState::SuspendedStart,
+            kind: IteratorHelperKind::Zip {
+                iters,
+                mode,
+                padding,
+                keys: Some(keys),
+            },
+        },
+    ));
+    Ok(JsValue::Object(helper))
 }

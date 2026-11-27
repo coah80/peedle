@@ -90,6 +90,7 @@ impl Compiler {
             is_generator: func.is_generator,
             is_arrow: func.is_arrow,
             is_method: false,
+            is_decl: func.is_decl,
             strict: func.strict,
             source: func.source.clone(),
         }))
@@ -409,6 +410,47 @@ impl Compiler {
         }
     }
 
+    fn emit_dispose_finally(&mut self, disp_idx: u32, try_push_idx: usize) {
+        let fin_ip = self.current_ip();
+        self.chunk.ops[try_push_idx] = Op::TryPush {
+            catch_ip: None,
+            finally_ip: Some(fin_ip),
+        };
+        self.emit(Op::FinallyStart);
+        let loop_start = self.current_ip();
+        let inner_try_idx = self.emit(Op::TryPush {
+            catch_ip: None,
+            finally_ip: None,
+        });
+        let disp_op_idx = self.emit(Op::DisposeNext {
+            stack_name: disp_idx,
+            sync_ip: 0,
+            end_ip: 0,
+        });
+        self.emit(Op::Await);
+        self.emit(Op::Pop);
+        let sync_pop_ip = self.current_ip();
+        self.emit(Op::TryPop);
+        self.emit(Op::Jump(loop_start));
+        let catch_ip = self.current_ip();
+        self.chunk.ops[inner_try_idx] = Op::TryPush {
+            catch_ip: Some(catch_ip),
+            finally_ip: None,
+        };
+        self.emit(Op::TryPop);
+        self.emit(Op::SuppressDisposeError);
+        self.emit(Op::Jump(loop_start));
+        let empty_ip = self.current_ip();
+        self.chunk.ops[disp_op_idx] = Op::DisposeNext {
+            stack_name: disp_idx,
+            sync_ip: sync_pop_ip,
+            end_ip: empty_ip,
+        };
+        self.emit(Op::TryPop);
+        self.emit(Op::FinallyEnd);
+        self.handler_depth -= 1;
+    }
+
     fn compile_stmt_list_with_dispose(&mut self, stmts: &[Stmt]) -> Result<(), JsError> {
         let has_using = stmts.iter().any(|s| {
             matches!(
@@ -446,28 +488,7 @@ impl Compiler {
         }
 
         self.dispose_stacks.pop();
-        let fin_ip = self.current_ip();
-        self.chunk.ops[try_push_idx] = Op::TryPush {
-            catch_ip: None,
-            finally_ip: Some(fin_ip),
-        };
-        let loop_start = self.current_ip();
-        let disp_op_idx = self.emit(Op::DisposeNext {
-            stack_name: disp_idx,
-            sync_ip: loop_start,
-            end_ip: 0,
-        });
-        self.emit(Op::Await);
-        self.emit(Op::Pop);
-        self.emit(Op::Jump(loop_start));
-        let end_ip = self.current_ip();
-        self.chunk.ops[disp_op_idx] = Op::DisposeNext {
-            stack_name: disp_idx,
-            sync_ip: loop_start,
-            end_ip,
-        };
-        self.emit(Op::FinallyEnd);
-        self.handler_depth -= 1;
+        self.emit_dispose_finally(disp_idx, try_push_idx);
         Ok(())
     }
 
@@ -588,13 +609,21 @@ impl Compiler {
     ) -> Result<(), JsError> {
         let mut lex_names = Vec::new();
         let mut per_iter_names = Vec::new();
+        let mut is_using_init = false;
         let has_lex_scope = match init {
             Some(ForInit::VarDecl { kind, decls }) if *kind != VarKind::Var => {
+                let is_const_like = matches!(
+                    *kind,
+                    VarKind::Const | VarKind::Using | VarKind::AwaitUsing
+                );
+                is_using_init = matches!(*kind, VarKind::Using | VarKind::AwaitUsing);
                 for d in decls {
-                    collect_pattern_names(&d.pattern, &mut lex_names, *kind == VarKind::Const);
+                    collect_pattern_names(&d.pattern, &mut lex_names, is_const_like);
                 }
-                for (n, _) in &lex_names {
-                    per_iter_names.push(n.clone());
+                if !is_using_init {
+                    for (n, _) in &lex_names {
+                        per_iter_names.push(n.clone());
+                    }
                 }
                 true
             }
@@ -617,6 +646,26 @@ impl Compiler {
             }
         }
 
+        let using_try_info = if is_using_init {
+            let disp_name = format!("\0__dispose_{}", self.next_dispose_id);
+            self.next_dispose_id += 1;
+            let disp_idx = self.str_const(&disp_name);
+            self.emit(Op::DeclareLet(disp_idx));
+            self.emit(Op::CreateArray(0));
+            self.stack_depth += 1;
+            self.emit(Op::InitBinding(disp_idx));
+            self.stack_depth -= 1;
+            let try_push_idx = self.emit(Op::TryPush {
+                catch_ip: None,
+                finally_ip: None,
+            });
+            self.handler_depth += 1;
+            self.dispose_stacks.push(disp_name);
+            Some((disp_idx, try_push_idx))
+        } else {
+            None
+        };
+
         if let Some(for_init) = init {
             match for_init {
                 ForInit::VarDecl { kind, decls } => self.compile_var_decl(*kind, decls)?,
@@ -626,6 +675,10 @@ impl Compiler {
                     self.stack_depth -= 1;
                 }
             }
+        }
+
+        if using_try_info.is_some() {
+            self.dispose_stacks.pop();
         }
 
         let cont_env = self.env_depth;
@@ -683,6 +736,9 @@ impl Compiler {
         let after_loop = self.current_ip();
         if let Some(j) = j_exit {
             self.chunk.patch_jump(j, after_loop);
+        }
+        if let Some((disp_idx, try_push_idx)) = using_try_info {
+            self.emit_dispose_finally(disp_idx, try_push_idx);
         }
         if has_lex_scope {
             self.pop_scope();
@@ -815,7 +871,7 @@ impl Compiler {
         let has_lex_head = matches!(
             left,
             ForInOfLeft::VarDecl {
-                kind: VarKind::Let | VarKind::Const,
+                kind: VarKind::Let | VarKind::Const | VarKind::Using | VarKind::AwaitUsing,
                 ..
             }
         );
@@ -823,7 +879,11 @@ impl Compiler {
             self.push_scope();
             if let ForInOfLeft::VarDecl { kind, pattern } = left {
                 let mut names = Vec::new();
-                collect_pattern_names(pattern, &mut names, *kind == VarKind::Const);
+                let is_const_like = matches!(
+                    *kind,
+                    VarKind::Const | VarKind::Using | VarKind::AwaitUsing
+                );
+                collect_pattern_names(pattern, &mut names, is_const_like);
                 for (n, is_c) in names {
                     let idx = self.str_const(&n);
                     if is_c {
@@ -876,10 +936,17 @@ impl Compiler {
             j
         };
 
+        let using_kind = match left {
+            ForInOfLeft::VarDecl {
+                kind: k @ (VarKind::Using | VarKind::AwaitUsing),
+                ..
+            } => Some(*k),
+            _ => None,
+        };
         let has_lex = matches!(
             left,
             ForInOfLeft::VarDecl {
-                kind: VarKind::Let | VarKind::Const,
+                kind: VarKind::Let | VarKind::Const | VarKind::Using | VarKind::AwaitUsing,
                 ..
             }
         );
@@ -887,7 +954,11 @@ impl Compiler {
             self.push_scope();
             if let ForInOfLeft::VarDecl { kind, pattern } = left {
                 let mut names = Vec::new();
-                collect_pattern_names(pattern, &mut names, *kind == VarKind::Const);
+                let is_const_like = matches!(
+                    *kind,
+                    VarKind::Const | VarKind::Using | VarKind::AwaitUsing
+                );
+                collect_pattern_names(pattern, &mut names, is_const_like);
                 for (n, is_c) in names {
                     let idx = self.str_const(&n);
                     if is_c {
@@ -898,6 +969,28 @@ impl Compiler {
                 }
             }
         }
+        let iter_dispose_info = if let Some(uk) = using_kind {
+            let disp_name = format!("\0__dispose_{}", self.next_dispose_id);
+            self.next_dispose_id += 1;
+            let disp_idx = self.str_const(&disp_name);
+            self.emit(Op::DeclareLet(disp_idx));
+            self.emit(Op::CreateArray(0));
+            self.stack_depth += 1;
+            self.emit(Op::InitBinding(disp_idx));
+            self.stack_depth -= 1;
+            self.emit(Op::AddDisposable {
+                stack_name: disp_idx,
+                is_async: uk == VarKind::AwaitUsing,
+            });
+            let inner_try = self.emit(Op::TryPush {
+                catch_ip: None,
+                finally_ip: None,
+            });
+            self.handler_depth += 1;
+            Some((disp_idx, inner_try))
+        } else {
+            None
+        };
         match left {
             ForInOfLeft::VarDecl { kind, pattern } => {
                 self.compile_pattern_bind(pattern, *kind)?;
@@ -907,6 +1000,9 @@ impl Compiler {
             }
         }
         self.compile_stmt(body)?;
+        if let Some((disp_idx, inner_try)) = iter_dispose_info {
+            self.emit_dispose_finally(disp_idx, inner_try);
+        }
         if has_lex {
             self.pop_scope();
         }
@@ -1162,140 +1258,38 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_import(&mut self, imp: &ImportDecl) -> Result<(), JsError> {
-        let src_idx = self.str_const(&imp.source);
-        self.emit(Op::ImportModule(src_idx));
-        self.stack_depth += 1;
-        for spec in &imp.specifiers {
-            match spec {
-                ImportSpecifier::Default(local) => {
-                    let def_idx = self.str_const("default");
-                    let loc_idx = self.str_const(local);
-                    self.emit(Op::ImportBinding(def_idx, loc_idx));
-                }
-                ImportSpecifier::Named { imported, local } => {
-                    let imp_idx = self.str_const(imported);
-                    let loc_idx = self.str_const(local);
-                    self.emit(Op::ImportBinding(imp_idx, loc_idx));
-                }
-                ImportSpecifier::Namespace(local) => {
-                    let loc_idx = self.str_const(local);
-                    self.emit(Op::ImportNamespace(loc_idx));
-                }
-            }
-        }
-        self.emit(Op::Pop);
-        self.stack_depth -= 1;
+    fn compile_import(&mut self, _imp: &ImportDecl) -> Result<(), JsError> {
         Ok(())
     }
 
     fn compile_export(&mut self, exp: &ExportDecl) -> Result<(), JsError> {
         match exp {
             ExportDecl::DefaultExpr(expr) => {
-                self.compile_expr(expr)?;
-                let idx = self.str_const("default");
-                self.emit(Op::ExportBinding(idx));
+                self.compile_expr_with_name(expr, "default")?;
+                self.emit(Op::ExportDefault);
                 self.stack_depth -= 1;
             }
-            ExportDecl::DefaultFunc(func) => {
-                let tmpl = Compiler::compile_function(func)?;
-                let fidx = self.chunk.add_const(ConstValue::Func(tmpl));
-                self.emit(Op::CreateFunction(fidx));
-                self.stack_depth += 1;
-                if let Some(ref name) = func.name {
-                    self.emit(Op::Dup);
-                    self.stack_depth += 1;
-                    let nidx = self.str_const(name);
-                    self.emit(Op::InitBinding(nidx));
-                    self.stack_depth -= 1;
-                }
-                let idx = self.str_const("default");
-                self.emit(Op::ExportBinding(idx));
-                self.stack_depth -= 1;
-            }
+            ExportDecl::DefaultFunc(_) => {}
             ExportDecl::DefaultClass(cls) => {
-                self.compile_class(cls)?;
-                if let Some(ref name) = cls.name {
-                    self.emit(Op::Dup);
-                    self.stack_depth += 1;
-                    let nidx = self.str_const(name);
-                    self.emit(Op::InitBinding(nidx));
+                if cls.name.is_none() {
+                    self.compile_expr_with_name(&Expr::Class(cls.clone()), "default")?;
+                    self.emit(Op::ExportDefault);
                     self.stack_depth -= 1;
+                } else {
+                    self.compile_class(cls)?;
+                    if let Some(ref name) = cls.name {
+                        let nidx = self.str_const(name);
+                        self.emit(Op::InitBinding(nidx));
+                        self.stack_depth -= 1;
+                    }
                 }
-                let idx = self.str_const("default");
-                self.emit(Op::ExportBinding(idx));
-                self.stack_depth -= 1;
             }
             ExportDecl::Decl(stmt) => {
-                self.compile_stmt(stmt)?;
-                let mut names = Vec::new();
-                match stmt.as_ref() {
-                    Stmt::VarDecl { decls, .. } => {
-                        for d in decls {
-                            collect_pattern_names(&d.pattern, &mut names, false);
-                        }
-                    }
-                    Stmt::FuncDecl(f) => {
-                        if let Some(ref n) = f.name {
-                            names.push((n.clone(), false));
-                        }
-                    }
-                    Stmt::ClassDecl(c) => {
-                        if let Some(ref n) = c.name {
-                            names.push((n.clone(), false));
-                        }
-                    }
-                    _ => {}
-                }
-                for (name, _) in names {
-                    let nidx = self.str_const(&name);
-                    self.emit(Op::GetVar(nidx));
-                    self.stack_depth += 1;
-                    self.emit(Op::ExportBinding(nidx));
-                    self.stack_depth -= 1;
+                if !matches!(stmt.as_ref(), Stmt::FuncDecl(_)) {
+                    self.compile_stmt(stmt)?;
                 }
             }
-            ExportDecl::Named { specifiers, source } => {
-                if let Some(ref src) = source {
-                    let sidx = self.str_const(src);
-                    self.emit(Op::ImportModule(sidx));
-                    self.stack_depth += 1;
-                    for spec in specifiers {
-                        self.emit(Op::Dup);
-                        self.stack_depth += 1;
-                        let lidx = self.str_const(&spec.local);
-                        self.emit(Op::GetProp(lidx));
-                        let eidx = self.str_const(&spec.exported);
-                        self.emit(Op::ExportBinding(eidx));
-                        self.stack_depth -= 1;
-                    }
-                    self.emit(Op::Pop);
-                    self.stack_depth -= 1;
-                } else {
-                    for spec in specifiers {
-                        let lidx = self.str_const(&spec.local);
-                        self.emit(Op::GetVar(lidx));
-                        self.stack_depth += 1;
-                        let eidx = self.str_const(&spec.exported);
-                        self.emit(Op::ExportBinding(eidx));
-                        self.stack_depth -= 1;
-                    }
-                }
-            }
-            ExportDecl::All { exported, source } => {
-                let sidx = self.str_const(source);
-                self.emit(Op::ImportModule(sidx));
-                self.stack_depth += 1;
-                if let Some(ref name) = exported {
-                    let eidx = self.str_const(name);
-                    self.emit(Op::ExportBinding(eidx));
-                    self.stack_depth -= 1;
-                } else {
-                    let star = self.str_const("*");
-                    self.emit(Op::ExportBinding(star));
-                    self.stack_depth -= 1;
-                }
-            }
+            ExportDecl::Named { .. } | ExportDecl::All { .. } => {}
         }
         Ok(())
     }
@@ -1726,9 +1720,30 @@ impl Compiler {
                 self.emit(Op::PushImportMeta);
                 self.stack_depth += 1;
             }
-            Expr::DynamicImport(spec) => {
+            Expr::DynamicImport {
+                spec,
+                options,
+                phase,
+            } => {
                 self.compile_expr(spec)?;
-                self.emit(Op::DynamicImport);
+                let has_options = if let Some(opt) = options {
+                    self.compile_expr(opt)?;
+                    true
+                } else {
+                    false
+                };
+                let phase_byte = match phase {
+                    ImportPhase::Evaluation => 0,
+                    ImportPhase::Defer => 1,
+                    ImportPhase::Source => 2,
+                };
+                self.emit(Op::DynamicImport {
+                    has_options,
+                    phase: phase_byte,
+                });
+                if has_options {
+                    self.stack_depth -= 1;
+                }
             }
             Expr::Ident(name) => {
                 let idx = self.str_const(name);
@@ -3030,10 +3045,12 @@ fn expr_may_capture_env(expr: &Expr) -> bool {
             }
             ObjectProp::Spread(e, _) => expr_may_capture_env(e),
         }),
+        Expr::DynamicImport { spec, options, .. } => {
+            expr_may_capture_env(spec) || options.as_deref().is_some_and(expr_may_capture_env)
+        }
         Expr::Unary { arg, .. }
         | Expr::Update { arg, .. }
         | Expr::OptionalChain(arg)
-        | Expr::DynamicImport(arg)
         | Expr::PrivateIn { right: arg, .. } => expr_may_capture_env(arg),
         Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
             expr_may_capture_env(left) || expr_may_capture_env(right)
@@ -3091,6 +3108,18 @@ fn collect_hoisted(stmts: &[Stmt], chunk: &mut Chunk, strict: bool) -> Result<()
             }
             Stmt::Export(ExportDecl::Decl(inner)) => {
                 collect_hoisted_stmt(inner, chunk, strict, true)?;
+            }
+            Stmt::Export(ExportDecl::DefaultFunc(func)) => {
+                let mut f_clone = (**func).clone();
+                let bind_name = f_clone
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "\0__default".to_string());
+                if f_clone.name.is_none() {
+                    f_clone.name = Some("default".to_string());
+                }
+                let tmpl = Compiler::compile_function(&f_clone)?;
+                chunk.hoisted_funcs.push((bind_name, tmpl));
             }
             _ => collect_hoisted_stmt(stmt, chunk, strict, false)?,
         }
@@ -3245,13 +3274,14 @@ fn collect_block_lex(stmts: &[Stmt], out: &mut Vec<(String, bool)>) {
             Stmt::Export(ExportDecl::DefaultClass(cls)) => {
                 if let Some(ref name) = cls.name {
                     out.push((name.clone(), false));
+                } else {
+                    out.push(("\0__default".to_string(), false));
                 }
             }
-            Stmt::Export(ExportDecl::DefaultFunc(func)) => {
-                if let Some(ref name) = func.name {
-                    out.push((name.clone(), false));
-                }
+            Stmt::Export(ExportDecl::DefaultExpr(_)) => {
+                out.push(("\0__default".to_string(), false));
             }
+            Stmt::Export(ExportDecl::DefaultFunc(_)) => {}
             _ => {}
         }
     }

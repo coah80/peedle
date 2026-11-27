@@ -188,6 +188,7 @@ fn make_host_262(rt: &mut JsRuntime, realm_id: usize) -> peedle_js::ObjectId {
 }
 
 fn run_single_test(
+    test_path: &Path,
     src: &str,
     meta: &TestMeta,
     harness_cache: &HashMap<String, String>,
@@ -195,6 +196,30 @@ fn run_single_test(
     let mut rt = JsRuntime::new();
     rt.max_steps = Some(100_000_000);
     rt.max_call_depth = 128;
+
+    let base_dir = test_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let base_dir_bytes = base_dir.clone();
+    rt.set_module_loader(move |specifier: &str| {
+        let candidate = if Path::new(specifier).is_absolute() {
+            PathBuf::from(specifier)
+        } else {
+            base_dir.join(specifier)
+        };
+        std::fs::read_to_string(&candidate)
+            .map_err(|_| JsError::error(format!("Cannot load module '{}'", specifier)))
+    });
+    rt.set_module_bytes_loader(move |specifier: &str| {
+        let candidate = if Path::new(specifier).is_absolute() {
+            PathBuf::from(specifier)
+        } else {
+            base_dir_bytes.join(specifier)
+        };
+        std::fs::read(&candidate)
+            .map_err(|_| JsError::error(format!("Cannot load module '{}'", specifier)))
+    });
 
     let is_async = meta.flags.iter().any(|f| f == "async");
     let is_module = meta.flags.iter().any(|f| f == "module");
@@ -246,7 +271,10 @@ fn run_single_test(
     };
 
     let result = if is_module {
-        rt.eval_module("test.mjs", &test_src)
+        let mod_name = test_path
+            .to_str()
+            .unwrap_or("test.mjs");
+        rt.eval_module(mod_name, &test_src)
     } else {
         rt.eval(&test_src)
     };
@@ -353,6 +381,9 @@ fn test262_broad_suite() {
         ("language/source-text", 50),
         ("language/statementList", 100),
         ("language/global-code", 100),
+        ("language/module-code", 700),
+        ("language/import", 200),
+        ("language/export", 20),
         ("language/function-code", 300),
         ("language/arguments-object", 350),
         ("language/eval-code", 400),
@@ -360,6 +391,7 @@ fn test262_broad_suite() {
         ("language/computed-property-names", 100),
         ("language/destructuring", 50),
         ("language/rest-parameters", 50),
+        ("language/expressions@flat", 20),
         ("language/expressions/addition", 60),
         ("language/expressions/array", 60),
         ("language/expressions/arrow-function", 400),
@@ -383,6 +415,7 @@ fn test262_broad_suite() {
         ("language/expressions/delete", 100),
         ("language/expressions/division", 60),
         ("language/expressions/does-not-equals", 50),
+        ("language/expressions/dynamic-import", 1200),
         ("language/expressions/equals", 60),
         ("language/expressions/exponentiation", 60),
         ("language/expressions/function", 350),
@@ -390,6 +423,7 @@ fn test262_broad_suite() {
         ("language/expressions/greater-than", 60),
         ("language/expressions/greater-than-or-equal", 60),
         ("language/expressions/grouping", 20),
+        ("language/expressions/import.meta", 50),
         ("language/expressions/in", 50),
         ("language/expressions/instanceof", 60),
         ("language/expressions/left-shift", 60),
@@ -428,6 +462,7 @@ fn test262_broad_suite() {
         ("language/expressions/yield", 100),
         ("language/statements/async-function", 100),
         ("language/statements/async-generator", 400),
+        ("language/statements/await-using", 150),
         ("language/statements/block", 50),
         ("language/statements/break", 50),
         ("language/statements/class", 5000),
@@ -450,6 +485,7 @@ fn test262_broad_suite() {
         ("language/statements/switch", 150),
         ("language/statements/throw", 50),
         ("language/statements/try", 250),
+        ("language/statements/using", 100),
         ("language/statements/variable", 250),
         ("language/statements/while", 50),
         ("language/statements/with", 250),
@@ -477,10 +513,13 @@ fn test262_broad_suite() {
         ("built-ins/Iterator@flat", 50),
         ("built-ins/Iterator/from", 50),
         ("built-ins/Iterator/concat", 100),
+        ("built-ins/Iterator/zip", 60),
+        ("built-ins/Iterator/zipKeyed", 60),
         ("built-ins/Iterator/prototype@flat", 20),
         ("built-ins/Iterator/prototype/Symbol.dispose", 20),
         ("built-ins/Iterator/prototype/Symbol.iterator", 20),
         ("built-ins/Iterator/prototype/Symbol.toStringTag", 20),
+        ("built-ins/Iterator/prototype/chunks", 60),
         ("built-ins/Iterator/prototype/constructor", 20),
         ("built-ins/Iterator/prototype/drop", 100),
         ("built-ins/Iterator/prototype/every", 100),
@@ -488,11 +527,14 @@ fn test262_broad_suite() {
         ("built-ins/Iterator/prototype/find", 100),
         ("built-ins/Iterator/prototype/flatMap", 100),
         ("built-ins/Iterator/prototype/forEach", 100),
+        ("built-ins/Iterator/prototype/includes", 60),
+        ("built-ins/Iterator/prototype/join", 30),
         ("built-ins/Iterator/prototype/map", 100),
         ("built-ins/Iterator/prototype/reduce", 100),
         ("built-ins/Iterator/prototype/some", 100),
         ("built-ins/Iterator/prototype/take", 100),
         ("built-ins/Iterator/prototype/toArray", 100),
+        ("built-ins/Iterator/prototype/windows", 60),
         ("built-ins/Promise", 800),
         ("built-ins/Proxy", 350),
         ("built-ins/Reflect", 200),
@@ -505,6 +547,7 @@ fn test262_broad_suite() {
         ("built-ins/RegExp/lookBehind", 50),
         ("built-ins/RegExp/match-indices", 50),
         ("built-ins/RegExp/named-groups", 100),
+        ("built-ins/RegExp/property-escapes@flat", 200),
         ("built-ins/RegExp/regexp-modifiers", 100),
         ("built-ins/RegExp/unicodeSets", 200),
         ("built-ins/TypedArray", 2000),
@@ -527,6 +570,9 @@ fn test262_broad_suite() {
         ("built-ins/Error", 150),
         ("built-ins/NativeErrors", 150),
         ("built-ins/AggregateError", 50),
+        ("built-ins/SuppressedError", 50),
+        ("built-ins/DisposableStack", 150),
+        ("built-ins/AsyncDisposableStack", 150),
         ("built-ins/ThrowTypeError", 30),
         ("built-ins/ArrayBuffer", 300),
         ("built-ins/SharedArrayBuffer", 150),
@@ -605,13 +651,10 @@ fn test262_broad_suite() {
                             continue;
                         };
                         let meta = parse_meta(&src);
-                        if meta.flags.iter().any(|fl| fl == "module") {
-                            continue;
-                        }
                         if trace {
                             eprintln!("RUN {}", f.display());
                         }
-                        match run_single_test(&src, &meta, hc) {
+                        match run_single_test(f, &src, &meta, hc) {
                             Ok(()) => per_suite[s_idx].0 += 1,
                             Err(msg) => {
                                 per_suite[s_idx].1 += 1;
@@ -690,8 +733,14 @@ fn test262_broad_suite() {
     }
     if filter.is_none() {
         assert!(
-            grand >= 30_000,
-            "Expected at least 30000 Test262 tests run, got {}",
+            grand >= 42_000,
+            "Expected at least 42000 Test262 tests run, got {}",
+            grand
+        );
+        assert!(
+            total_pass >= 42_000,
+            "Expected at least 42000 Test262 tests passing, got {}/{}",
+            total_pass,
             grand
         );
         assert!(

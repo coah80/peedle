@@ -39,6 +39,7 @@ pub struct JsFunction {
     pub is_generator: bool,
     pub is_arrow: bool,
     pub is_method: bool,
+    pub is_decl: bool,
     pub is_class_ctor: bool,
     pub is_derived_ctor: bool,
     pub strict: bool,
@@ -314,14 +315,31 @@ pub struct ArgumentsData {
 }
 
 #[derive(Clone)]
+pub enum ExportTarget {
+    Local { env: EnvId, name: String },
+    Indirect { ns: ObjectId, export_name: String },
+    Value(JsValue),
+    Ambiguous,
+}
+
+#[derive(Clone)]
 pub struct ModuleNamespaceData {
-    pub exports: Vec<(String, JsValue)>,
+    pub exports: Vec<(String, ExportTarget)>,
+    pub is_deferred: bool,
+    pub module_key: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct IterRecord {
     pub iterator: JsValue,
     pub next_method: JsValue,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ZipMode {
+    Shortest,
+    Longest,
+    Strict,
 }
 
 #[derive(Clone)]
@@ -354,6 +372,24 @@ pub enum IteratorHelperKind {
         iterables: Vec<(JsValue, JsValue)>,
         pos: usize,
         inner: Option<IterRecord>,
+    },
+    Chunks {
+        iterated: IterRecord,
+        chunk_size: usize,
+        exhausted: bool,
+    },
+    Windows {
+        iterated: IterRecord,
+        window_size: usize,
+        allow_partial: bool,
+        buffer: Vec<JsValue>,
+        exhausted: bool,
+    },
+    Zip {
+        iters: Vec<Option<IterRecord>>,
+        mode: ZipMode,
+        padding: Vec<JsValue>,
+        keys: Option<Vec<PropertyKey>>,
     },
 }
 
@@ -414,6 +450,28 @@ pub struct FinalizationRegistryData {
     pub cells: Vec<FinalizationCell>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DisposeHint {
+    Sync,
+    Async,
+    SyncWrappedAsync,
+}
+
+#[derive(Clone)]
+pub struct DisposableResource {
+    pub value: JsValue,
+    pub hint: DisposeHint,
+    pub method: Option<JsValue>,
+    pub adopt_arg: Option<JsValue>,
+}
+
+#[derive(Clone)]
+pub struct DisposableStackData {
+    pub disposed: bool,
+    pub stack: Vec<DisposableResource>,
+    pub is_async: bool,
+}
+
 pub enum ObjectKind {
     Ordinary,
     Function(JsFunction),
@@ -433,6 +491,7 @@ pub enum ObjectKind {
     WeakSet(Vec<ObjectId>),
     WeakRef(Option<JsValue>),
     FinalizationRegistry(FinalizationRegistryData),
+    DisposableStack(DisposableStackData),
     Promise(PromiseData),
     Proxy(ProxyData),
     ArrayBuffer(ArrayBufferData),
@@ -638,6 +697,18 @@ impl JsObject {
                     seen_idx.insert(i as u32);
                 }
             }
+            ObjectKind::ModuleNamespace(m) => {
+                let mut keys = Vec::with_capacity(m.exports.len() + self.symbol_props.len());
+                for (name, target) in &m.exports {
+                    if !matches!(target, ExportTarget::Ambiguous) {
+                        keys.push(PropertyKey::String(name.clone()));
+                    }
+                }
+                for (sym, _) in &self.symbol_props {
+                    keys.push(PropertyKey::Symbol(*sym));
+                }
+                return keys;
+            }
             _ => {}
         }
 
@@ -692,6 +763,7 @@ pub struct Binding {
 pub struct EnvRecord {
     pub parent: Option<EnvId>,
     pub bindings: HashMap<String, Binding>,
+    pub import_bindings: HashMap<String, (ObjectId, String)>,
     pub lex_names: HashSet<String>,
     pub var_names: HashSet<String>,
     pub object_env: Option<ObjectId>,
@@ -717,6 +789,7 @@ impl EnvRecord {
         EnvRecord {
             parent,
             bindings: HashMap::new(),
+            import_bindings: HashMap::new(),
             lex_names: HashSet::new(),
             var_names: HashSet::new(),
             object_env: None,
@@ -998,8 +1071,13 @@ impl Heap {
                         }
                     }
                     ObjectKind::ModuleNamespace(m) => {
-                        for (_, v) in &m.exports {
-                            trace_value(v, &mut obj_stack);
+                        for (_, target) in &m.exports {
+                            match target {
+                                ExportTarget::Local { env, .. } => env_stack.push(*env),
+                                ExportTarget::Indirect { ns, .. } => obj_stack.push(*ns),
+                                ExportTarget::Value(v) => trace_value(v, &mut obj_stack),
+                                ExportTarget::Ambiguous => {}
+                            }
                         }
                     }
                     ObjectKind::Iterator(it) => match &it.kind {
@@ -1066,6 +1144,28 @@ impl Heap {
                                     trace_value(&inn.next_method, &mut obj_stack);
                                 }
                             }
+                            IteratorHelperKind::Chunks { iterated, .. } => {
+                                trace_value(&iterated.iterator, &mut obj_stack);
+                                trace_value(&iterated.next_method, &mut obj_stack);
+                            }
+                            IteratorHelperKind::Windows {
+                                iterated, buffer, ..
+                            } => {
+                                trace_value(&iterated.iterator, &mut obj_stack);
+                                trace_value(&iterated.next_method, &mut obj_stack);
+                                for v in buffer {
+                                    trace_value(v, &mut obj_stack);
+                                }
+                            }
+                            IteratorHelperKind::Zip { iters, padding, .. } => {
+                                for it in iters.iter().flatten() {
+                                    trace_value(&it.iterator, &mut obj_stack);
+                                    trace_value(&it.next_method, &mut obj_stack);
+                                }
+                                for p in padding {
+                                    trace_value(p, &mut obj_stack);
+                                }
+                            }
                         },
                         BuiltinIteratorKind::String { .. } => {}
                     },
@@ -1073,6 +1173,17 @@ impl Heap {
                         trace_value(&fr.cleanup_callback, &mut obj_stack);
                         for cell in &fr.cells {
                             trace_value(&cell.held_value, &mut obj_stack);
+                        }
+                    }
+                    ObjectKind::DisposableStack(ds) => {
+                        for res in &ds.stack {
+                            trace_value(&res.value, &mut obj_stack);
+                            if let Some(ref m) = res.method {
+                                trace_value(m, &mut obj_stack);
+                            }
+                            if let Some(ref a) = res.adopt_arg {
+                                trace_value(a, &mut obj_stack);
+                            }
                         }
                     }
                     _ => {}
@@ -1112,6 +1223,9 @@ impl Heap {
                 }
                 for b in env.bindings.values() {
                     trace_value(&b.value, &mut obj_stack);
+                }
+                for (ns, _) in env.import_bindings.values() {
+                    obj_stack.push(*ns);
                 }
                 for (_, _, holder) in env.private_bindings.values() {
                     if let Some(h) = holder {

@@ -154,6 +154,7 @@ pub struct FuncNode {
     pub is_async: bool,
     pub is_generator: bool,
     pub is_arrow: bool,
+    pub is_decl: bool,
     pub strict: bool,
     pub source: String,
 }
@@ -374,7 +375,11 @@ pub enum Expr {
     },
     NewTarget,
     ImportMeta,
-    DynamicImport(Box<Expr>),
+    DynamicImport {
+        spec: Box<Expr>,
+        options: Option<Box<Expr>>,
+        phase: ImportPhase,
+    },
     Unary {
         op: UnaryOp,
         arg: Box<Expr>,
@@ -412,10 +417,19 @@ pub enum Expr {
     Await(Box<Expr>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportPhase {
+    Evaluation,
+    Defer,
+    Source,
+}
+
 #[derive(Debug, Clone)]
 pub struct ImportDecl {
     pub specifiers: Vec<ImportSpecifier>,
     pub source: String,
+    pub phase: ImportPhase,
+    pub attributes: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -434,10 +448,12 @@ pub enum ExportDecl {
     Named {
         specifiers: Vec<ExportSpecifier>,
         source: Option<String>,
+        attributes: Vec<(String, String)>,
     },
     All {
         exported: Option<String>,
         source: String,
+        attributes: Vec<(String, String)>,
     },
 }
 
@@ -445,4 +461,5 @@ pub enum ExportDecl {
 pub struct ExportSpecifier {
     pub local: String,
     pub exported: String,
+    pub local_is_string: bool,
 }

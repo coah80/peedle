@@ -150,6 +150,7 @@ pub fn init(rt: &mut JsRuntime) {
                     is_generator: false,
                     is_arrow: false,
                     is_method: false,
+                    is_decl: false,
                     is_class_ctor: false,
                     is_derived_ctor: false,
                     strict: false,
