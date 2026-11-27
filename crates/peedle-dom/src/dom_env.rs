@@ -332,10 +332,10 @@ impl BrowserJsEnv {
             }
             self.tick_event_loop(64);
         }
-        self.rt.max_steps = prev_step_limit;
 
         self.dom.borrow_mut().ready_state = "interactive".to_string();
         let root_id = self.dom.borrow().doc.root;
+        self.rt.step_count = 0;
         let _ = self.dispatch_dom_event(Some(root_id), "DOMContentLoaded", true, false);
 
         let embedded_nodes: Vec<NodeId> = {
@@ -352,6 +352,7 @@ impl BrowserJsEnv {
         };
         self.dom.borrow_mut().pending_subdoc_loads.clear();
         for eid in embedded_nodes {
+            self.rt.step_count = 0;
             self.load_subdocument_and_fire_load(eid);
         }
 
@@ -364,8 +365,10 @@ impl BrowserJsEnv {
                 .and_then(|e| e.get_attr("onload"))
                 .map(|s| s.to_string())
         };
+        self.rt.step_count = 0;
         let _ = self.dispatch_dom_event(None, "load", false, false);
         if let Some(code) = body_onload {
+            self.rt.step_count = 0;
             if let Err(e) = self.rt.eval(&code) {
                 let msg = e.to_string();
                 self.rt.console_lines.push(format!("[Error] {}", msg));
@@ -373,6 +376,7 @@ impl BrowserJsEnv {
             }
         }
         self.tick_event_loop(64);
+        self.rt.max_steps = prev_step_limit;
         errors
     }
 

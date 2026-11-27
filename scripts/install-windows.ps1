@@ -1,12 +1,13 @@
 param(
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "Programs\Peedle")
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "Programs\Peedle"),
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $TargetExe = Join-Path $RepoRoot "target\release\peedle.exe"
 
-if (-not (Test-Path $TargetExe)) {
+if (-not $SkipBuild -or -not (Test-Path $TargetExe)) {
     Push-Location $RepoRoot
     try {
         & cargo build --release --bin peedle
