@@ -605,13 +605,14 @@ pub fn draw_chrome(
             d.circle_fill(ico_cx, ico_cy, 1.8, if is_active { pal.accent } else { pal.text_muted });
         }
 
-        let max_title_w = (tab_w - 52.0).max(24.0);
-        let title = truncate_chars(&tab.page.title(), (max_title_w / 6.8).max(4.0) as usize);
+        let max_title_w = (tab_w - 60.0).max(20.0);
+        let title_face = if is_active { FontFaceKey::SansBold } else { FontFaceKey::SansRegular };
+        let title = truncate_to_width(&tab.page.title(), max_title_w, d.fonts, title_face, 12.0);
         d.text(
             &title,
             tx + 28.0,
             26.0,
-            if is_active { FontFaceKey::SansBold } else { FontFaceKey::SansRegular },
+            title_face,
             12.0,
             if is_active { pal.text_hi } else { pal.text_dim },
         );
@@ -1175,6 +1176,33 @@ fn fmt_bytes(b: usize) -> String {
     } else {
         format!("{} B", b)
     }
+}
+
+fn truncate_to_width(
+    s: &str,
+    max_w: f32,
+    fonts: &FontSystem,
+    face: FontFaceKey,
+    px: f32,
+) -> String {
+    if fonts.measure_text(s, face, px) <= max_w {
+        return s.to_string();
+    }
+    let ell_w = fonts.measure_text("...", face, px);
+    let budget = (max_w - ell_w).max(0.0);
+    let mut out = String::new();
+    let mut w = 0.0f32;
+    let mut buf = [0u8; 4];
+    for c in s.chars() {
+        let cw = fonts.measure_text(c.encode_utf8(&mut buf), face, px);
+        if w + cw > budget {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push_str("...");
+    out
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {

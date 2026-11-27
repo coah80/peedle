@@ -113,7 +113,7 @@ body {{ margin:0; min-height:100vh; background:{bg}; color:{fg}; font-family:san
 .tile:hover {{ border-color:{accent}; }}
 .badge {{ width:34px; height:34px; border-radius:9px; background:{badge_bg}; color:{accent}; display:flex; align-items:center; justify-content:center; margin-bottom:8px; font-size:15px; font-weight:700; }}
 .foot {{ margin-top:34px; display:flex; gap:18px; font-size:12px; }}
-.foot a {{ color:{muted}; text-decoration:none; }}
+.foot a {{ color:{muted}; text-decoration:none; padding:4px 10px; }}
 .foot a:hover {{ color:{accent}; }}
 </style></head><body>
 <div class="brand">peed<span>le</span></div>
