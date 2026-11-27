@@ -461,13 +461,18 @@ impl Page {
                             out.push((u.clone(), self.resolve_subresource_url(u)));
                         }
                     }
+                    if let Some(ref mu) = style.mask_image {
+                        if !self.images.contains(mu) {
+                            out.push((mu.clone(), self.resolve_subresource_url(mu)));
+                        }
+                    }
                 }
             }
             out
         };
 
         let mut new_sizes = Vec::new();
-        for (raw_src, resolved_opt) in img_srcs.into_iter().take(48) {
+        for (raw_src, resolved_opt) in img_srcs.into_iter().take(96) {
             if self.failed_images.contains(&raw_src) {
                 continue;
             }

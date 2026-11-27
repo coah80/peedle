@@ -16,12 +16,14 @@ pub enum FontFaceKey {
     MonoRegular,
     MonoBold,
     Custom(usize),
+    Fallback(usize),
 }
 
 #[derive(Clone)]
 pub struct FontSystem {
     faces: HashMap<FontFaceKey, Arc<Font>>,
     custom_names: Vec<(String, FontFaceKey)>,
+    fallback_keys: Vec<FontFaceKey>,
     glyph_cache: Arc<Mutex<HashMap<(FontFaceKey, char, u32), (Metrics, Vec<u8>)>>>,
 }
 
@@ -107,9 +109,29 @@ impl FontSystem {
             }
         }
 
+        let fallback_paths = [
+            "/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/unifont/unifont.otf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ];
+        let mut fallback_keys = Vec::new();
+        for &path in &fallback_paths {
+            if Path::new(path).exists() {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                        let fk = FontFaceKey::Fallback(fallback_keys.len());
+                        faces.insert(fk, Arc::new(font));
+                        fallback_keys.push(fk);
+                    }
+                }
+            }
+        }
+
         Self {
             faces,
             custom_names: Vec::new(),
+            fallback_keys,
             glyph_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -193,13 +215,30 @@ impl FontSystem {
             .or_else(|| self.faces.get(&FontFaceKey::SansRegular))
     }
 
+    fn resolve_glyph_font(&self, key: FontFaceKey, c: char) -> Option<(FontFaceKey, &Arc<Font>)> {
+        let primary = self.font(key)?;
+        if c.is_ascii() || primary.lookup_glyph_index(c) != 0 {
+            return Some((key, primary));
+        }
+        for &fk in &self.fallback_keys {
+            if let Some(fb) = self.faces.get(&fk) {
+                if fb.lookup_glyph_index(c) != 0 {
+                    return Some((fk, fb));
+                }
+            }
+        }
+        Some((key, primary))
+    }
+
     pub fn measure_text(&self, text: &str, key: FontFaceKey, px: f32) -> f32 {
-        let Some(font) = self.font(key) else {
+        if self.font(key).is_none() {
             return text.chars().count() as f32 * px * 0.55;
-        };
+        }
         let mut width = 0.0f32;
         for c in text.chars() {
-            width += font.metrics(c, px).advance_width;
+            if let Some((_, f)) = self.resolve_glyph_font(key, c) {
+                width += f.metrics(c, px).advance_width;
+            }
         }
         width
     }
@@ -223,21 +262,24 @@ impl FontSystem {
         px: f32,
         color: RgbaColor,
     ) -> f32 {
-        let Some(font) = self.font(key) else {
+        if self.font(key).is_none() {
             return x;
-        };
+        }
         let px_key = (px.max(4.0) * 4.0).round() as u32;
         let actual_px = px_key as f32 / 4.0;
         let mut pen_x = x;
 
         for c in text.chars() {
+            let Some((use_key, use_font)) = self.resolve_glyph_font(key, c) else {
+                continue;
+            };
             let (metrics, bitmap) = {
                 let mut cache = self.glyph_cache.lock().unwrap();
-                if let Some(hit) = cache.get(&(key, c, px_key)) {
+                if let Some(hit) = cache.get(&(use_key, c, px_key)) {
                     hit.clone()
                 } else {
-                    let entry = font.rasterize(c, actual_px);
-                    cache.insert((key, c, px_key), entry.clone());
+                    let entry = use_font.rasterize(c, actual_px);
+                    cache.insert((use_key, c, px_key), entry.clone());
                     entry
                 }
             };

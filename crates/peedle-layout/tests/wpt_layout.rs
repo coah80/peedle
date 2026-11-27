@@ -244,3 +244,23 @@ fn wpt_flex_intrinsic_ignores_absolute_dropdown() {
     let title = tree.bounding_rect(doc.get_element_by_id("title").unwrap()).unwrap();
     assert!(title.width > 400.0, "absolute popup must not shrink flex sibling: {:?}", title);
 }
+
+#[test]
+fn wpt_table_respects_min_word_width() {
+    let (doc, tree) = run_layout(
+        r#"<table id="t">
+            <tr><th id="c1">Implementation</th><td id="c2">A very long description that wraps across multiple lines inside the second column of this infobox table</td></tr>
+        </table>"#,
+        r#"
+            body { margin: 0; font-size: 14px; }
+            #t { width: 260px; border-collapse: collapse; }
+            th, td { padding: 4px; }
+        "#,
+        400.0,
+        400.0,
+    );
+    let c1 = tree.bounding_rect(doc.get_element_by_id("c1").unwrap()).unwrap();
+    let c2 = tree.bounding_rect(doc.get_element_by_id("c2").unwrap()).unwrap();
+    assert!(c1.width >= 95.0, "column 1 must preserve unbroken word width: {:?}", c1);
+    assert!(c2.x >= c1.right() - 0.5, "columns must not overlap: c1={:?} c2={:?}", c1, c2);
+}

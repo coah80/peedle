@@ -281,3 +281,81 @@ fn transform_sticky_outline_and_svg_arcs_render() {
     let rounded_corner = ((11 * 100 + 11) * 4) as usize;
     assert_eq!((svg_fb.data[rounded_corner], svg_fb.data[rounded_corner + 1], svg_fb.data[rounded_corner + 2]), (255, 255, 255));
 }
+
+#[test]
+fn mask_image_and_rounded_object_fit_render() {
+    let html = r##"<!DOCTYPE html>
+        <style>
+            body { margin: 0; background: #ffffff; }
+            #icon {
+                width: 40px; height: 40px;
+                background-color: #2563eb;
+                mask-image: url("mask.svg");
+            }
+            #avatar {
+                display: block;
+                width: 40px; height: 40px;
+                border-radius: 20px;
+                object-fit: cover;
+            }
+        </style>
+        <div id="icon"></div>
+        <img id="avatar" src="pic.png" width="40" height="40">
+    "##;
+    let doc = parse_html(html);
+    let mut sheets = Vec::new();
+    for nid in doc.descendants(doc.root) {
+        if let Some(el) = doc.element(nid) {
+            if el.tag_is("style") {
+                sheets.push(peedle_css::parse_stylesheet(&doc.text_content(nid)));
+            }
+        }
+    }
+    let styles = peedle_css::compute_styles(
+        &doc,
+        &sheets,
+        peedle_css::Viewport {
+            width: 200.0,
+            height: 200.0,
+            dark_mode: false,
+        },
+    );
+    let mut img_sizes = std::collections::HashMap::new();
+    img_sizes.insert("pic.png".to_string(), (80, 40));
+    let tree = peedle_layout::layout_document(&doc, &styles, &img_sizes, 200.0, 200.0);
+    let fonts = FontSystem::load_system_fonts();
+    let mut images = peedle_render::ImageCache::new();
+    let mask_svg = peedle_render::DecodedImage::decode(
+        br##"<svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="12" fill="#000"/></svg>"##,
+    )
+    .unwrap();
+    images.insert("mask.svg".to_string(), mask_svg);
+    let mut pic_rgba = vec![0u8; 80 * 40 * 4];
+    for px in pic_rgba.chunks_exact_mut(4) {
+        px[0] = 220;
+        px[1] = 38;
+        px[2] = 38;
+        px[3] = 255;
+    }
+    images.insert(
+        "pic.png".to_string(),
+        peedle_render::DecodedImage {
+            width: 80,
+            height: 40,
+            rgba: pic_rgba,
+        },
+    );
+    let canvases = std::collections::HashMap::new();
+    let mut fb = Framebuffer::new(200, 200);
+    peedle_render::paint_layout(&doc, &tree, &mut fb, &fonts, &images, &canvases, 0.0, 0.0);
+
+    let icon_center = ((20 * 200 + 20) * 4) as usize;
+    assert_eq!((fb.data[icon_center], fb.data[icon_center + 1], fb.data[icon_center + 2]), (37, 99, 235));
+    let icon_corner = ((2 * 200 + 2) * 4) as usize;
+    assert_eq!((fb.data[icon_corner], fb.data[icon_corner + 1], fb.data[icon_corner + 2]), (255, 255, 255));
+
+    let av_center = ((60 * 200 + 20) * 4) as usize;
+    assert_eq!((fb.data[av_center], fb.data[av_center + 1], fb.data[av_center + 2]), (220, 38, 38));
+    let av_corner = ((41 * 200 + 1) * 4) as usize;
+    assert_eq!((fb.data[av_corner], fb.data[av_corner + 1], fb.data[av_corner + 2]), (255, 255, 255));
+}

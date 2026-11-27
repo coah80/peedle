@@ -35,14 +35,31 @@ impl DecodedImage {
         let svgs = doc.get_elements_by_tag_name(doc.root, "svg");
         let svg_id = *svgs.first().ok_or_else(|| "no svg element".to_string())?;
         let el = doc.element(svg_id).ok_or_else(|| "missing svg".to_string())?;
+        let vb_dims = el
+            .get_attr("viewBox")
+            .or_else(|| el.get_attr("viewbox"))
+            .and_then(|vb| {
+                let nums: Vec<f32> = vb
+                    .split(|c: char| c.is_ascii_whitespace() || c == ',')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<f32>().ok())
+                    .collect();
+                if nums.len() >= 4 && nums[2] > 0.0 && nums[3] > 0.0 {
+                    Some((nums[2], nums[3]))
+                } else {
+                    None
+                }
+            });
         let w = el
             .get_attr("width")
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
+            .or_else(|| vb_dims.map(|d| d.0))
             .unwrap_or(64.0)
             .clamp(1.0, 1024.0) as u32;
         let h = el
             .get_attr("height")
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
+            .or_else(|| vb_dims.map(|d| d.1))
             .unwrap_or(64.0)
             .clamp(1.0, 1024.0) as u32;
         let mut fb = Framebuffer::new(w, h);

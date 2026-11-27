@@ -1619,6 +1619,57 @@ impl LayoutEngine {
         }
     }
 
+    pub fn measure_min_word_width(&mut self, id: LayoutBoxId, cb_width: f32) -> f32 {
+        let kind = self.tree.get(id).kind.clone();
+        let style = self.tree.get(id).style.clone();
+        if matches!(style.white_space, WhiteSpace::Nowrap | WhiteSpace::Pre) {
+            return self.measure_intrinsic_width(id, cb_width);
+        }
+        match kind {
+            BoxKind::Text(ref t) => {
+                let s = apply_text_transform(t, style.text_transform);
+                let mut max_w = 0.0f32;
+                for word in s.split_whitespace() {
+                    let w = self.measurer.measure_str(
+                        word,
+                        &style.font_family,
+                        style.font_size,
+                        style.font_weight,
+                    );
+                    max_w = max_w.max(w);
+                }
+                max_w
+            }
+            BoxKind::Replaced(ref rep) => {
+                self.resolve_replaced_size(rep, &style, cb_width, self.viewport_h).0
+            }
+            _ => {
+                let kids = self.tree.get(id).children.clone();
+                let mut max_w = 0.0f32;
+                for cid in kids {
+                    let cs = self.tree.get(cid).style.clone();
+                    if matches!(cs.position, Position::Absolute | Position::Fixed) {
+                        continue;
+                    }
+                    let cw = self.measure_min_word_width(cid, cb_width);
+                    let extra = if matches!(self.tree.get(cid).kind, BoxKind::Text(_)) {
+                        0.0
+                    } else {
+                        let cctx = self.calc_ctx(&cs, cb_width);
+                        cs.padding_left.resolve_or(&cctx, 0.0)
+                            + cs.padding_right.resolve_or(&cctx, 0.0)
+                            + cs.border_left_width
+                            + cs.border_right_width
+                            + cs.margin_left.resolve_or(&cctx, 0.0)
+                            + cs.margin_right.resolve_or(&cctx, 0.0)
+                    };
+                    max_w = max_w.max(cw + extra);
+                }
+                max_w
+            }
+        }
+    }
+
     fn resolve_replaced_size(
         &self,
         rep: &ReplacedKind,

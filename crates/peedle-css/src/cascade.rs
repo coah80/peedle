@@ -2131,6 +2131,18 @@ fn apply_longhand(
                 style.background_image = img;
             }
         }
+        "mask-image" | "-webkit-mask-image" | "mask" | "-webkit-mask" => {
+            if ident.as_deref() == Some("none") {
+                style.mask_image = None;
+            } else {
+                for g in split_whitespace_groups(trimmed) {
+                    if let Some(crate::values::BackgroundImage::Url(u)) = parse_background_image(g, style.color) {
+                        style.mask_image = Some(u);
+                        break;
+                    }
+                }
+            }
+        }
         "background-repeat" => {
             if let Some(s) = ident.as_deref() {
                 style.background_repeat = match s {
@@ -2679,6 +2691,7 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, prop: &str) {
         "vertical-align" => dst.vertical_align = src.vertical_align,
         "background-color" => dst.background_color = src.background_color,
         "background-image" => dst.background_image = src.background_image.clone(),
+        "mask-image" | "-webkit-mask-image" => dst.mask_image = src.mask_image.clone(),
         "background-position" => {
             dst.background_position_x = src.background_position_x.clone();
             dst.background_position_y = src.background_position_y.clone();

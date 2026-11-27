@@ -804,6 +804,108 @@ impl Framebuffer {
         }
     }
 
+    pub fn blit_rgba_rounded(
+        &mut self,
+        src_w: u32,
+        src_h: u32,
+        src: &[u8],
+        dst_x: f32,
+        dst_y: f32,
+        dst_w: f32,
+        dst_h: f32,
+        clip_x: f32,
+        clip_y: f32,
+        clip_w: f32,
+        clip_h: f32,
+        radii: [f32; 4],
+        opacity: f32,
+    ) {
+        if src_w == 0 || src_h == 0 || dst_w <= 0.0 || dst_h <= 0.0 || clip_w <= 0.0 || clip_h <= 0.0 || opacity <= 0.0 {
+            return;
+        }
+        let clip = self.current_clip();
+        let x0 = (clip_x.max(dst_x).floor() as i32).max(clip.x);
+        let y0 = (clip_y.max(dst_y).floor() as i32).max(clip.y);
+        let x1 = ((clip_x + clip_w).min(dst_x + dst_w).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((clip_y + clip_h).min(dst_y + dst_h).ceil() as i32).min(clip.y + clip.h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let max_r = (clip_w * 0.5).min(clip_h * 0.5);
+        let r = [
+            radii[0].clamp(0.0, max_r),
+            radii[1].clamp(0.0, max_r),
+            radii[2].clamp(0.0, max_r),
+            radii[3].clamp(0.0, max_r),
+        ];
+        let has_radius = r.iter().any(|&v| v > 0.01);
+        for py in y0..y1 {
+            let cy = py as f32 + 0.5;
+            let v = ((cy - dst_y) / dst_h).clamp(0.0, 0.9999);
+            let sy = ((v * src_h as f32) as u32).min(src_h - 1);
+            for px in x0..x1 {
+                let cx = px as f32 + 0.5;
+                let cov = if has_radius {
+                    (0.5 - rounded_rect_sdf(cx, cy, clip_x, clip_y, clip_w, clip_h, r)).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                if cov <= 0.0 {
+                    continue;
+                }
+                let u = ((cx - dst_x) / dst_w).clamp(0.0, 0.9999);
+                let sx = ((u * src_w as f32) as u32).min(src_w - 1);
+                let sidx = ((sy * src_w + sx) * 4) as usize;
+                if sidx + 3 < src.len() {
+                    let c = RgbaColor::new(src[sidx], src[sidx + 1], src[sidx + 2], src[sidx + 3])
+                        .with_alpha(opacity * cov);
+                    self.blend_pixel(px, py, c);
+                }
+            }
+        }
+    }
+
+    pub fn blit_tinted_mask_rgba(
+        &mut self,
+        src_w: u32,
+        src_h: u32,
+        src: &[u8],
+        dst_x: f32,
+        dst_y: f32,
+        dst_w: f32,
+        dst_h: f32,
+        color: RgbaColor,
+    ) {
+        if src_w == 0 || src_h == 0 || dst_w <= 0.0 || dst_h <= 0.0 || color.a == 0 {
+            return;
+        }
+        let clip = self.current_clip();
+        let x0 = (dst_x.floor() as i32).max(clip.x);
+        let y0 = (dst_y.floor() as i32).max(clip.y);
+        let x1 = ((dst_x + dst_w).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((dst_y + dst_h).ceil() as i32).min(clip.y + clip.h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        for py in y0..y1 {
+            let v = ((py as f32 + 0.5 - dst_y) / dst_h).clamp(0.0, 0.9999);
+            let sy = ((v * src_h as f32) as u32).min(src_h - 1);
+            for px in x0..x1 {
+                let u = ((px as f32 + 0.5 - dst_x) / dst_w).clamp(0.0, 0.9999);
+                let sx = ((u * src_w as f32) as u32).min(src_w - 1);
+                let sidx = ((sy * src_w + sx) * 4) as usize;
+                if sidx + 3 < src.len() {
+                    let mask_a = src[sidx + 3];
+                    if mask_a == 0 {
+                        continue;
+                    }
+                    let a = ((color.a as u32 * mask_a as u32 + 127) / 255) as u8;
+                    self.blend_pixel(px, py, RgbaColor::new(color.r, color.g, color.b, a));
+                }
+            }
+        }
+    }
+
     pub fn blit_alpha_mask(
         &mut self,
         dst_x: i32,

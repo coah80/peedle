@@ -41,24 +41,24 @@ pub fn layout_table(
     }
 
     let mut col_preferred = vec![0.0f32; num_cols];
+    let mut col_min = vec![0.0f32; num_cols];
     for (_, cells) in &row_entries {
         let mut col = 0usize;
         for &(cid, colspan) in cells {
             if colspan == 1 && col < num_cols {
                 let cs = engine.tree.get(cid).style.clone();
                 let cctx = engine.calc_ctx(&cs, table_w);
+                let pb_h = cs.padding_left.resolve_or(&cctx, 0.0)
+                    + cs.padding_right.resolve_or(&cctx, 0.0)
+                    + cs.border_left_width
+                    + cs.border_right_width;
+                let min_w = engine.measure_min_word_width(cid, table_w) + pb_h;
                 let pref = if let Some(w) = cs.width.resolve(&cctx) {
-                    w + cs.padding_left.resolve_or(&cctx, 0.0)
-                        + cs.padding_right.resolve_or(&cctx, 0.0)
-                        + cs.border_left_width
-                        + cs.border_right_width
+                    (w + pb_h).max(min_w)
                 } else {
-                    engine.measure_intrinsic_width(cid, table_w)
-                        + cs.padding_left.resolve_or(&cctx, 0.0)
-                        + cs.padding_right.resolve_or(&cctx, 0.0)
-                        + cs.border_left_width
-                        + cs.border_right_width
+                    (engine.measure_intrinsic_width(cid, table_w) + pb_h).max(min_w)
                 };
+                col_min[col] = col_min[col].max(min_w);
                 col_preferred[col] = col_preferred[col].max(pref);
             }
             col += colspan;
@@ -68,10 +68,36 @@ pub fn layout_table(
     let total_spacing_x = sx * (num_cols as f32 + 1.0);
     let avail_w = (table_w - total_spacing_x).max(0.0);
     let pref_sum: f32 = col_preferred.iter().sum();
+    let min_sum: f32 = col_min.iter().sum();
 
     let col_widths: Vec<f32> = if pref_sum <= 0.0 {
         vec![avail_w / num_cols as f32; num_cols]
-    } else if style.width != LengthPercentageAuto::Auto || pref_sum > avail_w {
+    } else if pref_sum > avail_w {
+        if min_sum > 0.0 && min_sum <= avail_w {
+            let extra_avail = avail_w - min_sum;
+            let extra_need: f32 = col_preferred
+                .iter()
+                .zip(col_min.iter())
+                .map(|(p, m)| (p - m).max(0.0))
+                .sum();
+            col_preferred
+                .iter()
+                .zip(col_min.iter())
+                .map(|(&p, &m)| {
+                    if extra_need > 0.0 {
+                        m + extra_avail * ((p - m).max(0.0) / extra_need)
+                    } else {
+                        m
+                    }
+                })
+                .collect()
+        } else {
+            col_preferred
+                .iter()
+                .map(|&p| avail_w * (p / pref_sum))
+                .collect()
+        }
+    } else if style.width != LengthPercentageAuto::Auto {
         col_preferred
             .iter()
             .map(|&p| avail_w * (p / pref_sum))

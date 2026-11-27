@@ -186,7 +186,31 @@ fn paint_box(
             );
         }
 
-        if b.style.background_color.a > 0 {
+        if let Some(ref mask_u) = b.style.mask_image {
+            if b.style.background_color.a > 0 {
+                if let Some(mimg) = images.get(mask_u) {
+                    if mimg.width > 0 && mimg.height > 0 && bb.width > 0.0 && bb.height > 0.0 {
+                        let sx = bb.width / mimg.width as f32;
+                        let sy = bb.height / mimg.height as f32;
+                        let s = sx.min(sy);
+                        let tw = mimg.width as f32 * s;
+                        let th = mimg.height as f32 * s;
+                        let tx = rx + (bb.width - tw) * 0.5;
+                        let ty = ry + (bb.height - th) * 0.5;
+                        fb.blit_tinted_mask_rgba(
+                            mimg.width,
+                            mimg.height,
+                            &mimg.rgba,
+                            tx,
+                            ty,
+                            tw,
+                            th,
+                            to_rgba(b.style.background_color).with_alpha(alpha),
+                        );
+                    }
+                }
+            }
+        } else if b.style.background_color.a > 0 {
             fb.fill_rounded_rect(
                 rx,
                 ry,
@@ -219,7 +243,7 @@ fn paint_box(
                             w: bb.width.ceil() as i32,
                             h: bb.height.ceil() as i32,
                         });
-                        let (tw, th) = match b.style.background_size {
+                        let (tw, th) = match &b.style.background_size {
                             peedle_css::BackgroundSize::Cover => {
                                 let sx = bb.width / img.width as f32;
                                 let sy = bb.height / img.height as f32;
@@ -231,6 +255,26 @@ fn paint_box(
                                 let sy = bb.height / img.height as f32;
                                 let s = sx.min(sy);
                                 (img.width as f32 * s, img.height as f32 * s)
+                            }
+                            peedle_css::BackgroundSize::Explicit(bw, bh) => {
+                                let ctx_w = CalcContext {
+                                    font_size: b.style.font_size,
+                                    root_font_size: 16.0,
+                                    viewport_width: fb.width as f32,
+                                    viewport_height: fb.height as f32,
+                                    percentage_base: bb.width,
+                                };
+                                let ctx_h = CalcContext {
+                                    percentage_base: bb.height,
+                                    ..ctx_w
+                                };
+                                let aspect = img.width as f32 / img.height.max(1) as f32;
+                                match (bw.resolve(&ctx_w), bh.resolve(&ctx_h)) {
+                                    (Some(w), Some(h)) => (w.max(1.0), h.max(1.0)),
+                                    (Some(w), None) => (w.max(1.0), (w / aspect).max(1.0)),
+                                    (None, Some(h)) => ((h * aspect).max(1.0), h.max(1.0)),
+                                    (None, None) => (img.width as f32, img.height as f32),
+                                }
                             }
                             _ => (img.width as f32, img.height as f32),
                         };
@@ -520,7 +564,32 @@ fn paint_replaced(
     match rep {
         ReplacedKind::Image { url, .. } => {
             if let Some(img) = images.get(url) {
-                fb.blit_rgba(img.width, img.height, &img.rgba, x, y, w, h, alpha);
+                let radii = resolve_radii(style, w, h);
+                let iw = img.width.max(1) as f32;
+                let ih = img.height.max(1) as f32;
+                let (dw, dh) = match style.object_fit {
+                    peedle_css::ObjectFit::Cover => {
+                        let s = (w / iw).max(h / ih);
+                        (iw * s, ih * s)
+                    }
+                    peedle_css::ObjectFit::Contain => {
+                        let s = (w / iw).min(h / ih);
+                        (iw * s, ih * s)
+                    }
+                    peedle_css::ObjectFit::ScaleDown => {
+                        let s = (w / iw).min(h / ih).min(1.0);
+                        (iw * s, ih * s)
+                    }
+                    peedle_css::ObjectFit::None => (iw, ih),
+                    peedle_css::ObjectFit::Fill => (w, h),
+                };
+                let dx = x + (w - dw) * 0.5;
+                let dy = y + (h - dh) * 0.5;
+                if radii.iter().any(|&r| r > 0.01) || (dw - w).abs() > 0.5 || (dh - h).abs() > 0.5 {
+                    fb.blit_rgba_rounded(img.width, img.height, &img.rgba, dx, dy, dw, dh, x, y, w, h, radii, alpha);
+                } else {
+                    fb.blit_rgba(img.width, img.height, &img.rgba, x, y, w, h, alpha);
+                }
             } else {
                 fb.fill_rect(x, y, w, h, RgbaColor::new(235, 238, 242, 255).with_alpha(alpha));
                 fb.stroke_rounded_rect(

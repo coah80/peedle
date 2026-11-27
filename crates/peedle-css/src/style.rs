@@ -957,6 +957,7 @@ pub struct ComputedStyle {
 
     pub background_color: Color,
     pub background_image: BackgroundImage,
+    pub mask_image: Option<String>,
     pub background_position_x: LengthPercentageAuto,
     pub background_position_y: LengthPercentageAuto,
     pub background_attachment_fixed: bool,
@@ -1096,6 +1097,7 @@ impl Default for ComputedStyle {
 
             background_color: Color::TRANSPARENT,
             background_image: BackgroundImage::None,
+            mask_image: None,
             background_position_x: LengthPercentageAuto::Percent(0.0),
             background_position_y: LengthPercentageAuto::Percent(0.0),
             background_attachment_fixed: false,
