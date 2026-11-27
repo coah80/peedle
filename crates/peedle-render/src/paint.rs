@@ -318,7 +318,21 @@ fn paint_box(
                 to_rgba(b.style.border_bottom_color).with_alpha(alpha),
                 to_rgba(b.style.border_left_color).with_alpha(alpha),
             ];
-            fb.stroke_rounded_rect(rx, ry, bb.width, bb.height, radii, widths, colors);
+            let style_code = |bs: BorderStyle| -> u8 {
+                match bs {
+                    BorderStyle::Dashed => 1,
+                    BorderStyle::Dotted => 2,
+                    BorderStyle::Double => 3,
+                    _ => 0,
+                }
+            };
+            let bstyles = [
+                style_code(b.style.border_top_style),
+                style_code(b.style.border_right_style),
+                style_code(b.style.border_bottom_style),
+                style_code(b.style.border_left_style),
+            ];
+            fb.stroke_styled_borders(rx, ry, bb.width, bb.height, radii, widths, colors, bstyles);
         }
 
         if b.style.outline_width > 0.0

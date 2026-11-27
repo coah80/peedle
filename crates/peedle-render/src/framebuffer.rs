@@ -281,6 +281,86 @@ impl Framebuffer {
         }
     }
 
+    pub fn stroke_styled_borders(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: [f32; 4],
+        widths: [f32; 4],
+        colors: [RgbaColor; 4],
+        styles: [u8; 4],
+    ) {
+        if styles.iter().all(|&s| s == 0) {
+            self.stroke_rounded_rect(x, y, w, h, radii, widths, colors);
+            return;
+        }
+        let draw_side = |fb: &mut Framebuffer,
+                         sx: f32,
+                         sy: f32,
+                         len: f32,
+                         thick: f32,
+                         horiz: bool,
+                         color: RgbaColor,
+                         st: u8| {
+            if thick <= 0.0 || len <= 0.0 || color.a == 0 {
+                return;
+            }
+            match st {
+                1 => {
+                    let dash = (thick * 3.0).max(4.0);
+                    let gap = (thick * 2.0).max(3.0);
+                    let mut pos = 0.0;
+                    while pos < len {
+                        let seg = dash.min(len - pos);
+                        if horiz {
+                            fb.fill_rect(sx + pos, sy, seg, thick, color);
+                        } else {
+                            fb.fill_rect(sx, sy + pos, thick, seg, color);
+                        }
+                        pos += dash + gap;
+                    }
+                }
+                2 => {
+                    let dot = thick.max(1.5);
+                    let step = (dot * 2.0).max(3.0);
+                    let mut pos = 0.0;
+                    while pos < len {
+                        let seg = dot.min(len - pos);
+                        if horiz {
+                            fb.fill_rect(sx + pos, sy, seg, thick, color);
+                        } else {
+                            fb.fill_rect(sx, sy + pos, thick, seg, color);
+                        }
+                        pos += step;
+                    }
+                }
+                3 => {
+                    let band = (thick / 3.0).max(1.0);
+                    if horiz {
+                        fb.fill_rect(sx, sy, len, band, color);
+                        fb.fill_rect(sx, sy + thick - band, len, band, color);
+                    } else {
+                        fb.fill_rect(sx, sy, band, len, color);
+                        fb.fill_rect(sx + thick - band, sy, band, len, color);
+                    }
+                }
+                _ => {
+                    if horiz {
+                        fb.fill_rect(sx, sy, len, thick, color);
+                    } else {
+                        fb.fill_rect(sx, sy, thick, len, color);
+                    }
+                }
+            }
+        };
+        draw_side(self, x, y, w, widths[0], true, colors[0], styles[0]);
+        draw_side(self, x + w - widths[1], y, h, widths[1], false, colors[1], styles[1]);
+        draw_side(self, x, y + h - widths[2], w, widths[2], true, colors[2], styles[2]);
+        draw_side(self, x, y, h, widths[3], false, colors[3], styles[3]);
+    }
+
     pub fn stroke_rounded_rect(
         &mut self,
         x: f32,
