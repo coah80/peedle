@@ -96,7 +96,7 @@ fn paint_box(
     oy: f32,
 ) {
     let b = tree.get(id);
-    if b.style.visibility == Visibility::Hidden || b.style.opacity <= 0.001 {
+    if b.style.visibility == Visibility::Hidden || b.style.opacity <= 0.001 || b.style.clip_hidden {
         return;
     }
 

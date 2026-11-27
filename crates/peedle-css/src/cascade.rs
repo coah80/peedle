@@ -2395,6 +2395,40 @@ fn apply_longhand(
                 style.overflow_y = o;
             }
         }
+        "clip" => {
+            if ident.as_deref() == Some("auto") {
+                style.clip_hidden = false;
+            } else {
+                let raw = serialize_tokens(trimmed).to_ascii_lowercase();
+                if let Some(inner) = raw.strip_prefix("rect(").and_then(|s| s.strip_suffix(')')) {
+                    let vals: Vec<f32> = inner
+                        .replace(',', " ")
+                        .split_ascii_whitespace()
+                        .filter_map(|t| t.trim_end_matches("px").parse::<f32>().ok())
+                        .collect();
+                    if vals.len() == 4 {
+                        let w = vals[1] - vals[3];
+                        let h = vals[2] - vals[0];
+                        style.clip_hidden = w <= 1.0 && h <= 1.0;
+                    }
+                }
+            }
+        }
+        "clip-path" => {
+            if ident.as_deref() == Some("none") {
+                style.clip_hidden = false;
+            } else {
+                let raw = serialize_tokens(trimmed).to_ascii_lowercase();
+                if let Some(inner) = raw.strip_prefix("inset(").and_then(|s| s.strip_suffix(')')) {
+                    let first = inner.split_ascii_whitespace().next().unwrap_or("");
+                    if let Some(pct) = first.strip_suffix('%').and_then(|p| p.parse::<f32>().ok()) {
+                        if pct >= 50.0 {
+                            style.clip_hidden = true;
+                        }
+                    }
+                }
+            }
+        }
         "box-shadow" => {
             style.box_shadow = parse_box_shadows(trimmed, ctx, style.color);
         }
@@ -2860,6 +2894,7 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, prop: &str) {
         "visibility" => dst.visibility = src.visibility,
         "overflow-x" => dst.overflow_x = src.overflow_x,
         "overflow-y" => dst.overflow_y = src.overflow_y,
+        "clip" | "clip-path" => dst.clip_hidden = src.clip_hidden,
         "box-shadow" => dst.box_shadow = src.box_shadow.clone(),
         "text-shadow" => dst.text_shadow = src.text_shadow.clone(),
         "transform" => dst.transform = src.transform.clone(),

@@ -385,3 +385,28 @@ fn wpt_table_colspan_and_border_spacing() {
     assert!(hdr.width > a.width + b.width - 2.0, "colspan=2 must span both columns: hdr={:?} a={:?} b={:?}", hdr, a, b);
     assert!(b.x >= a.right() + 8.0, "border-spacing must separate cells: a={:?} b={:?}", a, b);
 }
+
+#[test]
+fn wpt_flex_intrinsic_ignores_descendant_percent_width() {
+    let (doc, tree) = run_layout(
+        r##"<ul id="nav">
+            <li id="i1"><a href="#">Why Go</a></li>
+            <li id="i2"><a href="#">Learn</a></li>
+            <li id="i3"><a href="#">Docs</a></li>
+        </ul>"##,
+        r#"
+            body { margin: 0; }
+            #nav { display: flex; width: 1000px; list-style: none; padding: 0; margin: 0; }
+            #nav li { display: inline-flex; flex: none; }
+            #nav li a { display: inline-flex; width: 100%; padding: 0 16px; }
+        "#,
+        1200.0,
+        400.0,
+    );
+    let i1 = tree.bounding_rect(doc.get_element_by_id("i1").unwrap()).unwrap();
+    let i2 = tree.bounding_rect(doc.get_element_by_id("i2").unwrap()).unwrap();
+    let i3 = tree.bounding_rect(doc.get_element_by_id("i3").unwrap()).unwrap();
+    assert!(i1.width < 200.0, "item 1 must not expand to 1000px: {:?}", i1);
+    assert!(i2.x >= i1.right() - 1.0 && i2.x < 300.0, "item 2 must sit next to item 1: i1={:?} i2={:?}", i1, i2);
+    assert!(i3.x >= i2.right() - 1.0 && i3.right() < 500.0, "item 3 must remain inside navbar: {:?}", i3);
+}

@@ -258,3 +258,19 @@ fn wpt_css_specificity_is_where_not_has_and_layers() {
     assert_eq!(styles.get(lead).unwrap().color, Color::rgb(0x11, 0x11, 0x11));
     assert_eq!(styles.get(plain).unwrap().color, Color::rgb(0x44, 0x55, 0xcc));
 }
+
+#[test]
+fn wpt_clip_rect_and_clip_path_visually_hidden() {
+    let doc = parse_html(r#"<a id="skip">Skip</a><span id="sr">SR</span><div id="vis">Vis</div>"#);
+    let sheet = parse_stylesheet(
+        r#"
+        #skip { position: absolute; clip: rect(0 0 0 0); }
+        #sr { clip-path: inset(50%); }
+        #vis { clip: auto; }
+        "#,
+    );
+    let styles = compute_styles(&doc, &[sheet], Viewport::default());
+    assert!(styles.get(doc.get_element_by_id("skip").unwrap()).unwrap().clip_hidden);
+    assert!(styles.get(doc.get_element_by_id("sr").unwrap()).unwrap().clip_hidden);
+    assert!(!styles.get(doc.get_element_by_id("vis").unwrap()).unwrap().clip_hidden);
+}

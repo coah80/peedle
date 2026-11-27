@@ -1578,8 +1578,10 @@ impl LayoutEngine {
         let kind = self.tree.get(id).kind.clone();
         let style = self.tree.get(id).style.clone();
         let ctx = self.calc_ctx(&style, cb_width);
-        if let Some(w) = style.width.resolve(&ctx) {
-            return w;
+        if matches!(style.width, LengthPercentageAuto::Length(_)) {
+            if let Some(w) = style.width.resolve(&ctx) {
+                return w;
+            }
         }
         match kind {
             BoxKind::Text(ref t) => {
