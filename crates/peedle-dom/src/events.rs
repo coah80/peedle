@@ -150,6 +150,102 @@ pub fn define_event_system(rt: &mut JsRuntime, dom: SharedDom, event_target_prot
     );
     let _ = rt.set_property(event_proto, "initEvent", JsValue::Object(init_ev));
 
+    let init_ui_ev = rt.create_native_function(
+        "initUIEvent",
+        5,
+        Rc::new(|rt, this, args| {
+            let etype = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let bubbles = args.get(1).map_or(false, |v| rt.to_boolean(v));
+            let cancelable = args.get(2).map_or(false, |v| rt.to_boolean(v));
+            let view = args.get(3).cloned().unwrap_or(JsValue::Null);
+            let detail = args.get(4).and_then(|v| rt.to_number(v).ok()).unwrap_or(0.0);
+            if let Some(oid) = this.as_object() {
+                if let Some(ev) = rt.get_host_data_mut::<EventData>(oid) {
+                    ev.event_type = etype.clone();
+                    ev.bubbles = bubbles;
+                    ev.cancelable = cancelable;
+                }
+                let _ = rt.set_property(oid, "type", JsValue::String(etype));
+                let _ = rt.set_property(oid, "bubbles", JsValue::Boolean(bubbles));
+                let _ = rt.set_property(oid, "cancelable", JsValue::Boolean(cancelable));
+                let _ = rt.set_property(oid, "view", view);
+                let _ = rt.set_property(oid, "detail", JsValue::Number(detail));
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let _ = rt.set_property(event_proto, "initUIEvent", JsValue::Object(init_ui_ev));
+
+    let init_mouse_ev = rt.create_native_function(
+        "initMouseEvent",
+        15,
+        Rc::new(|rt, this, args| {
+            let etype = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let bubbles = args.get(1).map_or(false, |v| rt.to_boolean(v));
+            let cancelable = args.get(2).map_or(false, |v| rt.to_boolean(v));
+            let view = args.get(3).cloned().unwrap_or(JsValue::Null);
+            let detail = args.get(4).and_then(|v| rt.to_number(v).ok()).unwrap_or(0.0);
+            let screen_x = args.get(5).and_then(|v| rt.to_number(v).ok()).unwrap_or(0.0);
+            let screen_y = args.get(6).and_then(|v| rt.to_number(v).ok()).unwrap_or(0.0);
+            let client_x = args.get(7).and_then(|v| rt.to_number(v).ok()).unwrap_or(0.0);
+            let client_y = args.get(8).and_then(|v| rt.to_number(v).ok()).unwrap_or(0.0);
+            let ctrl = args.get(9).map_or(false, |v| rt.to_boolean(v));
+            let alt = args.get(10).map_or(false, |v| rt.to_boolean(v));
+            let shift = args.get(11).map_or(false, |v| rt.to_boolean(v));
+            let meta = args.get(12).map_or(false, |v| rt.to_boolean(v));
+            let button = args.get(13).and_then(|v| rt.to_number(v).ok()).unwrap_or(0.0);
+            let related = args.get(14).cloned().unwrap_or(JsValue::Null);
+            if let Some(oid) = this.as_object() {
+                if let Some(ev) = rt.get_host_data_mut::<EventData>(oid) {
+                    ev.event_type = etype.clone();
+                    ev.bubbles = bubbles;
+                    ev.cancelable = cancelable;
+                }
+                let _ = rt.set_property(oid, "type", JsValue::String(etype));
+                let _ = rt.set_property(oid, "bubbles", JsValue::Boolean(bubbles));
+                let _ = rt.set_property(oid, "cancelable", JsValue::Boolean(cancelable));
+                let _ = rt.set_property(oid, "view", view);
+                let _ = rt.set_property(oid, "detail", JsValue::Number(detail));
+                let _ = rt.set_property(oid, "screenX", JsValue::Number(screen_x));
+                let _ = rt.set_property(oid, "screenY", JsValue::Number(screen_y));
+                let _ = rt.set_property(oid, "clientX", JsValue::Number(client_x));
+                let _ = rt.set_property(oid, "clientY", JsValue::Number(client_y));
+                let _ = rt.set_property(oid, "ctrlKey", JsValue::Boolean(ctrl));
+                let _ = rt.set_property(oid, "altKey", JsValue::Boolean(alt));
+                let _ = rt.set_property(oid, "shiftKey", JsValue::Boolean(shift));
+                let _ = rt.set_property(oid, "metaKey", JsValue::Boolean(meta));
+                let _ = rt.set_property(oid, "button", JsValue::Number(button));
+                let _ = rt.set_property(oid, "relatedTarget", related);
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let _ = rt.set_property(event_proto, "initMouseEvent", JsValue::Object(init_mouse_ev));
+
+    let init_custom_ev = rt.create_native_function(
+        "initCustomEvent",
+        4,
+        Rc::new(|rt, this, args| {
+            let etype = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let bubbles = args.get(1).map_or(false, |v| rt.to_boolean(v));
+            let cancelable = args.get(2).map_or(false, |v| rt.to_boolean(v));
+            let detail = args.get(3).cloned().unwrap_or(JsValue::Null);
+            if let Some(oid) = this.as_object() {
+                if let Some(ev) = rt.get_host_data_mut::<EventData>(oid) {
+                    ev.event_type = etype.clone();
+                    ev.bubbles = bubbles;
+                    ev.cancelable = cancelable;
+                }
+                let _ = rt.set_property(oid, "type", JsValue::String(etype));
+                let _ = rt.set_property(oid, "bubbles", JsValue::Boolean(bubbles));
+                let _ = rt.set_property(oid, "cancelable", JsValue::Boolean(cancelable));
+                let _ = rt.set_property(oid, "detail", detail);
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let _ = rt.set_property(event_proto, "initCustomEvent", JsValue::Object(init_custom_ev));
+
     for (name, num) in [
         ("NONE", 0.0),
         ("CAPTURING_PHASE", 1.0),

@@ -103,6 +103,7 @@ impl BrowserJsEnv {
             text,
             comment,
             fragment,
+            doctype,
             range_proto,
         );
         define_web_apis(&mut rt, dom.clone());
@@ -268,12 +269,14 @@ impl BrowserJsEnv {
                 continue;
             }
 
+            self.dom.borrow_mut().current_script = Some(sid);
             let res = if is_module {
                 let spec = src_attr.unwrap_or_else(|| format!("inline:{}", sid.0));
                 self.rt.eval_module(&spec, &code)
             } else {
                 self.rt.eval(&code)
             };
+            self.dom.borrow_mut().current_script = None;
             if let Err(e) = res {
                 let msg = e.to_string();
                 self.rt.console_lines.push(format!("[Error] {}", msg));
@@ -298,9 +301,9 @@ impl BrowserJsEnv {
                 })
                 .collect()
         };
+        self.dom.borrow_mut().pending_subdoc_loads.clear();
         for eid in embedded_nodes {
-            let _ = crate::nodes::ensure_subdocument(&self.dom, eid);
-            let _ = self.dispatch_dom_event(Some(eid), "load", false, false);
+            self.load_subdocument_and_fire_load(eid);
         }
 
         self.dom.borrow_mut().ready_state = "complete".to_string();
@@ -345,16 +348,52 @@ impl BrowserJsEnv {
         Ok(ok)
     }
 
+    fn load_subdocument_and_fire_load(&mut self, eid: NodeId) {
+        let scripts = crate::nodes::load_subdocument_with_scripts(&self.dom, eid);
+        for code in scripts {
+            let _ = self.rt.eval(&code);
+            self.rt.drain_microtasks();
+        }
+        let ev_proto = self.dom.borrow().protos.unwrap().event;
+        let ev = build_event_object(
+            &mut self.rt,
+            ev_proto,
+            "load".to_string(),
+            false,
+            false,
+            true,
+        );
+        let _ = dispatch_event_object(&mut self.rt, &self.dom, Some(eid), ev);
+        self.rt.drain_microtasks();
+    }
+
     pub fn tick_event_loop(&mut self, max_turns: usize) {
         for _ in 0..max_turns {
             self.rt.drain_microtasks();
             self.flush_mutation_observers();
 
+            let pending_loads: Vec<NodeId> = {
+                let mut st = self.dom.borrow_mut();
+                std::mem::take(&mut st.pending_subdoc_loads)
+            };
+            let mut did_work = !pending_loads.is_empty();
+            for eid in pending_loads {
+                let connected = {
+                    let st = self.dom.borrow();
+                    st.doc.is_ancestor(st.doc.root, eid)
+                };
+                if connected {
+                    self.load_subdocument_and_fire_load(eid);
+                }
+            }
+
             let messages: Vec<(JsValue, JsValue)> = {
                 let mut st = self.dom.borrow_mut();
                 std::mem::take(&mut st.message_queue)
             };
-            let mut did_work = !messages.is_empty();
+            if !messages.is_empty() {
+                did_work = true;
+            }
             for (port, ev) in messages {
                 if let Some(p_oid) = port.as_object() {
                     if let Ok(handler) = self.rt.get_property(p_oid, "onmessage") {

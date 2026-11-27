@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use peedle_css::{matches_selector, query_selector, query_selector_all};
+use peedle_css::{matches_selector, query_selector, query_selector_all, CalcContext};
 use peedle_html::{parse_fragment_into, Namespace, NodeData, NodeId, ShadowRootMode};
 use peedle_js::{JsError, JsRuntime, JsValue, ObjectId, PropertyKey};
 
@@ -137,7 +137,13 @@ pub fn define_node_proto(rt: &mut JsRuntime, dom: SharedDom, node_proto: ObjectI
             Ok(JsValue::String(name))
         }),
     );
+    let _ = rt.set_property(node_proto, "nodeName", JsValue::Undefined);
     define_getter_setter(rt, node_proto, "nodeName", Some(get_node_name), None);
+
+    let get_null = rt.create_native_function("get null", 0, Rc::new(|_, _, _| Ok(JsValue::Null)));
+    define_getter_setter(rt, node_proto, "localName", Some(get_null), None);
+    define_getter_setter(rt, node_proto, "prefix", Some(get_null), None);
+    define_getter_setter(rt, node_proto, "namespaceURI", Some(get_null), None);
 
     let dg = dom.clone();
     let ds = dom.clone();
@@ -206,7 +212,12 @@ pub fn define_node_proto(rt: &mut JsRuntime, dom: SharedDom, node_proto: ObjectI
                 _ => String::new(),
             };
             let mut st = ds.borrow_mut();
+            let old_kids = st.doc.children(nid);
+            for k in old_kids {
+                st.notify_pre_remove(k);
+            }
             st.doc.set_text_content(nid, s);
+            st.invalidate_style_owner(nid);
             st.mark_dirty();
             Ok(JsValue::Undefined)
         }),
@@ -402,8 +413,24 @@ pub fn define_node_proto(rt: &mut JsRuntime, dom: SharedDom, node_proto: ObjectI
             }
             {
                 let mut st = d.borrow_mut();
+                let to_insert: Vec<NodeId> = if matches!(st.doc.node(child).data, NodeData::DocumentFragment) {
+                    st.doc.children(child)
+                } else {
+                    vec![child]
+                };
+                for &c in &to_insert {
+                    if st.doc.node(c).parent.is_some() {
+                        st.notify_pre_remove(c);
+                    }
+                }
+                let ins_idx = st.doc.children(parent).len();
                 st.doc.append_child(parent, child);
-                st.mark_dirty();
+                st.notify_post_insert(parent, ins_idx, to_insert.len());
+                st.invalidate_style_owner(parent);
+                for &c in &to_insert {
+                    st.queue_subdoc_loads_in(c);
+                }
+                st.mark_dirty_for(parent);
             }
             Ok(JsValue::Object(wrap_node(rt, &d, child)))
         }),
@@ -466,8 +493,32 @@ pub fn define_node_proto(rt: &mut JsRuntime, dom: SharedDom, node_proto: ObjectI
             }
             {
                 let mut st = d.borrow_mut();
+                let to_insert: Vec<NodeId> = if matches!(st.doc.node(child).data, NodeData::DocumentFragment) {
+                    st.doc.children(child)
+                } else {
+                    vec![child]
+                };
+                for &c in &to_insert {
+                    if st.doc.node(c).parent.is_some() {
+                        st.notify_pre_remove(c);
+                    }
+                }
+                let ins_idx = match ref_node {
+                    Some(rn) => st
+                        .doc
+                        .children(parent)
+                        .iter()
+                        .position(|&x| x == rn)
+                        .unwrap_or_else(|| st.doc.children(parent).len()),
+                    None => st.doc.children(parent).len(),
+                };
                 st.doc.insert_before(parent, child, ref_node);
-                st.mark_dirty();
+                st.notify_post_insert(parent, ins_idx, to_insert.len());
+                st.invalidate_style_owner(parent);
+                for &c in &to_insert {
+                    st.queue_subdoc_loads_in(c);
+                }
+                st.mark_dirty_for(parent);
             }
             Ok(JsValue::Object(wrap_node(rt, &d, child)))
         }),
@@ -497,8 +548,10 @@ pub fn define_node_proto(rt: &mut JsRuntime, dom: SharedDom, node_proto: ObjectI
             }
             {
                 let mut st = d.borrow_mut();
+                st.notify_pre_remove(child);
+                st.invalidate_style_owner(parent);
                 st.doc.detach(child);
-                st.mark_dirty();
+                st.mark_dirty_for(parent);
             }
             Ok(JsValue::Object(wrap_node(rt, &d, child)))
         }),
@@ -521,7 +574,22 @@ pub fn define_node_proto(rt: &mut JsRuntime, dom: SharedDom, node_proto: ObjectI
             };
             {
                 let mut st = d.borrow_mut();
+                let to_insert: Vec<NodeId> = if matches!(st.doc.node(new_c).data, NodeData::DocumentFragment) {
+                    st.doc.children(new_c)
+                } else {
+                    vec![new_c]
+                };
+                for &c in &to_insert {
+                    if st.doc.node(c).parent.is_some() {
+                        st.notify_pre_remove(c);
+                    }
+                }
+                st.notify_pre_remove(old_c);
                 st.doc.replace_child(parent, new_c, old_c);
+                st.invalidate_style_owner(parent);
+                for &c in &to_insert {
+                    st.queue_subdoc_loads_in(c);
+                }
                 st.mark_dirty();
             }
             Ok(JsValue::Object(wrap_node(rt, &d, old_c)))
@@ -708,18 +776,40 @@ pub fn define_element_proto(
         0,
         Rc::new(move |rt, this, _| {
             let Some(nid) = node_id_of(rt, &this) else {
-                return Ok(JsValue::String(String::new()));
+                return Ok(JsValue::Null);
             };
             let s = d
                 .borrow()
                 .doc
                 .element(nid)
-                .map(|e| e.tag_name.clone())
-                .unwrap_or_default();
-            Ok(JsValue::String(s))
+                .map(|e| {
+                    e.tag_name
+                        .split_once(':')
+                        .map(|(_, local)| local.to_string())
+                        .unwrap_or_else(|| e.tag_name.clone())
+                });
+            Ok(s.map(JsValue::String).unwrap_or(JsValue::Null))
         }),
     );
     define_getter_setter(rt, element_proto, "localName", Some(get_local), None);
+
+    let d = dom.clone();
+    let get_prefix = rt.create_native_function(
+        "get prefix",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Null);
+            };
+            let p = d
+                .borrow()
+                .doc
+                .element(nid)
+                .and_then(|e| e.tag_name.split_once(':').map(|(pfx, _)| pfx.to_string()));
+            Ok(p.map(JsValue::String).unwrap_or(JsValue::Null))
+        }),
+    );
+    define_getter_setter(rt, element_proto, "prefix", Some(get_prefix), None);
 
     let d = dom.clone();
     let get_ns = rt.create_native_function(
@@ -729,8 +819,14 @@ pub fn define_element_proto(
             let Some(nid) = node_id_of(rt, &this) else {
                 return Ok(JsValue::Null);
             };
-            let uri = d
-                .borrow()
+            let st = d.borrow();
+            if let Some(custom) = st.custom_namespaces.get(&nid) {
+                return Ok(match custom {
+                    Some(u) => JsValue::String(u.clone()),
+                    None => JsValue::Null,
+                });
+            }
+            let uri = st
                 .doc
                 .element(nid)
                 .map(|e| JsValue::String(e.namespace.uri().to_string()))
@@ -788,13 +884,59 @@ pub fn define_element_proto(
             let mut st = ds.borrow_mut();
             st.doc.set_attribute(nid, "data", s);
             st.sub_documents.remove(&nid);
+            if st.doc.element(nid).map_or(false, |e| e.is_html() && e.tag_is("object"))
+                && st.doc.is_ancestor(st.doc.root, nid)
+                && !st.pending_subdoc_loads.contains(&nid)
+            {
+                st.pending_subdoc_loads.push(nid);
+            }
             st.mark_dirty();
             Ok(JsValue::Undefined)
         }),
     );
     define_getter_setter(rt, html_element_proto, "data", Some(get_data_prop), Some(set_data_prop));
     define_attr_prop(rt, &dom, html_element_proto, "href", "href");
-    define_attr_prop(rt, &dom, html_element_proto, "src", "src");
+
+    let dg_src = dom.clone();
+    let ds_src = dom.clone();
+    let get_src_prop = rt.create_native_function(
+        "get src",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::String(String::new()));
+            };
+            let val = dg_src
+                .borrow()
+                .doc
+                .element(nid)
+                .and_then(|e| e.get_attr("src"))
+                .unwrap_or("")
+                .to_string();
+            Ok(JsValue::String(val))
+        }),
+    );
+    let set_src_prop = rt.create_native_function(
+        "set src",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Undefined);
+            };
+            let s = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let mut st = ds_src.borrow_mut();
+            st.doc.set_attribute(nid, "src", s);
+            if st.doc.element(nid).map_or(false, |e| e.is_html() && e.tag_is("iframe")) {
+                st.sub_documents.remove(&nid);
+                if st.doc.is_ancestor(st.doc.root, nid) && !st.pending_subdoc_loads.contains(&nid) {
+                    st.pending_subdoc_loads.push(nid);
+                }
+            }
+            st.mark_dirty();
+            Ok(JsValue::Undefined)
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "src", Some(get_src_prop), Some(set_src_prop));
     define_attr_prop(rt, &dom, html_element_proto, "alt", "alt");
     define_attr_prop(rt, &dom, html_element_proto, "placeholder", "placeholder");
     define_attr_prop(rt, &dom, html_element_proto, "rel", "rel");
@@ -911,6 +1053,9 @@ pub fn define_element_proto(
             };
             let b = args.first().map_or(false, |v| rt.to_boolean(v));
             let mut st = ds.borrow_mut();
+            if b {
+                uncheck_radio_siblings(&mut st.doc, nid);
+            }
             if let Some(el) = st.doc.element_mut(nid) {
                 el.checked = Some(b);
             }
@@ -919,6 +1064,164 @@ pub fn define_element_proto(
         }),
     );
     define_getter_setter(rt, html_element_proto, "checked", Some(get_chk), Some(set_chk));
+
+    let dg_dc = dom.clone();
+    let ds_dc = dom.clone();
+    let get_dchk = rt.create_native_function(
+        "get defaultChecked",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Boolean(false));
+            };
+            let c = dg_dc.borrow().doc.element(nid).map_or(false, |e| e.has_attr("checked"));
+            Ok(JsValue::Boolean(c))
+        }),
+    );
+    let set_dchk = rt.create_native_function(
+        "set defaultChecked",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Undefined);
+            };
+            let b = args.first().map_or(false, |v| rt.to_boolean(v));
+            let mut st = ds_dc.borrow_mut();
+            if b {
+                st.doc.set_attribute(nid, "checked", "");
+            } else {
+                st.doc.remove_attribute(nid, "checked");
+            }
+            st.mark_dirty();
+            Ok(JsValue::Undefined)
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "defaultChecked", Some(get_dchk), Some(set_dchk));
+
+    let dg_ds = dom.clone();
+    let ds_ds = dom.clone();
+    let get_dsel = rt.create_native_function(
+        "get defaultSelected",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Boolean(false));
+            };
+            let c = dg_ds.borrow().doc.element(nid).map_or(false, |e| e.has_attr("selected"));
+            Ok(JsValue::Boolean(c))
+        }),
+    );
+    let set_dsel = rt.create_native_function(
+        "set defaultSelected",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Undefined);
+            };
+            let b = args.first().map_or(false, |v| rt.to_boolean(v));
+            let mut st = ds_ds.borrow_mut();
+            if b {
+                st.doc.set_attribute(nid, "selected", "");
+            } else {
+                st.doc.remove_attribute(nid, "selected");
+            }
+            st.mark_dirty();
+            Ok(JsValue::Undefined)
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "defaultSelected", Some(get_dsel), Some(set_dsel));
+
+    let dg_sel = dom.clone();
+    let ds_sel = dom.clone();
+    let get_sel = rt.create_native_function(
+        "get selected",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Boolean(false));
+            };
+            let c = dg_sel
+                .borrow()
+                .doc
+                .element(nid)
+                .map_or(false, |e| e.checked.unwrap_or_else(|| e.has_attr("selected")));
+            Ok(JsValue::Boolean(c))
+        }),
+    );
+    let set_sel = rt.create_native_function(
+        "set selected",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Undefined);
+            };
+            let b = args.first().map_or(false, |v| rt.to_boolean(v));
+            let mut st = ds_sel.borrow_mut();
+            if let Some(el) = st.doc.element_mut(nid) {
+                el.checked = Some(b);
+            }
+            st.mark_dirty();
+            Ok(JsValue::Undefined)
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "selected", Some(get_sel), Some(set_sel));
+
+    let dg_si = dom.clone();
+    let ds_si = dom.clone();
+    let get_sel_idx = rt.create_native_function(
+        "get selectedIndex",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Number(-1.0));
+            };
+            let st = dg_si.borrow();
+            let opts: Vec<NodeId> = st
+                .doc
+                .descendants(nid)
+                .into_iter()
+                .filter(|&id| st.doc.element(id).map_or(false, |e| e.tag_is("option")))
+                .collect();
+            if opts.is_empty() {
+                return Ok(JsValue::Number(-1.0));
+            }
+            if let Some(explicit) = st.doc.element(nid).and_then(|e| e.selected_index) {
+                if explicit < opts.len() {
+                    return Ok(JsValue::Number(explicit as f64));
+                }
+            }
+            let mut chosen = 0usize;
+            for (i, &oid) in opts.iter().enumerate() {
+                if let Some(oe) = st.doc.element(oid) {
+                    if oe.checked.unwrap_or_else(|| oe.has_attr("selected")) {
+                        chosen = i;
+                    }
+                }
+            }
+            Ok(JsValue::Number(chosen as f64))
+        }),
+    );
+    let set_sel_idx = rt.create_native_function(
+        "set selectedIndex",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Undefined);
+            };
+            let idx = args
+                .first()
+                .and_then(|v| rt.to_number(v).ok())
+                .map(|n| n as isize)
+                .unwrap_or(-1);
+            let mut st = ds_si.borrow_mut();
+            if let Some(el) = st.doc.element_mut(nid) {
+                el.selected_index = if idx >= 0 { Some(idx as usize) } else { None };
+            }
+            st.mark_dirty();
+            Ok(JsValue::Undefined)
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "selectedIndex", Some(get_sel_idx), Some(set_sel_idx));
 
     let dg = dom.clone();
     let ds = dom.clone();
@@ -1058,8 +1361,19 @@ pub fn define_element_proto(
             let name = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
             let val = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
             let mut st = d.borrow_mut();
+            let is_embed_url = st.doc.element(nid).map_or(false, |e| {
+                e.is_html()
+                    && ((e.tag_is("iframe") && name.eq_ignore_ascii_case("src"))
+                        || (e.tag_is("object") && name.eq_ignore_ascii_case("data")))
+            });
             st.doc.set_attribute(nid, name, val);
-            st.mark_dirty();
+            if is_embed_url {
+                st.sub_documents.remove(&nid);
+                if st.doc.is_ancestor(st.doc.root, nid) && !st.pending_subdoc_loads.contains(&nid) {
+                    st.pending_subdoc_loads.push(nid);
+                }
+            }
+            st.mark_dirty_for(nid);
             Ok(JsValue::Undefined)
         }),
     );
@@ -1076,7 +1390,7 @@ pub fn define_element_proto(
             let name = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
             let mut st = d.borrow_mut();
             st.doc.remove_attribute(nid, &name);
-            st.mark_dirty();
+            st.mark_dirty_for(nid);
             Ok(JsValue::Undefined)
         }),
     );
@@ -1127,7 +1441,7 @@ pub fn define_element_proto(
             let name = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
             let mut st = d.borrow_mut();
             st.doc.remove_attribute(nid, &name);
-            st.mark_dirty();
+            st.mark_dirty_for(nid);
             Ok(JsValue::Undefined)
         }),
     );
@@ -1696,9 +2010,72 @@ pub fn define_element_proto(
             let Some(nid) = node_id_of(rt, &this) else {
                 return Ok(JsValue::Undefined);
             };
+            let (kind, prev_states) = {
+                let mut st = d.borrow_mut();
+                let info = st.doc.element(nid).map(|e| {
+                    let is_html = e.is_html();
+                    let tag = e.tag_name.clone();
+                    let ty = e.get_attr("type").unwrap_or("").to_ascii_lowercase();
+                    let disabled = e.is_disabled();
+                    let checked = e.checked;
+                    let is_checked = e.is_checked();
+                    (is_html, tag, ty, disabled, checked, is_checked)
+                });
+                match info {
+                    Some((true, ref tag, ref ty, false, old_opt, is_chk))
+                        if tag == "input" && ty == "checkbox" =>
+                    {
+                        if let Some(el) = st.doc.element_mut(nid) {
+                            el.checked = Some(!is_chk);
+                        }
+                        st.mark_dirty();
+                        (1u8, vec![(nid, old_opt)])
+                    }
+                    Some((true, ref tag, ref ty, false, _, _))
+                        if tag == "input" && ty == "radio" =>
+                    {
+                        let group = collect_radio_group(&st.doc, nid);
+                        let saved: Vec<(NodeId, Option<bool>)> = group
+                            .iter()
+                            .map(|&id| (id, st.doc.element(id).and_then(|e| e.checked)))
+                            .collect();
+                        uncheck_radio_siblings(&mut st.doc, nid);
+                        if let Some(el) = st.doc.element_mut(nid) {
+                            el.checked = Some(true);
+                        }
+                        st.mark_dirty();
+                        (2u8, saved)
+                    }
+                    Some((true, ref tag, ref ty, false, _, _))
+                        if (tag == "input" && ty == "submit")
+                            || (tag == "button" && (ty.is_empty() || ty == "submit")) =>
+                    {
+                        (3u8, Vec::new())
+                    }
+                    _ => (0u8, Vec::new()),
+                }
+            };
             let ev_proto = d.borrow().protos.unwrap().event;
             let ev = build_event_object(rt, ev_proto, "click".to_string(), true, true, true);
-            let _ = dispatch_event_object(rt, &d, Some(nid), ev)?;
+            let allow_default = dispatch_event_object(rt, &d, Some(nid), ev)?;
+            if !allow_default && (kind == 1 || kind == 2) {
+                let mut st = d.borrow_mut();
+                for (id, old) in prev_states {
+                    if let Some(el) = st.doc.element_mut(id) {
+                        el.checked = old;
+                    }
+                }
+                st.mark_dirty();
+            } else if allow_default && kind == 3 {
+                let form_id = {
+                    let st = d.borrow();
+                    find_owner_form(&st.doc, nid)
+                };
+                if let Some(fid) = form_id {
+                    let sub_ev = build_event_object(rt, ev_proto, "submit".to_string(), true, true, true);
+                    let _ = dispatch_event_object(rt, &d, Some(fid), sub_ev)?;
+                }
+            }
             Ok(JsValue::Undefined)
         }),
     );
@@ -1788,7 +2165,12 @@ pub fn define_element_proto(
             };
             let s = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
             let mut st = ds.borrow_mut();
+            let old_kids = st.doc.children(nid);
+            for k in old_kids {
+                st.notify_pre_remove(k);
+            }
             st.doc.set_text_content(nid, s);
+            st.invalidate_style_owner(nid);
             st.mark_dirty();
             Ok(JsValue::Undefined)
         }),
@@ -1802,24 +2184,39 @@ pub fn ensure_subdocument(dom: &SharedDom, host_id: NodeId) -> Option<NodeId> {
     if let Some(&existing) = dom.borrow().sub_documents.get(&host_id) {
         return Some(existing);
     }
+    let _ = load_subdocument_with_scripts(dom, host_id);
+    dom.borrow().sub_documents.get(&host_id).copied()
+}
+
+pub fn load_subdocument_with_scripts(dom: &SharedDom, host_id: NodeId) -> Vec<String> {
     let (tag, url_attr, base_url, client) = {
         let st = dom.borrow();
-        let el = st.doc.element(host_id)?;
+        let Some(el) = st.doc.element(host_id) else {
+            return Vec::new();
+        };
         let tag = el.tag_name.clone();
         let attr = if tag == "iframe" {
             el.get_attr("src").map(|s| s.to_string())
         } else if tag == "object" {
             el.get_attr("data").map(|s| s.to_string())
         } else {
-            return None;
+            return Vec::new();
         };
         (tag, attr, st.url.clone(), st.client.clone())
     };
-    let mut is_svg = false;
-    let body_text = if let Some(ref raw) = url_attr {
+
+    enum SubdocPayload {
+        Blank,
+        PlainText(String),
+        Html(String),
+        Xml(Vec<u8>),
+        Skip,
+    }
+
+    let payload = if let Some(ref raw) = url_attr {
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed == "about:blank" {
-            Some(String::new())
+            SubdocPayload::Blank
         } else {
             let resolved = peedle_url::Url::parse(&base_url)
                 .ok()
@@ -1830,58 +2227,103 @@ pub fn ensure_subdocument(dom: &SharedDom, host_id: NodeId) -> Option<NodeId> {
                 match client.get(&u) {
                     Ok(resp) if resp.status < 400 => {
                         let ct = resp.content_type().to_ascii_lowercase();
-                        is_svg = ct.contains("svg") || u.to_ascii_lowercase().contains("svg");
-                        if ct.contains("image/png") || ct.contains("image/gif") || ct.contains("image/jpeg") {
-                            None
+                        let path_part = u.split('?').next().unwrap_or(&u).to_ascii_lowercase();
+                        let is_img_bin = (ct.starts_with("image/") && !ct.contains("svg"))
+                            || (ct.contains("octet-stream")
+                                && (path_part.ends_with(".png")
+                                    || path_part.ends_with(".gif")
+                                    || path_part.ends_with(".jpg")
+                                    || path_part.ends_with(".jpeg")
+                                    || path_part.ends_with(".webp")));
+                        let is_plain = ct.starts_with("text/plain")
+                            || (ct.contains("octet-stream") && path_part.ends_with(".txt"));
+                        let is_xml = ct.contains("xml")
+                            || ct.contains("svg")
+                            || path_part.ends_with(".xml")
+                            || path_part.ends_with(".svg")
+                            || path_part.ends_with("/xhtml.1")
+                            || path_part.ends_with("/xhtml.2")
+                            || path_part.ends_with("/xhtml.3");
+                        if is_img_bin {
+                            SubdocPayload::Skip
+                        } else if is_plain {
+                            SubdocPayload::PlainText(resp.text())
+                        } else if is_xml {
+                            SubdocPayload::Xml(resp.body)
                         } else {
-                            Some(resp.text())
+                            SubdocPayload::Html(resp.text())
                         }
                     }
-                    _ => None,
+                    _ => SubdocPayload::Skip,
                 }
             } else {
-                None
+                SubdocPayload::Skip
             }
         }
     } else if tag == "iframe" {
-        Some(String::new())
+        SubdocPayload::Blank
     } else {
-        None
+        SubdocPayload::Skip
     };
 
-    let content = body_text?;
     let mut st = dom.borrow_mut();
-    let sub = st.doc.create_sub_document();
-    if is_svg {
-        for c in st.doc.children(sub) {
-            st.doc.detach(c);
+    match payload {
+        SubdocPayload::Skip => {
+            st.sub_documents.remove(&host_id);
+            Vec::new()
         }
-        st.xml_documents.insert(sub);
-        let nodes = parse_fragment_into(&mut st.doc, "svg", Namespace::Svg, &content);
-        if nodes.len() == 1 {
-            st.doc.append_child(sub, nodes[0]);
-        } else {
-            let root_svg = st.doc.create_element_ns("svg", Namespace::Svg, Vec::new());
-            for n in nodes {
-                st.doc.append_child(root_svg, n);
+        SubdocPayload::Blank => {
+            let sub = st.doc.create_sub_document();
+            st.sub_documents.insert(host_id, sub);
+            Vec::new()
+        }
+        SubdocPayload::PlainText(txt) => {
+            let sub = st.doc.create_sub_document();
+            if let Some(body) = st.doc.body_of(sub) {
+                let pre = st.doc.create_element("pre");
+                let tn = st.doc.create_text(txt);
+                st.doc.append_child(pre, tn);
+                st.doc.append_child(body, pre);
             }
-            st.doc.append_child(sub, root_svg);
+            st.sub_documents.insert(host_id, sub);
+            Vec::new()
         }
-    } else if !content.trim().is_empty() {
-        let parsed = peedle_html::parse_html(&content);
-        if let Some(src_html) = parsed.document_element() {
+        SubdocPayload::Xml(bytes) => {
+            let sub = st.doc.create_sub_document();
             for c in st.doc.children(sub) {
                 st.doc.detach(c);
             }
-            let imported = import_foreign_subtree(&mut st.doc, &parsed, src_html);
-            st.doc.append_child(sub, imported);
+            st.xml_documents.insert(sub);
+            match crate::xml_parser::parse_xml_into(&mut st, &bytes, sub) {
+                Ok(scripts) => {
+                    st.sub_documents.insert(host_id, sub);
+                    scripts
+                }
+                Err(()) => {
+                    st.sub_documents.remove(&host_id);
+                    Vec::new()
+                }
+            }
+        }
+        SubdocPayload::Html(content) => {
+            let sub = st.doc.create_sub_document();
+            if !content.trim().is_empty() {
+                let parsed = peedle_html::parse_html(&content);
+                for c in st.doc.children(sub) {
+                    st.doc.detach(c);
+                }
+                for src_child in parsed.children(parsed.root) {
+                    let imported = import_foreign_subtree(&mut st.doc, &parsed, src_child);
+                    st.doc.append_child(sub, imported);
+                }
+            }
+            st.sub_documents.insert(host_id, sub);
+            Vec::new()
         }
     }
-    st.sub_documents.insert(host_id, sub);
-    Some(sub)
 }
 
-fn import_foreign_subtree(
+pub fn import_foreign_subtree(
     dst: &mut peedle_html::Document,
     src: &peedle_html::Document,
     src_id: NodeId,
@@ -2394,6 +2836,9 @@ fn define_html_table_form_embed_apis(
                                 e.tag_name.as_str(),
                                 "input" | "button" | "select" | "textarea" | "fieldset" | "output" | "object"
                             )
+                            && !(e.tag_name == "input"
+                                && e.get_attr("type")
+                                    .map_or(false, |t| t.eq_ignore_ascii_case("image")))
                         {
                             Some((
                                 id,
@@ -2479,6 +2924,219 @@ fn define_html_table_form_embed_apis(
         }),
     );
     let _ = rt.set_property(html_element_proto, "add", JsValue::Object(select_add));
+
+    let d = dom.clone();
+    let get_form_or_select_len = rt.create_native_function(
+        "get length",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Undefined);
+            };
+            let st = d.borrow();
+            let Some(el) = st.doc.element(nid) else {
+                return Ok(JsValue::Undefined);
+            };
+            if el.is_html() && el.tag_is("form") {
+                let count = st
+                    .doc
+                    .descendants(nid)
+                    .into_iter()
+                    .filter(|&id| {
+                        st.doc.element(id).map_or(false, |e| {
+                            e.is_html()
+                                && matches!(
+                                    e.tag_name.as_str(),
+                                    "input" | "button" | "select" | "textarea" | "fieldset" | "output" | "object"
+                                )
+                                && !(e.tag_name == "input"
+                                    && e.get_attr("type")
+                                        .map_or(false, |t| t.eq_ignore_ascii_case("image")))
+                        })
+                    })
+                    .count();
+                return Ok(JsValue::Number(count as f64));
+            }
+            if el.is_html() && el.tag_is("select") {
+                let count = st
+                    .doc
+                    .descendants(nid)
+                    .into_iter()
+                    .filter(|&id| st.doc.element(id).map_or(false, |e| e.tag_is("option")))
+                    .count();
+                return Ok(JsValue::Number(count as f64));
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "length", Some(get_form_or_select_len), None);
+
+    for (dim_prop, is_width) in [("width", true), ("height", false)] {
+        let dg = dom.clone();
+        let ds = dom.clone();
+        let getter = rt.create_native_function(
+            dim_prop,
+            0,
+            Rc::new(move |rt, this, _| {
+                let Some(nid) = node_id_of(rt, &this) else {
+                    return Ok(JsValue::Undefined);
+                };
+                let mut st = dg.borrow_mut();
+                let Some(tag) = st.doc.element(nid).map(|e| e.tag_name.clone()) else {
+                    return Ok(JsValue::Undefined);
+                };
+                if tag == "img" {
+                    let mut root = nid;
+                    while let Some(p) = st.doc.node(root).parent {
+                        root = p;
+                    }
+                    let (style, vp) = if root == st.doc.root {
+                        st.ensure_layout();
+                        let vp = peedle_css::Viewport {
+                            width: st.viewport_w,
+                            height: st.viewport_h,
+                            dark_mode: st.dark_mode,
+                        };
+                        (st.styles.get(nid).cloned().unwrap_or_default(), vp)
+                    } else {
+                        let sheets = st.collect_stylesheets_for_root(root);
+                        let vp = st.resolve_iframe_viewport(root);
+                        let smap = peedle_css::compute_styles_for_root(&st.doc, root, &sheets, vp);
+                        (smap.get(nid).cloned().unwrap_or_default(), vp)
+                    };
+                    let ctx = CalcContext {
+                        font_size: style.font_size,
+                        root_font_size: 16.0,
+                        viewport_width: vp.width,
+                        viewport_height: vp.height,
+                        percentage_base: if is_width { vp.width } else { vp.height },
+                    };
+                    let css_val = if is_width {
+                        style.width.resolve(&ctx)
+                    } else {
+                        style.height.resolve(&ctx)
+                    };
+                    if let Some(px) = css_val {
+                        return Ok(JsValue::Number(px.round() as f64));
+                    }
+                    let attr_v = st
+                        .doc
+                        .element(nid)
+                        .and_then(|e| e.get_attr(dim_prop))
+                        .and_then(|s| s.trim_end_matches("px").parse::<f64>().ok());
+                    if let Some(av) = attr_v {
+                        return Ok(JsValue::Number(av));
+                    }
+                    if let Some(src) = st.doc.element(nid).and_then(|e| e.get_attr("src")).map(|s| s.to_string()) {
+                        if let Some(&(iw, ih)) = st.image_sizes.get(&src) {
+                            return Ok(JsValue::Number(if is_width { iw as f64 } else { ih as f64 }));
+                        }
+                    }
+                    return Ok(JsValue::Number(0.0));
+                }
+                if tag == "canvas" {
+                    let def = if is_width { 300.0 } else { 150.0 };
+                    let v = st
+                        .doc
+                        .element(nid)
+                        .and_then(|e| e.get_attr(dim_prop))
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(def);
+                    return Ok(JsValue::Number(v));
+                }
+                if matches!(tag.as_str(), "iframe" | "object" | "embed" | "video") {
+                    let s = st
+                        .doc
+                        .element(nid)
+                        .and_then(|e| e.get_attr(dim_prop))
+                        .unwrap_or("")
+                        .to_string();
+                    return Ok(JsValue::String(s));
+                }
+                Ok(JsValue::Undefined)
+            }),
+        );
+        let setter = rt.create_native_function(
+            dim_prop,
+            1,
+            Rc::new(move |rt, this, args| {
+                let Some(nid) = node_id_of(rt, &this) else {
+                    return Ok(JsValue::Undefined);
+                };
+                let s = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+                let mut st = ds.borrow_mut();
+                st.doc.set_attribute(nid, dim_prop, s);
+                st.mark_dirty();
+                Ok(JsValue::Undefined)
+            }),
+        );
+        define_getter_setter(rt, html_element_proto, dim_prop, Some(getter), Some(setter));
+    }
+}
+
+fn find_owner_form(doc: &peedle_html::Document, nid: NodeId) -> Option<NodeId> {
+    let mut cur = doc.node(nid).parent;
+    while let Some(p) = cur {
+        if doc.element(p).map_or(false, |e| e.is_html() && e.tag_is("form")) {
+            return Some(p);
+        }
+        cur = doc.node(p).parent;
+    }
+    None
+}
+
+fn collect_radio_group(doc: &peedle_html::Document, nid: NodeId) -> Vec<NodeId> {
+    let Some(el) = doc.element(nid) else {
+        return Vec::new();
+    };
+    if !el.is_html() || !el.tag_is("input") {
+        return Vec::new();
+    }
+    if !el.get_attr("type").map_or(false, |t| t.eq_ignore_ascii_case("radio")) {
+        return Vec::new();
+    }
+    let Some(name) = el.get_attr("name").filter(|n| !n.is_empty()) else {
+        return vec![nid];
+    };
+    let form_owner = find_owner_form(doc, nid);
+    let search_root = if let Some(fid) = form_owner {
+        fid
+    } else {
+        let mut r = nid;
+        while let Some(p) = doc.node(r).parent {
+            r = p;
+        }
+        r
+    };
+    doc.descendants(search_root)
+        .into_iter()
+        .filter(|&id| {
+            let Some(other) = doc.element(id) else {
+                return false;
+            };
+            if !other.is_html() || !other.tag_is("input") {
+                return false;
+            }
+            if !other.get_attr("type").map_or(false, |t| t.eq_ignore_ascii_case("radio")) {
+                return false;
+            }
+            if other.get_attr("name") != Some(name) {
+                return false;
+            }
+            find_owner_form(doc, id) == form_owner
+        })
+        .collect()
+}
+
+fn uncheck_radio_siblings(doc: &mut peedle_html::Document, nid: NodeId) {
+    let group = collect_radio_group(doc, nid);
+    for other_id in group {
+        if other_id != nid {
+            if let Some(other_el) = doc.element_mut(other_id) {
+                other_el.checked = Some(false);
+            }
+        }
+    }
 }
 
 fn collect_table_rows(doc: &peedle_html::Document, container: NodeId) -> Vec<NodeId> {
@@ -2567,7 +3225,7 @@ fn define_attr_prop(
             let s = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
             let mut st = ds.borrow_mut();
             st.doc.set_attribute(nid, attr_name, s);
-            st.mark_dirty();
+            st.mark_dirty_for(nid);
             Ok(JsValue::Undefined)
         }),
     );

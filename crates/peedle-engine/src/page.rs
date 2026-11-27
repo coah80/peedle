@@ -30,6 +30,7 @@ pub struct Page {
     pub base_url: Option<Url>,
     pub js_env: BrowserJsEnv,
     pub images: ImageCache,
+    pub failed_images: std::collections::HashSet<String>,
     pub viewport_w: f32,
     pub viewport_h: f32,
     pub scroll_x: f32,
@@ -62,6 +63,7 @@ impl Page {
             base_url: None,
             js_env,
             images: ImageCache::new(),
+            failed_images: std::collections::HashSet::new(),
             viewport_w,
             viewport_h,
             scroll_x: 0.0,
@@ -139,6 +141,7 @@ impl Page {
     fn load_url_internal(&mut self, target: &str, push_history: bool) -> Result<(), String> {
         self.network_log.clear();
         self.console_logs.clear();
+        self.failed_images.clear();
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         self.hovered_node = None;
@@ -449,11 +452,15 @@ impl Page {
 
         let mut new_sizes = Vec::new();
         for (raw_src, resolved_opt) in img_srcs.into_iter().take(48) {
+            if self.failed_images.contains(&raw_src) {
+                continue;
+            }
             if let Some(existing) = self.images.get(&raw_src) {
                 new_sizes.push((raw_src, (existing.width, existing.height)));
                 continue;
             }
             let Some(resolved) = resolved_opt else {
+                self.failed_images.insert(raw_src);
                 continue;
             };
             let start = Instant::now();
@@ -470,8 +477,14 @@ impl Page {
                     if let Ok(decoded) = DecodedImage::decode(&resp.body) {
                         new_sizes.push((raw_src.clone(), (decoded.width, decoded.height)));
                         self.images.insert(raw_src, decoded);
+                    } else {
+                        self.failed_images.insert(raw_src);
                     }
+                } else {
+                    self.failed_images.insert(raw_src);
                 }
+            } else {
+                self.failed_images.insert(raw_src);
             }
         }
 

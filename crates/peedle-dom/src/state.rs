@@ -1,8 +1,10 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use peedle_css::{compute_styles, parse_stylesheet, StyleMap, Stylesheet, Viewport};
+use peedle_css::{
+    compute_styles, parse_stylesheet, CalcContext, StyleMap, Stylesheet, Viewport,
+};
 use peedle_html::{Document, NodeId};
 use peedle_js::{JsValue, ObjectId};
 use peedle_layout::{layout_document, LayoutTree};
@@ -73,10 +75,26 @@ pub struct DomPrototypes {
     pub tree_walker_proto: ObjectId,
 }
 
+pub struct LiveNodeIterator {
+    pub root: NodeId,
+    pub what_to_show: u32,
+    pub filter: JsValue,
+    pub reference: NodeId,
+    pub pointer_before: bool,
+    pub detached: bool,
+}
+
+#[derive(Clone)]
+pub struct NodeIteratorHandle(pub Rc<RefCell<LiveNodeIterator>>);
+
+#[derive(Clone)]
+pub struct RangeHandle(pub Rc<RefCell<RangeData>>);
+
 pub struct DomState {
     pub doc: Document,
     pub url: String,
     pub external_stylesheets: HashMap<NodeId, Stylesheet>,
+    pub cssom_stylesheets: HashMap<NodeId, Stylesheet>,
     pub stylesheets: Vec<Stylesheet>,
     pub styles: StyleMap,
     pub layout: LayoutTree,
@@ -110,8 +128,16 @@ pub struct DomState {
     pub focused_node: Option<NodeId>,
     pub pending_navigation: Option<String>,
     pub sub_documents: HashMap<NodeId, NodeId>,
-    pub xml_documents: std::collections::HashSet<NodeId>,
-    pub xml_elements: std::collections::HashSet<NodeId>,
+    pub subdoc_urls: HashMap<NodeId, String>,
+    pub pending_subdoc_loads: Vec<NodeId>,
+    pub xml_documents: HashSet<NodeId>,
+    pub xml_elements: HashSet<NodeId>,
+    pub custom_namespaces: HashMap<NodeId, Option<String>>,
+    pub current_script: Option<NodeId>,
+    pub open_doc_buffers: HashMap<NodeId, String>,
+    pub title_overrides: HashMap<NodeId, String>,
+    pub live_iterators: Vec<Rc<RefCell<LiveNodeIterator>>>,
+    pub live_ranges: Vec<Rc<RefCell<RangeData>>>,
 }
 
 pub type SharedDom = Rc<RefCell<DomState>>;
@@ -122,6 +148,7 @@ impl DomState {
             doc,
             url: url.clone(),
             external_stylesheets: HashMap::new(),
+            cssom_stylesheets: HashMap::new(),
             stylesheets: Vec::new(),
             styles: StyleMap::default(),
             layout: LayoutTree::default(),
@@ -155,8 +182,16 @@ impl DomState {
             focused_node: None,
             pending_navigation: None,
             sub_documents: HashMap::new(),
-            xml_documents: std::collections::HashSet::new(),
-            xml_elements: std::collections::HashSet::new(),
+            subdoc_urls: HashMap::new(),
+            pending_subdoc_loads: Vec::new(),
+            xml_documents: HashSet::new(),
+            xml_elements: HashSet::new(),
+            custom_namespaces: HashMap::new(),
+            current_script: None,
+            open_doc_buffers: HashMap::new(),
+            title_overrides: HashMap::new(),
+            live_iterators: Vec::new(),
+            live_ranges: Vec::new(),
         };
         st.doc.track_mutations = true;
         st
@@ -167,21 +202,72 @@ impl DomState {
         self.dirty_layout = true;
     }
 
-    pub fn collect_inline_stylesheets(&mut self) {
-        self.stylesheets.clear();
-        let nodes = self.doc.descendants(self.doc.root);
-        for nid in nodes {
-            if let Some(ext) = self.external_stylesheets.get(&nid) {
-                self.stylesheets.push(ext.clone());
-                continue;
+    pub fn mark_dirty_for(&mut self, nid: NodeId) {
+        let mut cur = nid;
+        while let Some(p) = self.doc.node(cur).parent {
+            cur = p;
+        }
+        if cur == self.doc.root {
+            self.dirty_style = true;
+            self.dirty_layout = true;
+        }
+    }
+
+    pub fn ensure_styles(&mut self) {
+        if self.dirty_style {
+            self.collect_inline_stylesheets();
+            self.styles = compute_styles(
+                &self.doc,
+                &self.stylesheets,
+                Viewport {
+                    width: self.viewport_w,
+                    height: self.viewport_h,
+                    dark_mode: self.dark_mode,
+                },
+            );
+            self.dirty_style = false;
+            self.dirty_layout = true;
+        }
+    }
+
+    pub fn invalidate_style_owner(&mut self, nid: NodeId) {
+        let mut cur = Some(nid);
+        while let Some(id) = cur {
+            if self.cssom_stylesheets.contains_key(&id) {
+                self.cssom_stylesheets.remove(&id);
             }
-            if let Some(el) = self.doc.element(nid) {
-                if el.is_html() && el.tag_is("style") {
-                    let css = self.doc.text_content(nid);
-                    self.stylesheets.push(parse_stylesheet(&css));
-                }
+            cur = self.doc.node(id).parent;
+        }
+    }
+
+    pub fn stylesheet_for_node(&self, nid: NodeId) -> Option<Stylesheet> {
+        if let Some(sheet) = self.cssom_stylesheets.get(&nid) {
+            return Some(sheet.clone());
+        }
+        if let Some(ext) = self.external_stylesheets.get(&nid) {
+            return Some(ext.clone());
+        }
+        if let Some(el) = self.doc.element(nid) {
+            if el.is_html() && el.tag_is("style") {
+                let css = self.doc.text_content(nid);
+                return Some(parse_stylesheet(&css));
             }
         }
+        None
+    }
+
+    pub fn collect_stylesheets_for_root(&self, root: NodeId) -> Vec<Stylesheet> {
+        let mut out = Vec::new();
+        for nid in self.doc.descendants(root) {
+            if let Some(sheet) = self.stylesheet_for_node(nid) {
+                out.push(sheet);
+            }
+        }
+        out
+    }
+
+    pub fn collect_inline_stylesheets(&mut self) {
+        self.stylesheets = self.collect_stylesheets_for_root(self.doc.root);
     }
 
     pub fn ensure_layout(&mut self) {
@@ -208,6 +294,162 @@ impl DomState {
                 self.viewport_h,
             );
             self.dirty_layout = false;
+        }
+    }
+
+    pub fn resolve_iframe_viewport(&mut self, sub_root: NodeId) -> Viewport {
+        let host_id = self
+            .sub_documents
+            .iter()
+            .find_map(|(&host, &sub)| if sub == sub_root { Some(host) } else { None });
+        let Some(hid) = host_id else {
+            return Viewport {
+                width: self.viewport_w,
+                height: self.viewport_h,
+                dark_mode: self.dark_mode,
+            };
+        };
+        self.ensure_styles();
+        let ctx_w = CalcContext {
+            font_size: 16.0,
+            root_font_size: 16.0,
+            viewport_width: self.viewport_w,
+            viewport_height: self.viewport_h,
+            percentage_base: self.viewport_w,
+        };
+        let ctx_h = CalcContext {
+            font_size: 16.0,
+            root_font_size: 16.0,
+            viewport_width: self.viewport_w,
+            viewport_height: self.viewport_h,
+            percentage_base: self.viewport_h,
+        };
+        let (w, h) = if let Some(style) = self.styles.get(hid) {
+            let sw = style.width.resolve(&ctx_w);
+            let sh = style.height.resolve(&ctx_h);
+            let attr_w = self
+                .doc
+                .element(hid)
+                .and_then(|e| e.get_attr("width"))
+                .and_then(|s| s.trim_end_matches("px").parse::<f32>().ok());
+            let attr_h = self
+                .doc
+                .element(hid)
+                .and_then(|e| e.get_attr("height"))
+                .and_then(|s| s.trim_end_matches("px").parse::<f32>().ok());
+            let w = sw.or(attr_w).unwrap_or(300.0);
+            let h = sh.or(attr_h).unwrap_or(150.0);
+            (w.max(0.0), h.max(0.0))
+        } else {
+            (300.0, 150.0)
+        };
+        Viewport {
+            width: w,
+            height: h,
+            dark_mode: self.dark_mode,
+        }
+    }
+
+    pub fn queue_subdoc_loads_in(&mut self, root: NodeId) {
+        let connected = root == self.doc.root || self.doc.is_ancestor(self.doc.root, root);
+        if !connected {
+            return;
+        }
+        let mut candidates = vec![root];
+        candidates.extend(self.doc.descendants(root));
+        for cid in candidates {
+            let is_embed = self.doc.element(cid).map_or(false, |e| {
+                e.is_html() && (e.tag_is("iframe") || e.tag_is("object"))
+            });
+            if is_embed {
+                self.sub_documents.remove(&cid);
+                if !self.pending_subdoc_loads.contains(&cid) {
+                    self.pending_subdoc_loads.push(cid);
+                }
+            }
+        }
+    }
+
+    pub fn notify_pre_remove(&mut self, node: NodeId) {
+        let Some(parent) = self.doc.node(node).parent else {
+            return;
+        };
+        let index = self
+            .doc
+            .children(parent)
+            .iter()
+            .position(|&c| c == node)
+            .unwrap_or(0);
+
+        for it_rc in &self.live_iterators {
+            let mut it = it_rc.borrow_mut();
+            if it.detached || node == it.root {
+                continue;
+            }
+            if node != it.reference && !self.doc.is_ancestor(node, it.reference) {
+                continue;
+            }
+            if it.pointer_before {
+                let mut cur = node;
+                let mut next = None;
+                loop {
+                    if cur == it.root {
+                        break;
+                    }
+                    if let Some(ns) = self.doc.node(cur).next_sibling {
+                        next = Some(ns);
+                        break;
+                    }
+                    match self.doc.node(cur).parent {
+                        Some(p) => cur = p,
+                        None => break,
+                    }
+                }
+                if let Some(n) = next {
+                    it.reference = n;
+                    continue;
+                }
+                it.pointer_before = false;
+            }
+            if let Some(mut prev) = self.doc.node(node).prev_sibling {
+                while let Some(lc) = self.doc.node(prev).last_child {
+                    prev = lc;
+                }
+                it.reference = prev;
+            } else {
+                it.reference = parent;
+            }
+        }
+
+        for r_rc in &self.live_ranges {
+            let mut r = r_rc.borrow_mut();
+            if r.start_container == node || self.doc.is_ancestor(node, r.start_container) {
+                r.start_container = parent;
+                r.start_offset = index;
+            } else if r.start_container == parent && r.start_offset > index {
+                r.start_offset -= 1;
+            }
+            if r.end_container == node || self.doc.is_ancestor(node, r.end_container) {
+                r.end_container = parent;
+                r.end_offset = index;
+            } else if r.end_container == parent && r.end_offset > index {
+                r.end_offset -= 1;
+            }
+        }
+    }
+
+    pub fn notify_post_insert(&mut self, parent: NodeId, index: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        for r_rc in &self.live_ranges {
+            let mut r = r_rc.borrow_mut();
+            if r.start_container == parent && r.start_offset > index {
+                r.start_offset += count;
+            }
+            if r.end_container == parent && r.end_offset > index {
+                r.end_offset += count;
+            }
         }
     }
 

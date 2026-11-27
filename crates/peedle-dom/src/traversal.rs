@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use peedle_html::{Document, Namespace, NodeData, NodeId};
@@ -5,7 +6,7 @@ use peedle_js::{JsError, JsRuntime, JsValue, ObjectId};
 
 use crate::events::define_getter_setter;
 use crate::nodes::{node_id_of, wrap_node, wrap_node_opt};
-use crate::state::{RangeData, SharedDom};
+use crate::state::{DomState, NodeIteratorHandle, RangeData, RangeHandle, SharedDom};
 
 pub const DOM_EXCEPTION_CONSTANTS: &[(&str, u16)] = &[
     ("INDEX_SIZE_ERR", 1),
@@ -76,6 +77,13 @@ pub fn is_valid_xml_name(name: &str) -> bool {
     true
 }
 
+pub fn is_valid_ncname(name: &str) -> bool {
+    if name.is_empty() || name.contains(':') {
+        return false;
+    }
+    is_valid_xml_name(name)
+}
+
 pub fn define_dom_exception(rt: &mut JsRuntime, dom_exception_proto: ObjectId) {
     let err_proto = rt.intrinsics.error_proto;
     let _ = rt.set_prototype_of(dom_exception_proto, Some(err_proto));
@@ -111,15 +119,6 @@ pub fn define_dom_exception(rt: &mut JsRuntime, dom_exception_proto: ObjectId) {
     }
     let global = rt.global_object();
     let _ = rt.set_property(global, "DOMException", JsValue::Object(ctor));
-}
-
-pub struct NodeIteratorData {
-    pub root: NodeId,
-    pub what_to_show: u32,
-    pub filter: JsValue,
-    pub reference: NodeId,
-    pub pointer_before: bool,
-    pub detached: bool,
 }
 
 pub struct TreeWalkerData {
@@ -168,7 +167,7 @@ fn apply_node_filter(
     } else {
         return Ok(1);
     };
-    let n = rt.to_number(&res).unwrap_or(1.0) as u8;
+    let n = rt.to_number(&res)? as u8;
     Ok(n)
 }
 
@@ -177,6 +176,35 @@ fn collect_subtree_preorder(doc: &Document, root: NodeId, out: &mut Vec<NodeId>)
     for c in doc.children(root) {
         collect_subtree_preorder(doc, c, out);
     }
+}
+
+fn next_in_preorder(doc: &Document, root: NodeId, node: NodeId) -> Option<NodeId> {
+    if let Some(fc) = doc.node(node).first_child {
+        return Some(fc);
+    }
+    let mut cur = node;
+    loop {
+        if cur == root {
+            return None;
+        }
+        if let Some(ns) = doc.node(cur).next_sibling {
+            return Some(ns);
+        }
+        cur = doc.node(cur).parent?;
+    }
+}
+
+fn prev_in_preorder(doc: &Document, root: NodeId, node: NodeId) -> Option<NodeId> {
+    if node == root {
+        return None;
+    }
+    if let Some(mut ps) = doc.node(node).prev_sibling {
+        while let Some(lc) = doc.node(ps).last_child {
+            ps = lc;
+        }
+        return Some(ps);
+    }
+    doc.node(node).parent
 }
 
 pub fn define_traversal_protos(
@@ -194,8 +222,8 @@ pub fn define_traversal_protos(
                 return Ok(JsValue::Null);
             };
             let rid = rt
-                .get_host_data::<NodeIteratorData>(oid)
-                .map(|x| x.root)
+                .get_host_data::<NodeIteratorHandle>(oid)
+                .map(|x| x.0.borrow().root)
                 .or_else(|| rt.get_host_data::<TreeWalkerData>(oid).map(|x| x.root));
             Ok(wrap_node_opt(rt, &d, rid))
         }),
@@ -211,8 +239,8 @@ pub fn define_traversal_protos(
                 return Ok(JsValue::Number(0.0));
             };
             let wts = rt
-                .get_host_data::<NodeIteratorData>(oid)
-                .map(|x| x.what_to_show)
+                .get_host_data::<NodeIteratorHandle>(oid)
+                .map(|x| x.0.borrow().what_to_show)
                 .or_else(|| rt.get_host_data::<TreeWalkerData>(oid).map(|x| x.what_to_show))
                 .unwrap_or(0);
             Ok(JsValue::Number(wts as f64))
@@ -229,8 +257,8 @@ pub fn define_traversal_protos(
                 return Ok(JsValue::Null);
             };
             let f = rt
-                .get_host_data::<NodeIteratorData>(oid)
-                .map(|x| x.filter.clone())
+                .get_host_data::<NodeIteratorHandle>(oid)
+                .map(|x| x.0.borrow().filter.clone())
                 .or_else(|| rt.get_host_data::<TreeWalkerData>(oid).map(|x| x.filter.clone()))
                 .unwrap_or(JsValue::Null);
             Ok(f)
@@ -246,8 +274,8 @@ pub fn define_traversal_protos(
         Rc::new(move |rt, this, _| {
             let rid = this
                 .as_object()
-                .and_then(|o| rt.get_host_data::<NodeIteratorData>(o))
-                .map(|x| x.reference);
+                .and_then(|o| rt.get_host_data::<NodeIteratorHandle>(o))
+                .map(|x| x.0.borrow().reference);
             Ok(wrap_node_opt(rt, &d, rid))
         }),
     );
@@ -259,8 +287,8 @@ pub fn define_traversal_protos(
         Rc::new(|rt, this, _| {
             let b = this
                 .as_object()
-                .and_then(|o| rt.get_host_data::<NodeIteratorData>(o))
-                .map_or(true, |x| x.pointer_before);
+                .and_then(|o| rt.get_host_data::<NodeIteratorHandle>(o))
+                .map_or(true, |x| x.0.borrow().pointer_before);
             Ok(JsValue::Boolean(b))
         }),
     );
@@ -274,33 +302,39 @@ pub fn define_traversal_protos(
             let Some(oid) = this.as_object() else {
                 return Ok(JsValue::Null);
             };
-            let (root, wts, filter, mut cur, mut before) = {
-                let Some(it) = rt.get_host_data::<NodeIteratorData>(oid) else {
-                    return Ok(JsValue::Null);
-                };
-                if it.detached {
-                    return Ok(JsValue::Null);
-                }
-                (it.root, it.what_to_show, it.filter.clone(), it.reference, it.pointer_before)
+            let Some(handle) = rt.get_host_data::<NodeIteratorHandle>(oid).map(|h| h.0.clone()) else {
+                return Ok(JsValue::Null);
             };
-            let mut list = Vec::new();
-            collect_subtree_preorder(&d.borrow().doc, root, &mut list);
-            let mut idx = list.iter().position(|&id| id == cur).unwrap_or(0);
             loop {
-                if before {
-                    before = false;
-                } else if idx + 1 < list.len() {
-                    idx += 1;
-                    cur = list[idx];
+                let (root, wts, filter, cur, before) = {
+                    let it = handle.borrow();
+                    if it.detached {
+                        return Ok(JsValue::Null);
+                    }
+                    (it.root, it.what_to_show, it.filter.clone(), it.reference, it.pointer_before)
+                };
+                let (next_cur, next_before) = if before {
+                    (cur, false)
                 } else {
-                    return Ok(JsValue::Null);
+                    let Some(n) = next_in_preorder(&d.borrow().doc, root, cur) else {
+                        return Ok(JsValue::Null);
+                    };
+                    (n, false)
+                };
+                {
+                    let mut it = handle.borrow_mut();
+                    it.reference = next_cur;
+                    it.pointer_before = next_before;
                 }
-                if let Some(it) = rt.get_host_data_mut::<NodeIteratorData>(oid) {
-                    it.reference = cur;
-                    it.pointer_before = before;
-                }
-                if apply_node_filter(rt, &d, wts, &filter, cur)? == 1 {
-                    return Ok(JsValue::Object(wrap_node(rt, &d, cur)));
+                match apply_node_filter(rt, &d, wts, &filter, next_cur) {
+                    Ok(1) => return Ok(JsValue::Object(wrap_node(rt, &d, next_cur))),
+                    Ok(_) => continue,
+                    Err(e) => {
+                        let mut it = handle.borrow_mut();
+                        it.reference = cur;
+                        it.pointer_before = before;
+                        return Err(e);
+                    }
                 }
             }
         }),
@@ -315,33 +349,39 @@ pub fn define_traversal_protos(
             let Some(oid) = this.as_object() else {
                 return Ok(JsValue::Null);
             };
-            let (root, wts, filter, mut cur, mut before) = {
-                let Some(it) = rt.get_host_data::<NodeIteratorData>(oid) else {
-                    return Ok(JsValue::Null);
-                };
-                if it.detached {
-                    return Ok(JsValue::Null);
-                }
-                (it.root, it.what_to_show, it.filter.clone(), it.reference, it.pointer_before)
+            let Some(handle) = rt.get_host_data::<NodeIteratorHandle>(oid).map(|h| h.0.clone()) else {
+                return Ok(JsValue::Null);
             };
-            let mut list = Vec::new();
-            collect_subtree_preorder(&d.borrow().doc, root, &mut list);
-            let mut idx = list.iter().position(|&id| id == cur).unwrap_or(0);
             loop {
-                if !before {
-                    before = true;
-                } else if idx > 0 {
-                    idx -= 1;
-                    cur = list[idx];
+                let (root, wts, filter, cur, before) = {
+                    let it = handle.borrow();
+                    if it.detached {
+                        return Ok(JsValue::Null);
+                    }
+                    (it.root, it.what_to_show, it.filter.clone(), it.reference, it.pointer_before)
+                };
+                let (prev_cur, prev_before) = if !before {
+                    (cur, true)
                 } else {
-                    return Ok(JsValue::Null);
+                    let Some(p) = prev_in_preorder(&d.borrow().doc, root, cur) else {
+                        return Ok(JsValue::Null);
+                    };
+                    (p, true)
+                };
+                {
+                    let mut it = handle.borrow_mut();
+                    it.reference = prev_cur;
+                    it.pointer_before = prev_before;
                 }
-                if let Some(it) = rt.get_host_data_mut::<NodeIteratorData>(oid) {
-                    it.reference = cur;
-                    it.pointer_before = before;
-                }
-                if apply_node_filter(rt, &d, wts, &filter, cur)? == 1 {
-                    return Ok(JsValue::Object(wrap_node(rt, &d, cur)));
+                match apply_node_filter(rt, &d, wts, &filter, prev_cur) {
+                    Ok(1) => return Ok(JsValue::Object(wrap_node(rt, &d, prev_cur))),
+                    Ok(_) => continue,
+                    Err(e) => {
+                        let mut it = handle.borrow_mut();
+                        it.reference = cur;
+                        it.pointer_before = before;
+                        return Err(e);
+                    }
                 }
             }
         }),
@@ -353,8 +393,8 @@ pub fn define_traversal_protos(
         0,
         Rc::new(|rt, this, _| {
             if let Some(oid) = this.as_object() {
-                if let Some(it) = rt.get_host_data_mut::<NodeIteratorData>(oid) {
-                    it.detached = true;
+                if let Some(it) = rt.get_host_data::<NodeIteratorHandle>(oid) {
+                    it.0.borrow_mut().detached = true;
                 }
             }
             Ok(JsValue::Undefined)
@@ -763,6 +803,22 @@ fn common_ancestor(doc: &Document, a: NodeId, b: NodeId) -> NodeId {
     a
 }
 
+fn is_inclusive_ancestor(doc: &Document, anc: NodeId, node: NodeId) -> bool {
+    anc == node || doc.is_ancestor(anc, node)
+}
+
+fn is_character_data(doc: &Document, nid: NodeId) -> bool {
+    matches!(
+        doc.node(nid).data,
+        NodeData::Text(_) | NodeData::Comment(_) | NodeData::ProcessingInstruction { .. }
+    )
+}
+
+fn get_range_handle(rt: &JsRuntime, val: &JsValue) -> Option<Rc<RefCell<RangeData>>> {
+    let oid = val.as_object()?;
+    rt.get_host_data::<RangeHandle>(oid).map(|h| h.0.clone())
+}
+
 pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: ObjectId) {
     for (name, val) in [
         ("START_TO_START", 0.0),
@@ -778,7 +834,7 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "get startContainer",
         0,
         Rc::new(move |rt, this, _| {
-            let id = this.as_object().and_then(|o| rt.get_host_data::<RangeData>(o)).map(|r| r.start_container);
+            let id = get_range_handle(rt, &this).map(|r| r.borrow().start_container);
             Ok(wrap_node_opt(rt, &d, id))
         }),
     );
@@ -788,7 +844,7 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "get startOffset",
         0,
         Rc::new(|rt, this, _| {
-            let o = this.as_object().and_then(|o| rt.get_host_data::<RangeData>(o)).map_or(0, |r| r.start_offset);
+            let o = get_range_handle(rt, &this).map_or(0, |r| r.borrow().start_offset);
             Ok(JsValue::Number(o as f64))
         }),
     );
@@ -799,7 +855,7 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "get endContainer",
         0,
         Rc::new(move |rt, this, _| {
-            let id = this.as_object().and_then(|o| rt.get_host_data::<RangeData>(o)).map(|r| r.end_container);
+            let id = get_range_handle(rt, &this).map(|r| r.borrow().end_container);
             Ok(wrap_node_opt(rt, &d, id))
         }),
     );
@@ -809,7 +865,7 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "get endOffset",
         0,
         Rc::new(|rt, this, _| {
-            let o = this.as_object().and_then(|o| rt.get_host_data::<RangeData>(o)).map_or(0, |r| r.end_offset);
+            let o = get_range_handle(rt, &this).map_or(0, |r| r.borrow().end_offset);
             Ok(JsValue::Number(o as f64))
         }),
     );
@@ -819,10 +875,10 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "get collapsed",
         0,
         Rc::new(|rt, this, _| {
-            let c = this
-                .as_object()
-                .and_then(|o| rt.get_host_data::<RangeData>(o))
-                .map_or(true, |r| r.start_container == r.end_container && r.start_offset == r.end_offset);
+            let c = get_range_handle(rt, &this).map_or(true, |r| {
+                let r = r.borrow();
+                r.start_container == r.end_container && r.start_offset == r.end_offset
+            });
             Ok(JsValue::Boolean(c))
         }),
     );
@@ -833,10 +889,10 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "get commonAncestorContainer",
         0,
         Rc::new(move |rt, this, _| {
-            let pair = this
-                .as_object()
-                .and_then(|o| rt.get_host_data::<RangeData>(o))
-                .map(|r| (r.start_container, r.end_container));
+            let pair = get_range_handle(rt, &this).map(|r| {
+                let r = r.borrow();
+                (r.start_container, r.end_container)
+            });
             let Some((a, b)) = pair else {
                 return Ok(JsValue::Null);
             };
@@ -851,7 +907,7 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "setStart",
         2,
         Rc::new(move |rt, this, args| {
-            let Some(oid) = this.as_object() else {
+            let Some(rh) = get_range_handle(rt, &this) else {
                 return Ok(JsValue::Undefined);
             };
             let Some(nid) = args.first().and_then(|v| node_id_of(rt, v)) else {
@@ -863,19 +919,13 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
                 return Err(throw_dom_exception(rt, &d, 1, "IndexSizeError", "offset out of range"));
             }
             let off = off_n as usize;
-            let collapse = {
-                let Some(r) = rt.get_host_data::<RangeData>(oid) else {
-                    return Ok(JsValue::Undefined);
-                };
-                compare_bp(&d.borrow().doc, nid, off, r.end_container, r.end_offset) > 0
-            };
-            if let Some(r) = rt.get_host_data_mut::<RangeData>(oid) {
-                r.start_container = nid;
-                r.start_offset = off;
-                if collapse {
-                    r.end_container = nid;
-                    r.end_offset = off;
-                }
+            let mut r = rh.borrow_mut();
+            let collapse = compare_bp(&d.borrow().doc, nid, off, r.end_container, r.end_offset) > 0;
+            r.start_container = nid;
+            r.start_offset = off;
+            if collapse {
+                r.end_container = nid;
+                r.end_offset = off;
             }
             Ok(JsValue::Undefined)
         }),
@@ -887,7 +937,7 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "setEnd",
         2,
         Rc::new(move |rt, this, args| {
-            let Some(oid) = this.as_object() else {
+            let Some(rh) = get_range_handle(rt, &this) else {
                 return Ok(JsValue::Undefined);
             };
             let Some(nid) = args.first().and_then(|v| node_id_of(rt, v)) else {
@@ -899,19 +949,13 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
                 return Err(throw_dom_exception(rt, &d, 1, "IndexSizeError", "offset out of range"));
             }
             let off = off_n as usize;
-            let collapse = {
-                let Some(r) = rt.get_host_data::<RangeData>(oid) else {
-                    return Ok(JsValue::Undefined);
-                };
-                compare_bp(&d.borrow().doc, r.start_container, r.start_offset, nid, off) > 0
-            };
-            if let Some(r) = rt.get_host_data_mut::<RangeData>(oid) {
-                r.end_container = nid;
-                r.end_offset = off;
-                if collapse {
-                    r.start_container = nid;
-                    r.start_offset = off;
-                }
+            let mut r = rh.borrow_mut();
+            let collapse = compare_bp(&d.borrow().doc, r.start_container, r.start_offset, nid, off) > 0;
+            r.end_container = nid;
+            r.end_offset = off;
+            if collapse {
+                r.start_container = nid;
+                r.start_offset = off;
             }
             Ok(JsValue::Undefined)
         }),
@@ -929,7 +973,7 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
             name,
             1,
             Rc::new(move |rt, this, args| {
-                let Some(oid) = this.as_object() else {
+                let Some(rh) = get_range_handle(rt, &this) else {
                     return Ok(JsValue::Undefined);
                 };
                 let Some(nid) = args.first().and_then(|v| node_id_of(rt, v)) else {
@@ -939,31 +983,25 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
                     return Err(throw_dom_exception(rt, &d, 24, "InvalidNodeTypeError", "node has no parent"));
                 };
                 let off = idx + delta;
-                let collapse = {
-                    let Some(r) = rt.get_host_data::<RangeData>(oid) else {
-                        return Ok(JsValue::Undefined);
-                    };
-                    if is_start {
-                        compare_bp(&d.borrow().doc, parent, off, r.end_container, r.end_offset) > 0
-                    } else {
-                        compare_bp(&d.borrow().doc, r.start_container, r.start_offset, parent, off) > 0
-                    }
+                let mut r = rh.borrow_mut();
+                let collapse = if is_start {
+                    compare_bp(&d.borrow().doc, parent, off, r.end_container, r.end_offset) > 0
+                } else {
+                    compare_bp(&d.borrow().doc, r.start_container, r.start_offset, parent, off) > 0
                 };
-                if let Some(r) = rt.get_host_data_mut::<RangeData>(oid) {
-                    if is_start {
-                        r.start_container = parent;
-                        r.start_offset = off;
-                        if collapse {
-                            r.end_container = parent;
-                            r.end_offset = off;
-                        }
-                    } else {
+                if is_start {
+                    r.start_container = parent;
+                    r.start_offset = off;
+                    if collapse {
                         r.end_container = parent;
                         r.end_offset = off;
-                        if collapse {
-                            r.start_container = parent;
-                            r.start_offset = off;
-                        }
+                    }
+                } else {
+                    r.end_container = parent;
+                    r.end_offset = off;
+                    if collapse {
+                        r.start_container = parent;
+                        r.start_offset = off;
                     }
                 }
                 Ok(JsValue::Undefined)
@@ -977,15 +1015,14 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         1,
         Rc::new(|rt, this, args| {
             let to_start = args.first().map_or(false, |v| rt.to_boolean(v));
-            if let Some(oid) = this.as_object() {
-                if let Some(r) = rt.get_host_data_mut::<RangeData>(oid) {
-                    if to_start {
-                        r.end_container = r.start_container;
-                        r.end_offset = r.start_offset;
-                    } else {
-                        r.start_container = r.end_container;
-                        r.start_offset = r.end_offset;
-                    }
+            if let Some(rh) = get_range_handle(rt, &this) {
+                let mut r = rh.borrow_mut();
+                if to_start {
+                    r.end_container = r.start_container;
+                    r.end_offset = r.start_offset;
+                } else {
+                    r.start_container = r.end_container;
+                    r.start_offset = r.end_offset;
                 }
             }
             Ok(JsValue::Undefined)
@@ -998,7 +1035,7 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "selectNode",
         1,
         Rc::new(move |rt, this, args| {
-            let Some(oid) = this.as_object() else {
+            let Some(rh) = get_range_handle(rt, &this) else {
                 return Ok(JsValue::Undefined);
             };
             let Some(nid) = args.first().and_then(|v| node_id_of(rt, v)) else {
@@ -1007,12 +1044,11 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
             let Some((parent, idx)) = child_index(&d.borrow().doc, nid) else {
                 return Err(throw_dom_exception(rt, &d, 24, "InvalidNodeTypeError", "node has no parent"));
             };
-            if let Some(r) = rt.get_host_data_mut::<RangeData>(oid) {
-                r.start_container = parent;
-                r.start_offset = idx;
-                r.end_container = parent;
-                r.end_offset = idx + 1;
-            }
+            let mut r = rh.borrow_mut();
+            r.start_container = parent;
+            r.start_offset = idx;
+            r.end_container = parent;
+            r.end_offset = idx + 1;
             Ok(JsValue::Undefined)
         }),
     );
@@ -1023,19 +1059,18 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "selectNodeContents",
         1,
         Rc::new(move |rt, this, args| {
-            let Some(oid) = this.as_object() else {
+            let Some(rh) = get_range_handle(rt, &this) else {
                 return Ok(JsValue::Undefined);
             };
             let Some(nid) = args.first().and_then(|v| node_id_of(rt, v)) else {
                 return Err(JsError::type_err("selectNodeContents requires Node"));
             };
             let len = node_length(&d.borrow().doc, nid);
-            if let Some(r) = rt.get_host_data_mut::<RangeData>(oid) {
-                r.start_container = nid;
-                r.start_offset = 0;
-                r.end_container = nid;
-                r.end_offset = len;
-            }
+            let mut r = rh.borrow_mut();
+            r.start_container = nid;
+            r.start_offset = 0;
+            r.end_container = nid;
+            r.end_offset = len;
             Ok(JsValue::Undefined)
         }),
     );
@@ -1046,19 +1081,15 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "compareBoundaryPoints",
         2,
         Rc::new(move |rt, this, args| {
-            let Some(oid) = this.as_object() else {
-                return Ok(JsValue::Number(0.0));
-            };
             let how = args.first().and_then(|v| rt.to_number(v).ok()).unwrap_or(0.0) as u32;
-            let Some(other_oid) = args.get(1).and_then(|v| v.as_object()) else {
+            let Some(other_val) = args.get(1) else {
                 return Err(JsError::type_err("compareBoundaryPoints requires Range"));
             };
-            let (Some(a), Some(b)) = (
-                rt.get_host_data::<RangeData>(oid).cloned(),
-                rt.get_host_data::<RangeData>(other_oid).cloned(),
-            ) else {
+            let (Some(ah), Some(bh)) = (get_range_handle(rt, &this), get_range_handle(rt, other_val)) else {
                 return Ok(JsValue::Number(0.0));
             };
+            let a = *ah.borrow();
+            let b = *bh.borrow();
             let (an, ao, bn, bo) = match how {
                 0 => (a.start_container, a.start_offset, b.start_container, b.start_offset),
                 1 => (a.end_container, a.end_offset, b.start_container, b.start_offset),
@@ -1077,16 +1108,22 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "deleteContents",
         0,
         Rc::new(move |rt, this, _| {
-            let Some(oid) = this.as_object() else {
+            let Some(rh) = get_range_handle(rt, &this) else {
                 return Ok(JsValue::Undefined);
             };
-            let Some(r) = rt.get_host_data::<RangeData>(oid).cloned() else {
-                return Ok(JsValue::Undefined);
+            let r = *rh.borrow();
+            let (_, new_pos) = {
+                let mut st = d.borrow_mut();
+                let res = range_extract_or_delete(&mut st, r, false, false);
+                st.mark_dirty();
+                res
             };
-            range_delete_or_extract(&d, &r, false);
-            if let Some(rm) = rt.get_host_data_mut::<RangeData>(oid) {
-                rm.end_container = rm.start_container;
-                rm.end_offset = rm.start_offset;
+            if let Some((nc, no)) = new_pos {
+                let mut rm = rh.borrow_mut();
+                rm.start_container = nc;
+                rm.start_offset = no;
+                rm.end_container = nc;
+                rm.end_offset = no;
             }
             Ok(JsValue::Undefined)
         }),
@@ -1098,16 +1135,22 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "extractContents",
         0,
         Rc::new(move |rt, this, _| {
-            let Some(oid) = this.as_object() else {
+            let Some(rh) = get_range_handle(rt, &this) else {
                 return Ok(JsValue::Null);
             };
-            let Some(r) = rt.get_host_data::<RangeData>(oid).cloned() else {
-                return Ok(JsValue::Null);
+            let r = *rh.borrow();
+            let (frag, new_pos) = {
+                let mut st = d.borrow_mut();
+                let res = range_extract_or_delete(&mut st, r, true, false);
+                st.mark_dirty();
+                res
             };
-            let frag = range_delete_or_extract(&d, &r, true);
-            if let Some(rm) = rt.get_host_data_mut::<RangeData>(oid) {
-                rm.end_container = rm.start_container;
-                rm.end_offset = rm.start_offset;
+            if let Some((nc, no)) = new_pos {
+                let mut rm = rh.borrow_mut();
+                rm.start_container = nc;
+                rm.start_offset = no;
+                rm.end_container = nc;
+                rm.end_offset = no;
             }
             Ok(JsValue::Object(wrap_node(rt, &d, frag)))
         }),
@@ -1119,13 +1162,14 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "cloneContents",
         0,
         Rc::new(move |rt, this, _| {
-            let Some(oid) = this.as_object() else {
+            let Some(rh) = get_range_handle(rt, &this) else {
                 return Ok(JsValue::Null);
             };
-            let Some(r) = rt.get_host_data::<RangeData>(oid).cloned() else {
-                return Ok(JsValue::Null);
+            let r = *rh.borrow();
+            let (frag, _) = {
+                let mut st = d.borrow_mut();
+                range_extract_or_delete(&mut st, r, true, true)
             };
-            let frag = range_clone_contents(&d, &r);
             Ok(JsValue::Object(wrap_node(rt, &d, frag)))
         }),
     );
@@ -1136,15 +1180,13 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "insertNode",
         1,
         Rc::new(move |rt, this, args| {
-            let Some(oid) = this.as_object() else {
+            let Some(rh) = get_range_handle(rt, &this) else {
                 return Ok(JsValue::Undefined);
             };
             let Some(new_node) = args.first().and_then(|v| node_id_of(rt, v)) else {
                 return Err(JsError::type_err("insertNode requires Node"));
             };
-            let Some(r) = rt.get_host_data::<RangeData>(oid).cloned() else {
-                return Ok(JsValue::Undefined);
-            };
+            let r = *rh.borrow();
             let mut st = d.borrow_mut();
             let is_text = matches!(st.doc.node(r.start_container).data, NodeData::Text(_));
             if is_text {
@@ -1157,12 +1199,26 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
                     };
                     let after_text = st.doc.create_text(tail);
                     let next_sib = st.doc.node(r.start_container).next_sibling;
-                    st.doc.insert_before(parent, new_node, next_sib);
                     st.doc.insert_before(parent, after_text, next_sib);
+                    if st.doc.node(new_node).parent.is_some() {
+                        st.notify_pre_remove(new_node);
+                    }
+                    st.doc.insert_before(parent, new_node, Some(after_text));
+                    let new_idx = child_index(&st.doc, new_node).map(|(_, i)| i).unwrap_or(0);
+                    let mut rm = rh.borrow_mut();
+                    rm.start_container = parent;
+                    rm.start_offset = new_idx;
+                    if r.end_container == r.start_container {
+                        rm.end_container = after_text;
+                        rm.end_offset = r.end_offset.saturating_sub(r.start_offset);
+                    }
                 }
             } else {
                 let kids = st.doc.children(r.start_container);
                 let ref_node = kids.get(r.start_offset).copied();
+                if st.doc.node(new_node).parent.is_some() {
+                    st.notify_pre_remove(new_node);
+                }
                 st.doc.insert_before(r.start_container, new_node, ref_node);
             }
             st.mark_dirty();
@@ -1176,26 +1232,99 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "surroundContents",
         1,
         Rc::new(move |rt, this, args| {
-            let Some(oid) = this.as_object() else {
+            let Some(rh) = get_range_handle(rt, &this) else {
                 return Ok(JsValue::Undefined);
             };
             let Some(wrapper) = args.first().and_then(|v| node_id_of(rt, v)) else {
                 return Err(JsError::type_err("surroundContents requires Node"));
             };
-            let Some(r) = rt.get_host_data::<RangeData>(oid).cloned() else {
-                return Ok(JsValue::Undefined);
+            let r = *rh.borrow();
+            let err_kind = {
+                let st = d.borrow();
+                let mut partially_non_text = false;
+                let anc = common_ancestor(&st.doc, r.start_container, r.end_container);
+                if r.start_container != r.end_container {
+                    let mut cur = r.start_container;
+                    while cur != anc {
+                        if !matches!(st.doc.node(cur).data, NodeData::Text(_)) {
+                            partially_non_text = true;
+                            break;
+                        }
+                        match st.doc.node(cur).parent {
+                            Some(p) => cur = p,
+                            None => break,
+                        }
+                    }
+                    if !partially_non_text {
+                        let mut cur = r.end_container;
+                        while cur != anc {
+                            if !matches!(st.doc.node(cur).data, NodeData::Text(_)) {
+                                partially_non_text = true;
+                                break;
+                            }
+                            match st.doc.node(cur).parent {
+                                Some(p) => cur = p,
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                if partially_non_text {
+                    Some((11u16, "InvalidStateError", "Partially selects a non-Text node"))
+                } else if matches!(
+                    st.doc.node(wrapper).data,
+                    NodeData::Document { .. }
+                        | NodeData::Doctype { .. }
+                        | NodeData::DocumentFragment
+                ) {
+                    Some((24u16, "InvalidNodeTypeError", "Invalid wrapper node type"))
+                } else {
+                    let parent_is_doc = matches!(st.doc.node(r.start_container).data, NodeData::Document { .. });
+                    let wrapper_is_el = matches!(st.doc.node(wrapper).data, NodeData::Element(_));
+                    let has_other_doc_el = parent_is_doc
+                        && wrapper_is_el
+                        && st.doc.element_children(r.start_container).into_iter().any(|c| {
+                            let idx = child_index(&st.doc, c).map(|(_, i)| i).unwrap_or(0);
+                            let in_range = r.start_container == r.end_container
+                                && idx >= r.start_offset
+                                && idx < r.end_offset;
+                            !in_range
+                        });
+                    if has_other_doc_el || wrapper == r.start_container || st.doc.is_ancestor(wrapper, r.start_container) {
+                        Some((3u16, "HierarchyRequestError", "Invalid node hierarchy"))
+                    } else {
+                        None
+                    }
+                }
             };
-            let frag = range_delete_or_extract(&d, &r, true);
-            {
+            if let Some((code, name, msg)) = err_kind {
+                return Err(throw_dom_exception(rt, &d, code, name, msg));
+            }
+            let (frag, new_pos) = {
                 let mut st = d.borrow_mut();
+                let res = range_extract_or_delete(&mut st, r, true, false);
                 for c in st.doc.children(wrapper) {
+                    st.notify_pre_remove(c);
                     st.doc.detach(c);
                 }
-                let kids = st.doc.children(r.start_container);
-                let ref_node = kids.get(r.start_offset).copied();
-                st.doc.insert_before(r.start_container, wrapper, ref_node);
-                st.doc.append_child(wrapper, frag);
+                let (ins_container, ins_offset) = res.1.unwrap_or((r.start_container, r.start_offset));
+                let kids = st.doc.children(ins_container);
+                let ref_node = kids.get(ins_offset).copied();
+                if st.doc.node(wrapper).parent.is_some() {
+                    st.notify_pre_remove(wrapper);
+                }
+                st.doc.insert_before(ins_container, wrapper, ref_node);
+                st.doc.append_child(wrapper, res.0);
                 st.mark_dirty();
+                res
+            };
+            let _ = (frag, new_pos);
+            if let Some((parent, idx)) = child_index(&d.borrow().doc, wrapper) {
+                let mut rm = rh.borrow_mut();
+                rm.start_container = parent;
+                rm.start_offset = idx;
+                rm.end_container = parent;
+                rm.end_offset = idx + 1;
             }
             Ok(JsValue::Undefined)
         }),
@@ -1207,15 +1336,15 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "cloneRange",
         0,
         Rc::new(move |rt, this, _| {
-            let Some(oid) = this.as_object() else {
+            let Some(rh) = get_range_handle(rt, &this) else {
                 return Ok(JsValue::Null);
             };
-            let Some(r) = rt.get_host_data::<RangeData>(oid).cloned() else {
-                return Ok(JsValue::Null);
-            };
+            let r = *rh.borrow();
             let proto = d.borrow().protos.unwrap().range_proto;
             let obj = rt.create_object_with_proto(Some(proto));
-            rt.set_host_data(obj, r);
+            let rc = Rc::new(RefCell::new(r));
+            d.borrow_mut().live_ranges.push(rc.clone());
+            rt.set_host_data(obj, RangeHandle(rc));
             Ok(JsValue::Object(obj))
         }),
     );
@@ -1229,12 +1358,10 @@ pub fn define_full_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: 
         "toString",
         0,
         Rc::new(move |rt, this, _| {
-            let Some(oid) = this.as_object() else {
+            let Some(rh) = get_range_handle(rt, &this) else {
                 return Ok(JsValue::String(String::new()));
             };
-            let Some(r) = rt.get_host_data::<RangeData>(oid).cloned() else {
-                return Ok(JsValue::String(String::new()));
-            };
+            let r = *rh.borrow();
             let txt = range_to_string(&d.borrow().doc, &r);
             Ok(JsValue::String(txt))
         }),
@@ -1272,12 +1399,23 @@ fn range_to_string(doc: &Document, r: &RangeData) -> String {
             let b = utf16_offset_to_byte(s, r.end_offset);
             return s[a..b].to_string();
         }
+        if matches!(
+            doc.node(r.start_container).data,
+            NodeData::Comment(_) | NodeData::ProcessingInstruction { .. }
+        ) {
+            return String::new();
+        }
         let kids = doc.children(r.start_container);
         let end = r.end_offset.min(kids.len());
         let start = r.start_offset.min(end);
         let mut out = String::new();
         for &cid in &kids[start..end] {
-            out.push_str(&doc.text_content(cid));
+            if !matches!(
+                doc.node(cid).data,
+                NodeData::Comment(_) | NodeData::ProcessingInstruction { .. }
+            ) {
+                out.push_str(&doc.text_content(cid));
+            }
         }
         return out;
     }
@@ -1314,94 +1452,194 @@ fn utf16_offset_to_byte(s: &str, u16_off: usize) -> usize {
     s.len()
 }
 
-fn range_delete_or_extract(dom: &SharedDom, r: &RangeData, keep_frag: bool) -> NodeId {
-    let mut st = dom.borrow_mut();
-    let frag = st.doc.create_fragment();
-    if r.start_container == r.end_container && r.start_offset == r.end_offset {
-        return frag;
-    }
-    if r.start_container == r.end_container {
-        let is_text = matches!(st.doc.node(r.start_container).data, NodeData::Text(_));
-        if is_text {
-            let extracted = if let NodeData::Text(ref mut s) = st.doc.node_mut(r.start_container).data {
-                let a = utf16_offset_to_byte(s, r.start_offset);
-                let b = utf16_offset_to_byte(s, r.end_offset);
-                let mid = s[a..b].to_string();
+fn clone_char_data_slice(st: &mut DomState, nid: NodeId, start_u16: usize, end_u16: usize, remove_from_orig: bool) -> Option<NodeId> {
+    let kind_and_sub = match &mut st.doc.node_mut(nid).data {
+        NodeData::Text(ref mut s) => {
+            let a = utf16_offset_to_byte(s, start_u16);
+            let b = utf16_offset_to_byte(s, end_u16);
+            let sub = s[a..b].to_string();
+            if remove_from_orig {
                 s.replace_range(a..b, "");
-                mid
-            } else {
-                String::new()
-            };
-            if keep_frag && !extracted.is_empty() {
-                let t = st.doc.create_text(extracted);
-                st.doc.append_child(frag, t);
             }
-            st.mark_dirty();
-            return frag;
+            Some((0u8, String::new(), sub))
         }
-        let kids = st.doc.children(r.start_container);
-        let end = r.end_offset.min(kids.len());
-        let start = r.start_offset.min(end);
-        for &cid in &kids[start..end] {
-            if keep_frag {
-                st.doc.append_child(frag, cid);
-            } else {
-                st.doc.detach(cid);
+        NodeData::Comment(ref mut s) => {
+            let a = utf16_offset_to_byte(s, start_u16);
+            let b = utf16_offset_to_byte(s, end_u16);
+            let sub = s[a..b].to_string();
+            if remove_from_orig {
+                s.replace_range(a..b, "");
             }
+            Some((1u8, String::new(), sub))
         }
-        st.mark_dirty();
-        return frag;
-    }
-    let anc = common_ancestor(&st.doc, r.start_container, r.end_container);
-    let kids = st.doc.children(anc);
-    for cid in kids {
-        let after_start = compare_bp(&st.doc, cid, 0, r.start_container, r.start_offset) >= 0;
-        let before_end = compare_bp(&st.doc, cid, node_length(&st.doc, cid), r.end_container, r.end_offset) <= 0;
-        if after_start && before_end {
-            if keep_frag {
-                st.doc.append_child(frag, cid);
-            } else {
-                st.doc.detach(cid);
+        NodeData::ProcessingInstruction { target, data } => {
+            let a = utf16_offset_to_byte(data, start_u16);
+            let b = utf16_offset_to_byte(data, end_u16);
+            let sub = data[a..b].to_string();
+            let t = target.clone();
+            if remove_from_orig {
+                data.replace_range(a..b, "");
             }
+            Some((2u8, t, sub))
         }
-    }
-    st.mark_dirty();
-    frag
+        _ => None,
+    }?;
+    Some(match kind_and_sub.0 {
+        0 => st.doc.create_text(kind_and_sub.2),
+        1 => st.doc.create_comment(kind_and_sub.2),
+        _ => st.doc.create_processing_instruction(kind_and_sub.1, kind_and_sub.2),
+    })
 }
 
-fn range_clone_contents(dom: &SharedDom, r: &RangeData) -> NodeId {
-    let mut st = dom.borrow_mut();
+fn range_extract_or_delete(
+    st: &mut DomState,
+    r: RangeData,
+    keep_frag: bool,
+    clone_only: bool,
+) -> (NodeId, Option<(NodeId, usize)>) {
     let frag = st.doc.create_fragment();
     if r.start_container == r.end_container && r.start_offset == r.end_offset {
-        return frag;
+        return (frag, Some((r.start_container, r.start_offset)));
     }
+
     if r.start_container == r.end_container {
-        if let NodeData::Text(ref s) = st.doc.node(r.start_container).data {
-            let a = utf16_offset_to_byte(s, r.start_offset);
-            let b = utf16_offset_to_byte(s, r.end_offset);
-            let sub = s[a..b].to_string();
-            let t = st.doc.create_text(sub);
-            st.doc.append_child(frag, t);
-            return frag;
+        if is_character_data(&st.doc, r.start_container) {
+            if let Some(cloned) = clone_char_data_slice(
+                st,
+                r.start_container,
+                r.start_offset,
+                r.end_offset,
+                !clone_only,
+            ) {
+                if keep_frag {
+                    st.doc.append_child(frag, cloned);
+                }
+            }
+            return (frag, Some((r.start_container, r.start_offset)));
         }
         let kids = st.doc.children(r.start_container);
         let end = r.end_offset.min(kids.len());
         let start = r.start_offset.min(end);
         for &cid in &kids[start..end] {
-            let c = st.doc.clone_node(cid, true);
-            st.doc.append_child(frag, c);
+            if clone_only {
+                let c = st.doc.clone_node(cid, true);
+                st.doc.append_child(frag, c);
+            } else if keep_frag {
+                st.notify_pre_remove(cid);
+                st.doc.append_child(frag, cid);
+            } else {
+                st.notify_pre_remove(cid);
+                st.doc.detach(cid);
+            }
         }
-        return frag;
+        return (frag, Some((r.start_container, r.start_offset)));
     }
+
     let anc = common_ancestor(&st.doc, r.start_container, r.end_container);
+    let new_pos = if is_inclusive_ancestor(&st.doc, r.start_container, r.end_container) {
+        (r.start_container, r.start_offset)
+    } else {
+        let mut ref_node = r.start_container;
+        while let Some(p) = st.doc.node(ref_node).parent {
+            if is_inclusive_ancestor(&st.doc, p, r.end_container) {
+                break;
+            }
+            ref_node = p;
+        }
+        if let Some((parent, idx)) = child_index(&st.doc, ref_node) {
+            (parent, idx + 1)
+        } else {
+            (r.start_container, r.start_offset)
+        }
+    };
+
     let kids = st.doc.children(anc);
-    for cid in kids {
-        let after_start = compare_bp(&st.doc, cid, 0, r.start_container, r.start_offset) >= 0;
-        let before_end = compare_bp(&st.doc, cid, node_length(&st.doc, cid), r.end_container, r.end_offset) <= 0;
+    let first_partial = if is_inclusive_ancestor(&st.doc, r.start_container, r.end_container) {
+        None
+    } else {
+        kids.iter()
+            .copied()
+            .find(|&c| is_inclusive_ancestor(&st.doc, c, r.start_container))
+    };
+    let last_partial = if is_inclusive_ancestor(&st.doc, r.end_container, r.start_container) {
+        None
+    } else {
+        kids.iter()
+            .copied()
+            .find(|&c| is_inclusive_ancestor(&st.doc, c, r.end_container))
+    };
+
+    let mut contained = Vec::new();
+    for (idx, &cid) in kids.iter().enumerate() {
+        if Some(cid) == first_partial || Some(cid) == last_partial {
+            continue;
+        }
+        let after_start = compare_bp(&st.doc, anc, idx, r.start_container, r.start_offset) >= 0;
+        let before_end = compare_bp(&st.doc, anc, idx + 1, r.end_container, r.end_offset) <= 0;
         if after_start && before_end {
-            let c = st.doc.clone_node(cid, true);
-            st.doc.append_child(frag, c);
+            contained.push(cid);
         }
     }
-    frag
+
+    if let Some(fp) = first_partial {
+        if is_character_data(&st.doc, fp) {
+            let len = node_length(&st.doc, fp);
+            if let Some(cloned) = clone_char_data_slice(st, fp, r.start_offset, len, !clone_only) {
+                if keep_frag {
+                    st.doc.append_child(frag, cloned);
+                }
+            }
+        } else {
+            let sub_range = RangeData {
+                start_container: r.start_container,
+                start_offset: r.start_offset,
+                end_container: fp,
+                end_offset: node_length(&st.doc, fp),
+            };
+            let (sub_frag, _) = range_extract_or_delete(st, sub_range, keep_frag, clone_only);
+            if keep_frag {
+                let shallow = st.doc.clone_node(fp, false);
+                st.doc.append_child(shallow, sub_frag);
+                st.doc.append_child(frag, shallow);
+            }
+        }
+    }
+
+    for cid in contained {
+        if clone_only {
+            let c = st.doc.clone_node(cid, true);
+            st.doc.append_child(frag, c);
+        } else if keep_frag {
+            st.notify_pre_remove(cid);
+            st.doc.append_child(frag, cid);
+        } else {
+            st.notify_pre_remove(cid);
+            st.doc.detach(cid);
+        }
+    }
+
+    if let Some(lp) = last_partial {
+        if is_character_data(&st.doc, lp) {
+            if let Some(cloned) = clone_char_data_slice(st, lp, 0, r.end_offset, !clone_only) {
+                if keep_frag {
+                    st.doc.append_child(frag, cloned);
+                }
+            }
+        } else {
+            let sub_range = RangeData {
+                start_container: lp,
+                start_offset: 0,
+                end_container: r.end_container,
+                end_offset: r.end_offset,
+            };
+            let (sub_frag, _) = range_extract_or_delete(st, sub_range, keep_frag, clone_only);
+            if keep_frag {
+                let shallow = st.doc.clone_node(lp, false);
+                st.doc.append_child(shallow, sub_frag);
+                st.doc.append_child(frag, shallow);
+            }
+        }
+    }
+
+    (frag, Some(new_pos))
 }
