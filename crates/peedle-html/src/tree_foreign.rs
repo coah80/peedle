@@ -121,20 +121,23 @@ pub fn adjust_mathml_attributes(attrs: &mut [Attribute]) {
 
 pub fn adjust_foreign_attributes(attrs: &mut [Attribute]) {
     for attr in attrs.iter_mut() {
-        if let Some((prefix, local)) = attr.name.split_once(':') {
-            let ns = match prefix {
-                "xlink" => Some("http://www.w3.org/1999/xlink"),
-                "xml" => Some("http://www.w3.org/XML/1998/namespace"),
-                "xmlns" => Some("http://www.w3.org/2000/xmlns/"),
-                _ => None,
-            };
-            if let Some(uri) = ns {
-                attr.prefix = Some(prefix.to_string());
-                attr.namespace = Some(uri.to_string());
-                attr.name = format!("{}:{}", prefix, local);
+        let info = match attr.name.as_str() {
+            "xlink:actuate" | "xlink:arcrole" | "xlink:href" | "xlink:role" | "xlink:show"
+            | "xlink:title" | "xlink:type" => {
+                Some(("xlink", "http://www.w3.org/1999/xlink"))
             }
-        } else if attr.name == "xmlns" {
-            attr.namespace = Some("http://www.w3.org/2000/xmlns/".to_string());
+            "xml:lang" | "xml:space" => {
+                Some(("xml", "http://www.w3.org/XML/1998/namespace"))
+            }
+            "xmlns:xlink" => Some(("xmlns", "http://www.w3.org/2000/xmlns/")),
+            "xmlns" => Some(("", "http://www.w3.org/2000/xmlns/")),
+            _ => None,
+        };
+        if let Some((prefix, uri)) = info {
+            if !prefix.is_empty() {
+                attr.prefix = Some(prefix.to_string());
+            }
+            attr.namespace = Some(uri.to_string());
         }
     }
 }

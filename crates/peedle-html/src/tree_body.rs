@@ -337,15 +337,23 @@ fn step_after_head(
 fn step_text(st: &mut TreeState, token: &Token) -> StepAction {
     match token {
         Token::Character(c) => {
+            if st.ignore_leading_lf {
+                st.ignore_leading_lf = false;
+                if *c == '\n' {
+                    return StepAction::Done;
+                }
+            }
             st.insert_char(*c);
             StepAction::Done
         }
         Token::Eof => {
+            st.ignore_leading_lf = false;
             st.open_elements.pop();
             st.mode = st.original_mode;
             StepAction::Reprocess(st.mode)
         }
         Token::EndTag(_) => {
+            st.ignore_leading_lf = false;
             st.open_elements.pop();
             st.mode = st.original_mode;
             StepAction::Done
@@ -556,18 +564,26 @@ fn step_in_body_start(
             StepAction::Done
         }
         "a" => {
-            let existing_a = st.active_formatting.iter().rev().find_map(|item| match item {
-                FormattingItem::Marker => None,
-                FormattingItem::Element { tag, .. } if tag == "a" => Some(true),
-                _ => None,
-            });
-            if existing_a.is_some() {
+            let mut existing_a = None;
+            for item in st.active_formatting.iter().rev() {
+                match item {
+                    FormattingItem::Marker => break,
+                    FormattingItem::Element { node, tag, .. } if tag == "a" => {
+                        existing_a = Some(*node);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(a_node) = existing_a {
                 st.run_adoption_agency("a");
-                st.active_formatting.retain(|item| match item {
-                    FormattingItem::Element { tag, .. } => tag != "a",
-                    _ => true,
-                });
-                if let Some(pos) = st.open_elements.iter().rposition(|&id| st.node_is_html(id, "a")) {
+                if let Some(pos) = st.active_formatting.iter().position(|item| match item {
+                    FormattingItem::Element { node, .. } => *node == a_node,
+                    FormattingItem::Marker => false,
+                }) {
+                    st.active_formatting.remove(pos);
+                }
+                if let Some(pos) = st.open_elements.iter().rposition(|&id| id == a_node) {
                     st.open_elements.remove(pos);
                 }
             }
@@ -923,7 +939,7 @@ fn step_in_select(
                 StepAction::Done
             }
             "script" | "template" => StepAction::ProcessAsInHead,
-            _ => StepAction::Done,
+            _ => StepAction::ProcessAsInBody,
         },
         Token::EndTag(t) => match t.name.as_str() {
             "optgroup" => {
@@ -952,7 +968,7 @@ fn step_in_select(
                 StepAction::Done
             }
             "template" => StepAction::ProcessAsInHead,
-            _ => StepAction::Done,
+            _ => StepAction::ProcessAsInBody,
         },
         Token::Eof => StepAction::ProcessAsInBody,
     }

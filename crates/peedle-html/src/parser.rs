@@ -203,15 +203,24 @@ fn dispatch_token(st: &mut TreeState, token: &Token, tok_state: &mut TokenizerSt
             }
             StepAction::ProcessAsInBody => {
                 let res = step_in_body(st, token, tok_state);
-                st.foster_parenting = false;
                 match res {
-                    StepAction::Done => return,
-                    StepAction::Reprocess(next) => active_mode = next,
-                    StepAction::ProcessAsInHead => {
-                        let _ = step_in_head(st, token, tok_state);
+                    StepAction::Done => {
+                        st.foster_parenting = false;
                         return;
                     }
-                    StepAction::ProcessAsInBody => return,
+                    StepAction::Reprocess(next) => {
+                        st.foster_parenting = false;
+                        active_mode = next;
+                    }
+                    StepAction::ProcessAsInHead => {
+                        let _ = step_in_head(st, token, tok_state);
+                        st.foster_parenting = false;
+                        return;
+                    }
+                    StepAction::ProcessAsInBody => {
+                        st.foster_parenting = false;
+                        return;
+                    }
                 }
             }
         }
@@ -261,6 +270,18 @@ fn process_foreign_token(
             true
         }
         Token::EndTag(t) => {
+            if matches!(t.name.as_str(), "br" | "p") {
+                while let Some(cur) = st.current_node() {
+                    if st.node_ns(cur) == Namespace::Html
+                        || is_mathml_text_integration_point(&st.doc, cur)
+                        || is_html_integration_point(&st.doc, cur)
+                    {
+                        break;
+                    }
+                    st.open_elements.pop();
+                }
+                return false;
+            }
             let mut idx = st.open_elements.len();
             while idx > 0 {
                 idx -= 1;

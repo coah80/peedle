@@ -477,15 +477,16 @@ impl TreeState {
             let mut node_idx = fb_idx;
             let mut last_node = furthest_block;
 
-            for inner in 1..=3 {
+            let mut inner = 0usize;
+            loop {
+                inner += 1;
                 node_idx -= 1;
                 let cur_node = self.open_elements[node_idx];
                 if cur_node == fmt_node {
                     break;
                 }
-                let af_pos = self.formatting_index(cur_node);
                 if inner > 3 {
-                    if let Some(p) = af_pos {
+                    if let Some(p) = self.formatting_index(cur_node) {
                         self.active_formatting.remove(p);
                         if p < bookmark {
                             bookmark -= 1;
@@ -808,7 +809,18 @@ pub fn classify_doctype_quirks(dt: &DoctypeToken) -> QuirksMode {
     if pub_id.is_empty() && sys_id.is_none() {
         return QuirksMode::NoQuirks;
     }
+    if let Some(s) = sys_id {
+        if s.eq_ignore_ascii_case("http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd") {
+            return QuirksMode::Quirks;
+        }
+    }
     let lower_pub = pub_id.to_ascii_lowercase();
+    if lower_pub == "html"
+        || lower_pub == "-//w3o//dtd w3 html strict 3.0//en//"
+        || lower_pub == "-/w3c/dtd html 4.0 transitional/en"
+    {
+        return QuirksMode::Quirks;
+    }
     if lower_pub.starts_with("-//w3c//dtd html 4.01 transitional//")
         || lower_pub.starts_with("-//w3c//dtd html 4.01 frameset//")
     {

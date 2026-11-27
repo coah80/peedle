@@ -117,3 +117,87 @@ fn wpt_urltestdata_conformance() {
     }
     assert_eq!(passed, total, "WPT URL pass rate regressed: {}/{}", passed, total);
 }
+
+#[test]
+fn wpt_url_setters_conformance() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/wpt/setters_tests.json");
+    if !fixture_path.exists() {
+        return;
+    }
+    let raw = std::fs::read_to_string(&fixture_path).unwrap();
+    let root: Value = serde_json::from_str(&raw).unwrap();
+    let obj = root.as_object().unwrap();
+
+    let mut total = 0usize;
+    let mut passed = 0usize;
+
+    for (prop, cases_val) in obj {
+        if prop == "comment" {
+            continue;
+        }
+        let Some(cases) = cases_val.as_array() else {
+            continue;
+        };
+        for tc in cases {
+            let Some(href) = tc.get("href").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(new_val) = tc.get("new_value").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(expected) = tc.get("expected").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let Ok(mut url) = Url::parse(href) else {
+                continue;
+            };
+            total += 1;
+            match prop.as_str() {
+                "protocol" => url.set_protocol(new_val),
+                "username" => url.set_username(new_val),
+                "password" => url.set_password(new_val),
+                "host" => url.set_host(new_val),
+                "hostname" => url.set_hostname(new_val),
+                "port" => url.set_port(new_val),
+                "pathname" => url.set_pathname(new_val),
+                "search" => url.set_search(new_val),
+                "hash" => url.set_hash(new_val),
+                "href" => {
+                    let _ = url.set_href(new_val);
+                }
+                _ => continue,
+            }
+            let mut ok = true;
+            for (ek, ev) in expected {
+                let Some(exp_str) = ev.as_str() else {
+                    continue;
+                };
+                let got_str = match ek.as_str() {
+                    "href" => url.href(),
+                    "protocol" => url.protocol(),
+                    "username" => url.username.clone(),
+                    "password" => url.password.clone(),
+                    "host" => url.host_str(),
+                    "hostname" => url.hostname(),
+                    "port" => url.port_str(),
+                    "pathname" => url.pathname(),
+                    "search" => url.search(),
+                    "hash" => url.hash(),
+                    _ => continue,
+                };
+                if got_str != exp_str {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                passed += 1;
+            }
+        }
+    }
+
+    let pct = (passed as f64 / total.max(1) as f64) * 100.0;
+    eprintln!("WPT url setters: {}/{} ({:.1}%)", passed, total, pct);
+    assert!(pct >= 80.0, "WPT URL setters pass rate too low: {:.1}%", pct);
+}
