@@ -195,6 +195,75 @@ fn init_iterators_and_generators(rt: &mut JsRuntime) {
         PropEntry::data(JsValue::String("Generator".into()), false, false, true),
     );
 
+    let async_iter_proto = rt.intrinsics.async_iterator_proto;
+    let sym_async_iter = rt.symbols.async_iterator;
+    set_symbol_method(
+        rt,
+        async_iter_proto,
+        sym_async_iter,
+        "[Symbol.asyncIterator]",
+        0,
+        Rc::new(|_, this, _| Ok(this)),
+    );
+    let sym_async_dispose = rt.symbols.async_dispose;
+    set_symbol_method(
+        rt,
+        async_iter_proto,
+        sym_async_dispose,
+        "[Symbol.asyncDispose]",
+        0,
+        Rc::new(|rt, this, _| {
+            let out_p = rt.create_promise();
+            let step: Result<Option<JsValue>, JsError> = (|| {
+                let oid = rt.to_object(&this)?;
+                let ret_fn = rt.get_property(oid, "return")?;
+                if ret_fn.is_nullish() {
+                    return Ok(None);
+                }
+                if !rt.is_callable(&ret_fn) {
+                    return Err(JsError::type_err("return property is not callable"));
+                }
+                let r = rt.call_function(ret_fn, this, &[])?;
+                Ok(Some(r))
+            })();
+            match step {
+                Ok(None) => {
+                    rt.resolve_promise(out_p, JsValue::Undefined);
+                }
+                Ok(Some(res)) => {
+                    let inner_p = rt.promise_resolve_value(res);
+                    let on_ok = rt.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, _| {
+                            rt.resolve_promise(out_p, JsValue::Undefined);
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    let on_err = rt.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, a| {
+                            let err = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            rt.reject_promise(out_p, err);
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    rt.promise_then(
+                        inner_p,
+                        Some(JsValue::Object(on_ok)),
+                        Some(JsValue::Object(on_err)),
+                    );
+                }
+                Err(e) => {
+                    let ev = rt.error_to_js_value(e);
+                    rt.reject_promise(out_p, ev);
+                }
+            }
+            Ok(JsValue::Object(out_p))
+        }),
+    );
+
     let async_gen_proto = rt.intrinsics.async_generator_proto;
     rt.heap.get_obj_mut(async_gen_proto).set_own_prop(
         PropertyKey::from("constructor"),
@@ -209,25 +278,23 @@ fn init_iterators_and_generators(rt: &mut JsRuntime) {
         PropertyKey::Symbol(to_str_tag),
         PropEntry::data(JsValue::String("AsyncGenerator".into()), false, false, true),
     );
-    let sym_async_iter = rt.symbols.async_iterator;
-    set_symbol_method(
-        rt,
-        async_gen_proto,
-        sym_async_iter,
-        "[Symbol.asyncIterator]",
-        0,
-        Rc::new(|_, this, _| Ok(this)),
-    );
     set_method(
         rt,
         async_gen_proto,
         "next",
         1,
         Rc::new(|rt, this, args| {
-            let JsValue::Object(oid) = this else {
-                return Err(JsError::type_err("AsyncGenerator.next called on non-object"));
-            };
             let arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let is_valid = matches!(this, JsValue::Object(oid) if matches!(rt.heap.get_obj(oid).kind, ObjectKind::Generator(ref g) if g.is_async));
+            if !is_valid {
+                let p = rt.create_promise();
+                let ev = rt.error_to_js_value(JsError::type_err(
+                    "AsyncGenerator.prototype.next requires that 'this' be an AsyncGenerator",
+                ));
+                rt.reject_promise(p, ev);
+                return Ok(JsValue::Object(p));
+            }
+            let JsValue::Object(oid) = this else { unreachable!() };
             rt.resume_generator(oid, 0, arg)
         }),
     );
@@ -237,10 +304,17 @@ fn init_iterators_and_generators(rt: &mut JsRuntime) {
         "throw",
         1,
         Rc::new(|rt, this, args| {
-            let JsValue::Object(oid) = this else {
-                return Err(JsError::type_err("AsyncGenerator.throw called on non-object"));
-            };
             let arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let is_valid = matches!(this, JsValue::Object(oid) if matches!(rt.heap.get_obj(oid).kind, ObjectKind::Generator(ref g) if g.is_async));
+            if !is_valid {
+                let p = rt.create_promise();
+                let ev = rt.error_to_js_value(JsError::type_err(
+                    "AsyncGenerator.prototype.throw requires that 'this' be an AsyncGenerator",
+                ));
+                rt.reject_promise(p, ev);
+                return Ok(JsValue::Object(p));
+            }
+            let JsValue::Object(oid) = this else { unreachable!() };
             rt.resume_generator(oid, 1, arg)
         }),
     );
@@ -250,10 +324,17 @@ fn init_iterators_and_generators(rt: &mut JsRuntime) {
         "return",
         1,
         Rc::new(|rt, this, args| {
-            let JsValue::Object(oid) = this else {
-                return Err(JsError::type_err("AsyncGenerator.return called on non-object"));
-            };
             let arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let is_valid = matches!(this, JsValue::Object(oid) if matches!(rt.heap.get_obj(oid).kind, ObjectKind::Generator(ref g) if g.is_async));
+            if !is_valid {
+                let p = rt.create_promise();
+                let ev = rt.error_to_js_value(JsError::type_err(
+                    "AsyncGenerator.prototype.return requires that 'this' be an AsyncGenerator",
+                ));
+                rt.reject_promise(p, ev);
+                return Ok(JsValue::Object(p));
+            }
+            let JsValue::Object(oid) = this else { unreachable!() };
             rt.resume_generator(oid, 2, arg)
         }),
     );

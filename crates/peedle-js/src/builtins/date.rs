@@ -368,6 +368,7 @@ pub fn init(rt: &mut JsRuntime) {
         "setTime",
         1,
         Rc::new(|rt, this, args| {
+            let _ = this_time(rt, &this)?;
             let t = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
             set_this_time(rt, &this, t)
         }),

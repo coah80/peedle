@@ -653,6 +653,8 @@ pub fn object_to_string(rt: &mut JsRuntime, val: &JsValue) -> Result<String, JsE
         ObjectKind::Set(_) => "Set",
         ObjectKind::WeakMap(_) => "WeakMap",
         ObjectKind::WeakSet(_) => "WeakSet",
+        ObjectKind::WeakRef(_) => "WeakRef",
+        ObjectKind::FinalizationRegistry(_) => "FinalizationRegistry",
         ObjectKind::Promise(_) => "Promise",
         ObjectKind::ArrayBuffer(_) => "ArrayBuffer",
         ObjectKind::DataView(_) => "DataView",

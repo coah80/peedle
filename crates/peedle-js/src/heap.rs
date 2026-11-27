@@ -248,6 +248,8 @@ pub struct PromiseReaction {
     pub on_fulfilled: Option<JsValue>,
     pub on_rejected: Option<JsValue>,
     pub target: Option<ObjectId>,
+    pub resolve: Option<JsValue>,
+    pub reject: Option<JsValue>,
 }
 
 #[derive(Clone)]
@@ -298,7 +300,7 @@ pub struct GeneratorData {
     pub state: GeneratorState,
     pub frame: Option<Box<CallFrame>>,
     pub is_async: bool,
-    pub delegating: Option<JsValue>,
+    pub delegating: Option<(JsValue, JsValue)>,
     pub result_promise: Option<ObjectId>,
 }
 
@@ -343,6 +345,19 @@ pub enum IterMode {
     Entries,
 }
 
+#[derive(Clone)]
+pub struct FinalizationCell {
+    pub target: JsValue,
+    pub held_value: JsValue,
+    pub unregister_token: Option<JsValue>,
+}
+
+#[derive(Clone)]
+pub struct FinalizationRegistryData {
+    pub cleanup_callback: JsValue,
+    pub cells: Vec<FinalizationCell>,
+}
+
 pub enum ObjectKind {
     Ordinary,
     Function(JsFunction),
@@ -360,6 +375,8 @@ pub enum ObjectKind {
     Set(SetData),
     WeakMap(Vec<(ObjectId, JsValue)>),
     WeakSet(Vec<ObjectId>),
+    WeakRef(Option<JsValue>),
+    FinalizationRegistry(FinalizationRegistryData),
     Promise(PromiseData),
     Proxy(ProxyData),
     ArrayBuffer(ArrayBufferData),
@@ -623,8 +640,11 @@ pub struct EnvRecord {
     pub var_names: HashSet<String>,
     pub object_env: Option<ObjectId>,
     pub this_binding: Option<JsValue>,
+    pub this_uninitialized: bool,
     pub new_target: Option<JsValue>,
     pub super_proto: Option<ObjectId>,
+    pub home_object: Option<ObjectId>,
+    pub ctor_callee: Option<ObjectId>,
     pub is_function_scope: bool,
     pub is_param_env: bool,
     pub strict: bool,
@@ -643,8 +663,11 @@ impl EnvRecord {
             var_names: HashSet::new(),
             object_env: None,
             this_binding: None,
+            this_uninitialized: false,
             new_target: None,
             super_proto: None,
+            home_object: None,
+            ctor_callee: None,
             is_function_scope,
             is_param_env: false,
             strict,
@@ -730,6 +753,7 @@ impl Heap {
     }
 
     pub fn alloc_env(&mut self, env: EnvRecord) -> EnvId {
+        self.alloc_since_gc += 1;
         if let Some(idx) = self.free_envs.pop() {
             self.envs[idx] = Some(env);
             EnvId(idx)
@@ -875,6 +899,12 @@ impl Heap {
                             if let Some(t) = r.target {
                                 obj_stack.push(t);
                             }
+                            if let Some(ref f) = r.resolve {
+                                trace_value(f, &mut obj_stack);
+                            }
+                            if let Some(ref f) = r.reject {
+                                trace_value(f, &mut obj_stack);
+                            }
                         }
                     }
                     ObjectKind::Proxy(p) => {
@@ -891,8 +921,9 @@ impl Heap {
                         if let Some(ref fr) = g.frame {
                             trace_frame(fr, &mut obj_stack, &mut env_stack);
                         }
-                        if let Some(ref d) = g.delegating {
+                        if let Some((ref d, ref nm)) = g.delegating {
                             trace_value(d, &mut obj_stack);
+                            trace_value(nm, &mut obj_stack);
                         }
                         if let Some(rp) = g.result_promise {
                             obj_stack.push(rp);
@@ -925,6 +956,12 @@ impl Heap {
                         }
                         BuiltinIteratorKind::String { .. } => {}
                     },
+                    ObjectKind::FinalizationRegistry(fr) => {
+                        trace_value(&fr.cleanup_callback, &mut obj_stack);
+                        for cell in &fr.cells {
+                            trace_value(&cell.held_value, &mut obj_stack);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -953,6 +990,12 @@ impl Heap {
                 }
                 if let Some(sp) = env.super_proto {
                     obj_stack.push(sp);
+                }
+                if let Some(ho) = env.home_object {
+                    obj_stack.push(ho);
+                }
+                if let Some(cc) = env.ctor_callee {
+                    obj_stack.push(cc);
                 }
                 for b in env.bindings.values() {
                     trace_value(&b.value, &mut obj_stack);
@@ -1017,6 +1060,22 @@ impl Heap {
                     ObjectKind::WeakSet(entries) => {
                         entries.retain(|k| k.0 < marked_objs.len() && marked_objs[k.0]);
                     }
+                    ObjectKind::WeakRef(target) => {
+                        if let Some(JsValue::Object(tid)) = target {
+                            if tid.0 >= marked_objs.len() || !marked_objs[tid.0] {
+                                *target = None;
+                            }
+                        }
+                    }
+                    ObjectKind::FinalizationRegistry(fr) => {
+                        for cell in &mut fr.cells {
+                            if let Some(JsValue::Object(tid)) = cell.unregister_token {
+                                if tid.0 >= marked_objs.len() || !marked_objs[tid.0] {
+                                    cell.unregister_token = None;
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1055,6 +1114,11 @@ pub fn trace_frame(frame: &CallFrame, objs: &mut Vec<ObjectId>, envs: &mut Vec<E
     envs.push(frame.env);
     for e in &frame.env_stack {
         envs.push(*e);
+    }
+    for r in &frame.ref_stack {
+        if let Some(e) = r {
+            envs.push(*e);
+        }
     }
     for v in &frame.stack {
         trace_value(v, objs);

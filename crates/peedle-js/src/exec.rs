@@ -543,16 +543,22 @@ impl JsRuntime {
 
         let mut env_rec = EnvRecord::new(Some(parent_env), true, func.strict);
         if !func.is_arrow {
-            let bound_this = if func.strict || is_constructor {
-                this_arg
-            } else if this_arg.is_nullish() {
-                JsValue::Object(self.global_object)
-            } else if !this_arg.is_object() {
-                JsValue::Object(self.to_object(&this_arg)?)
+            if func.is_derived_ctor {
+                env_rec.this_binding = None;
+                env_rec.this_uninitialized = true;
+                env_rec.ctor_callee = Some(fn_id);
             } else {
-                this_arg
-            };
-            env_rec.this_binding = Some(bound_this);
+                let bound_this = if func.strict || is_constructor {
+                    this_arg
+                } else if this_arg.is_nullish() {
+                    JsValue::Object(self.global_object)
+                } else if !this_arg.is_object() {
+                    JsValue::Object(self.to_object(&this_arg)?)
+                } else {
+                    this_arg
+                };
+                env_rec.this_binding = Some(bound_this);
+            }
             env_rec.new_target = Some(new_target.unwrap_or(JsValue::Undefined));
             env_rec.allow_new_target = true;
             env_rec.allow_super_call = func.is_derived_ctor;
@@ -562,6 +568,7 @@ impl JsRuntime {
             env_rec.allow_private = true;
         }
         if let Some(home) = func.home_object {
+            env_rec.home_object = Some(home);
             env_rec.super_proto = self.heap.get_obj(home).prototype;
         }
         let fn_env = self.heap.alloc_env(env_rec);
@@ -700,14 +707,15 @@ impl JsRuntime {
         frame.is_async = func.is_async;
 
         if func.is_generator {
-            let gen_proto = if func.is_async {
-                self.intrinsics.async_generator_proto
-            } else {
-                self.get_property(fn_id, "prototype")
-                    .ok()
-                    .and_then(|v| v.as_object())
-                    .unwrap_or(self.intrinsics.generator_proto)
-            };
+            let gen_proto = self
+                .get_property(fn_id, "prototype")
+                .ok()
+                .and_then(|v| v.as_object())
+                .unwrap_or(if func.is_async {
+                    self.intrinsics.async_generator_proto
+                } else {
+                    self.intrinsics.generator_proto
+                });
             let gen_obj = self.heap.alloc_object(JsObject::new(
                 Some(gen_proto),
                 ObjectKind::Generator(GeneratorData {
@@ -749,6 +757,11 @@ impl JsRuntime {
                     }
                     if let Some(inst) = frame.this_for_ctor {
                         return Ok(JsValue::Object(inst));
+                    }
+                    if !self.heap.get_env(fn_env).this_uninitialized {
+                        if let Some(ref tb) = self.heap.get_env(fn_env).this_binding {
+                            return Ok(tb.clone());
+                        }
                     }
                     let err = self.create_realm_error_object(
                         caller_realm,
@@ -856,11 +869,12 @@ impl JsRuntime {
         &mut self,
         gen_id: ObjectId,
         del_iter: JsValue,
+        next_method: JsValue,
         mode: u8,
         arg: JsValue,
     ) -> ObjectId {
         let out_p = self.create_promise();
-        self.step_async_delegate(gen_id, del_iter, mode, arg, out_p);
+        self.step_async_delegate(gen_id, del_iter, next_method, mode, arg, out_p);
         out_p
     }
 
@@ -868,6 +882,7 @@ impl JsRuntime {
         &mut self,
         gen_id: ObjectId,
         del_iter: JsValue,
+        next_method: JsValue,
         mode: u8,
         arg: JsValue,
         out_p: ObjectId,
@@ -884,11 +899,10 @@ impl JsRuntime {
 
         let call_res: Result<Option<JsValue>, JsError> = (|| match mode {
             0 => {
-                let next_fn = self.get_property(d_oid, "next")?;
-                if !self.is_callable(&next_fn) {
+                if !self.is_callable(&next_method) {
                     return Err(JsError::type_err("Delegated iterator next is not callable"));
                 }
-                let r = self.call_function(next_fn, del_iter.clone(), &[arg.clone()])?;
+                let r = self.call_function(next_method.clone(), del_iter.clone(), &[arg.clone()])?;
                 Ok(Some(r))
             }
             1 => {
@@ -1031,6 +1045,132 @@ impl JsRuntime {
         }
     }
 
+    fn resume_sync_delegate(
+        &mut self,
+        gen_id: ObjectId,
+        del_iter: JsValue,
+        next_method: JsValue,
+        mode: u8,
+        arg: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let JsValue::Object(d_oid) = del_iter else {
+            if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                g.delegating = None;
+            }
+            let ev = self.error_to_js_value(JsError::type_err("Delegated iterator is not an object"));
+            return self.resume_generator(gen_id, 1, ev);
+        };
+        let step_res: Result<Option<(JsValue, bool, Option<JsValue>)>, JsError> = (|| match mode {
+            0 => {
+                if !self.is_callable(&next_method) {
+                    return Err(JsError::type_err("Delegated iterator next is not callable"));
+                }
+                let res = self.call_function(next_method.clone(), del_iter.clone(), &[arg.clone()])?;
+                let JsValue::Object(r_oid) = res else {
+                    return Err(JsError::type_err("Iterator result is not an object"));
+                };
+                let done = self.get_property(r_oid, "done")?.to_boolean();
+                let val = if done {
+                    Some(self.get_property(r_oid, "value")?)
+                } else {
+                    None
+                };
+                Ok(Some((res, done, val)))
+            }
+            1 => {
+                let throw_fn = self.get_property(d_oid, "throw")?;
+                if throw_fn.is_nullish() {
+                    return Ok(None);
+                }
+                if !self.is_callable(&throw_fn) {
+                    return Err(JsError::type_err("Delegated iterator throw is not callable"));
+                }
+                let res = self.call_function(throw_fn, del_iter.clone(), &[arg.clone()])?;
+                let JsValue::Object(r_oid) = res else {
+                    return Err(JsError::type_err("Iterator result is not an object"));
+                };
+                let done = self.get_property(r_oid, "done")?.to_boolean();
+                let val = if done {
+                    Some(self.get_property(r_oid, "value")?)
+                } else {
+                    None
+                };
+                Ok(Some((res, done, val)))
+            }
+            2 => {
+                let ret_fn = self.get_property(d_oid, "return")?;
+                if ret_fn.is_nullish() {
+                    return Ok(None);
+                }
+                if !self.is_callable(&ret_fn) {
+                    return Err(JsError::type_err("Delegated iterator return is not callable"));
+                }
+                let res = self.call_function(ret_fn, del_iter.clone(), &[arg.clone()])?;
+                let JsValue::Object(r_oid) = res else {
+                    return Err(JsError::type_err("Iterator result is not an object"));
+                };
+                let done = self.get_property(r_oid, "done")?.to_boolean();
+                let val = if done {
+                    Some(self.get_property(r_oid, "value")?)
+                } else {
+                    None
+                };
+                Ok(Some((res, done, val)))
+            }
+            _ => Ok(None),
+        })();
+
+        match step_res {
+            Err(e) => {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.delegating = None;
+                }
+                let ev = self.error_to_js_value(e);
+                self.resume_generator(gen_id, 1, ev)
+            }
+            Ok(None) => {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.delegating = None;
+                }
+                if mode == 1 {
+                    let close_res: Result<(), JsError> = (|| {
+                        let ret_fn = self.get_property(d_oid, "return")?;
+                        if !ret_fn.is_nullish() {
+                            if !self.is_callable(&ret_fn) {
+                                return Err(JsError::type_err("Iterator return is not callable"));
+                            }
+                            let cr = self.call_function(ret_fn, del_iter.clone(), &[])?;
+                            if !cr.is_object() {
+                                return Err(JsError::type_err(
+                                    "Iterator return result is not an object",
+                                ));
+                            }
+                        }
+                        Ok(())
+                    })();
+                    let err = match close_res {
+                        Err(e) => e,
+                        Ok(()) => JsError::type_err(
+                            "The iterator does not provide a 'throw' method",
+                        ),
+                    };
+                    let ev = self.error_to_js_value(err);
+                    self.resume_generator(gen_id, 1, ev)
+                } else {
+                    self.resume_generator(gen_id, 2, arg)
+                }
+            }
+            Ok(Some((res, false, _))) => Ok(res),
+            Ok(Some((_, true, val))) => {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.delegating = None;
+                }
+                let resume_mode = if mode == 2 { 2 } else { 0 };
+                self.resume_generator(gen_id, resume_mode, val.unwrap_or(JsValue::Undefined))
+            }
+        }
+    }
+
     pub fn resume_generator(
         &mut self,
         gen_id: ObjectId,
@@ -1042,28 +1182,12 @@ impl JsRuntime {
             _ => return Err(JsError::type_err("Receiver is not a Generator")),
         };
 
-        if let Some(del_iter) = delegating {
+        if let Some((del_iter, next_method)) = delegating {
             if is_async {
-                let p = self.resume_async_delegate(gen_id, del_iter, mode, arg);
+                let p = self.resume_async_delegate(gen_id, del_iter, next_method, mode, arg);
                 return Ok(JsValue::Object(p));
             }
-            if mode == 0 {
-                if let JsValue::Object(d_oid) = del_iter {
-                    let next_fn = self.get_property(d_oid, "next")?;
-                    let res = self.call_function(next_fn, del_iter.clone(), &[arg.clone()])?;
-                    if let JsValue::Object(r_oid) = res {
-                        let done = self.get_property(r_oid, "done")?.to_boolean();
-                        let val = self.get_property(r_oid, "value")?;
-                        if !done {
-                            return Ok(self.create_iter_result(val, false));
-                        }
-                        if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
-                            g.delegating = None;
-                        }
-                        return self.resume_generator(gen_id, 0, val);
-                    }
-                }
-            }
+            return self.resume_sync_delegate(gen_id, del_iter, next_method, mode, arg);
         }
 
         if state == GeneratorState::Completed {
@@ -1242,13 +1366,21 @@ impl JsRuntime {
                 }
             }
             Ok(FrameOutcome::YieldDelegate(iterable)) => {
-                match self.get_iterator(&iterable, is_async) {
-                    Ok(iter) => {
+                let iter_res = (|| -> Result<(JsValue, JsValue), JsError> {
+                    let iter = self.get_iterator(&iterable, is_async)?;
+                    let JsValue::Object(iter_oid) = iter else {
+                        return Err(JsError::type_err("Iterator must be an object"));
+                    };
+                    let next_fn = self.get_property(iter_oid, "next")?;
+                    Ok((iter, next_fn))
+                })();
+                match iter_res {
+                    Ok((iter, next_fn)) => {
                         if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind
                         {
                             g.state = GeneratorState::SuspendedYield;
                             g.frame = Some(Box::new(frame));
-                            g.delegating = Some(iter);
+                            g.delegating = Some((iter, next_fn));
                         }
                         self.resume_generator(gen_id, 0, JsValue::Undefined)
                     }
@@ -1485,6 +1617,9 @@ impl JsRuntime {
                     return Err(JsError::internal("Execution step limit exceeded"));
                 }
             }
+            if self.call_depth == 0 && self.heap.alloc_since_gc() > 32_768 {
+                self.collect_garbage_with_frame(frame);
+            }
             if frame.ip >= frame.chunk.ops.len() {
                 return Ok(FrameOutcome::Return(JsValue::Undefined));
             }
@@ -1509,8 +1644,10 @@ impl JsRuntime {
                     handler.in_catch = true;
                     let target_stack = handler.stack_len;
                     let target_env = handler.env_depth;
+                    let target_ref = handler.ref_depth;
                     self.restore_env_depth(frame, target_env);
                     frame.stack.truncate(target_stack);
+                    frame.ref_stack.truncate(target_ref);
                     let err_val = self.error_to_js_value(err);
                     frame.stack.push(err_val);
                     frame.ip = catch_ip as usize;
@@ -1523,8 +1660,10 @@ impl JsRuntime {
                     handler.pending = PendingCompletion::Throw(err);
                     let target_stack = handler.stack_len;
                     let target_env = handler.env_depth;
+                    let target_ref = handler.ref_depth;
                     self.restore_env_depth(frame, target_env);
                     frame.stack.truncate(target_stack);
+                    frame.ref_stack.truncate(target_ref);
                     frame.ip = fin_ip as usize;
                     return Ok(());
                 }
@@ -1546,8 +1685,10 @@ impl JsRuntime {
                     handler.pending = PendingCompletion::Return(val);
                     let target_stack = handler.stack_len;
                     let target_env = handler.env_depth;
+                    let target_ref = handler.ref_depth;
                     self.restore_env_depth(frame, target_env);
                     frame.stack.truncate(target_stack);
+                    frame.ref_stack.truncate(target_ref);
                     frame.ip = fin_ip as usize;
                     return Ok(None);
                 }
@@ -1578,8 +1719,10 @@ impl JsRuntime {
                     };
                     let s_len = handler.stack_len;
                     let e_len = handler.env_depth;
+                    let r_len = handler.ref_depth;
                     self.restore_env_depth(frame, e_len);
                     frame.stack.truncate(s_len);
+                    frame.ref_stack.truncate(r_len);
                     frame.ip = fin_ip as usize;
                     return;
                 }
@@ -1643,7 +1786,7 @@ impl JsRuntime {
                 let _ = len;
             }
             Op::PushThis => {
-                let t = self.resolve_this(frame.env);
+                let t = self.resolve_this(frame.env)?;
                 frame.stack.push(t);
             }
             Op::PushNewTarget => {
@@ -1815,6 +1958,11 @@ impl JsRuntime {
             Op::GetElem => {
                 let key_val = frame.stack.pop().unwrap();
                 let obj_val = frame.stack.pop().unwrap();
+                if obj_val.is_nullish() {
+                    return Err(JsError::type_err(
+                        "Cannot read properties of null or undefined",
+                    ));
+                }
                 let key = self.to_property_key(&key_val)?;
                 let val = self.get_value_prop(&obj_val, &key)?;
                 frame.stack.push(val);
@@ -1823,6 +1971,11 @@ impl JsRuntime {
                 let val = frame.stack.pop().unwrap();
                 let key_val = frame.stack.pop().unwrap();
                 let obj_val = frame.stack.pop().unwrap();
+                if obj_val.is_nullish() {
+                    return Err(JsError::type_err(
+                        "Cannot set properties of null or undefined",
+                    ));
+                }
                 let key = self.to_property_key(&key_val)?;
                 self.set_value_prop(&obj_val, key, val.clone(), frame.chunk.strict)?;
                 frame.stack.push(val);
@@ -1865,20 +2018,27 @@ impl JsRuntime {
                         "Right-hand side of private 'in' must be an object",
                     ));
                 };
-                let found = self
-                    .heap
-                    .get_obj(oid)
-                    .private_fields
-                    .keys()
-                    .any(|(_, k)| k == &name);
+                let mut found = false;
+                let mut cur = Some(oid);
+                while let Some(id) = cur {
+                    if self
+                        .heap
+                        .get_obj(id)
+                        .private_fields
+                        .keys()
+                        .any(|(_, k)| k == &name)
+                    {
+                        found = true;
+                        break;
+                    }
+                    cur = self.heap.get_obj(id).prototype;
+                }
                 frame.stack.push(JsValue::Boolean(found));
             }
             Op::GetSuperProp(idx) => {
                 let name = get_const_str(&frame.chunk, idx).to_string();
-                let super_proto = self
-                    .resolve_super_proto(frame.env)
-                    .ok_or_else(|| JsError::type_err("Cannot read super property"))?;
-                let this_val = self.resolve_this(frame.env);
+                let this_val = self.resolve_this(frame.env)?;
+                let super_proto = self.resolve_super_base(frame.env)?;
                 let val = self.get_property_key_receiver(
                     super_proto,
                     &PropertyKey::String(name),
@@ -1889,37 +2049,37 @@ impl JsRuntime {
             Op::SetSuperProp(idx) => {
                 let name = get_const_str(&frame.chunk, idx).to_string();
                 let val = frame.stack.pop().unwrap();
-                let super_proto = self
-                    .resolve_super_proto(frame.env)
-                    .ok_or_else(|| JsError::type_err("Cannot set super property"))?;
-                let this_val = self.resolve_this(frame.env);
-                self.set_property_key_receiver(
+                let this_val = self.resolve_this(frame.env)?;
+                let super_proto = self.resolve_super_base(frame.env)?;
+                let ok = self.set_property_key_receiver(
                     super_proto,
                     PropertyKey::String(name),
                     val.clone(),
                     this_val,
                 )?;
+                if !ok && frame.chunk.strict {
+                    return Err(JsError::type_err("Cannot set super property"));
+                }
                 frame.stack.push(val);
             }
             Op::GetSuperElem => {
                 let key_val = frame.stack.pop().unwrap();
+                let this_val = self.resolve_this(frame.env)?;
+                let super_proto = self.resolve_super_base(frame.env)?;
                 let key = self.to_property_key(&key_val)?;
-                let super_proto = self
-                    .resolve_super_proto(frame.env)
-                    .ok_or_else(|| JsError::type_err("Cannot read super property"))?;
-                let this_val = self.resolve_this(frame.env);
                 let val = self.get_property_key_receiver(super_proto, &key, this_val)?;
                 frame.stack.push(val);
             }
             Op::SetSuperElem => {
                 let val = frame.stack.pop().unwrap();
                 let key_val = frame.stack.pop().unwrap();
+                let this_val = self.resolve_this(frame.env)?;
+                let super_proto = self.resolve_super_base(frame.env)?;
                 let key = self.to_property_key(&key_val)?;
-                let super_proto = self
-                    .resolve_super_proto(frame.env)
-                    .ok_or_else(|| JsError::type_err("Cannot set super property"))?;
-                let this_val = self.resolve_this(frame.env);
-                self.set_property_key_receiver(super_proto, key, val.clone(), this_val)?;
+                let ok = self.set_property_key_receiver(super_proto, key, val.clone(), this_val)?;
+                if !ok && frame.chunk.strict {
+                    return Err(JsError::type_err("Cannot set super property"));
+                }
                 frame.stack.push(val);
             }
             Op::CallSuper(argc) => {
@@ -2158,6 +2318,68 @@ impl JsRuntime {
                     }
                 }
             }
+            Op::RecordExcludedKey => {
+                let raw = frame.stack.pop().unwrap();
+                let pk = self.to_property_key(&raw)?;
+                let pv = pk.to_value();
+                let slen = frame.stack.len();
+                if slen >= 3 {
+                    if let JsValue::Object(excl_id) = frame.stack[slen - 3] {
+                        if let ObjectKind::Array(ref mut arr) = self.heap.get_obj_mut(excl_id).kind {
+                            let idx = arr.length;
+                            arr.set(idx, pv.clone());
+                        }
+                    }
+                }
+                frame.stack.push(pv);
+            }
+            Op::ObjectRestDyn(cidx) => {
+                let ConstValue::Names(excluded) = frame.chunk.consts[cidx as usize].clone() else {
+                    unreachable!();
+                };
+                let src = frame.stack.pop().unwrap();
+                let excl_val = frame.stack.pop().unwrap();
+                let mut dyn_keys: Vec<PropertyKey> = Vec::new();
+                if let JsValue::Object(excl_id) = excl_val {
+                    if let ObjectKind::Array(ref arr) = self.heap.get_obj(excl_id).kind {
+                        for i in 0..arr.length {
+                            if let Some(v) = arr.get(i) {
+                                match v {
+                                    JsValue::String(s) => dyn_keys.push(PropertyKey::String(s.clone())),
+                                    JsValue::Symbol(s) => dyn_keys.push(PropertyKey::Symbol(*s)),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                let src_id = self.to_object(&src)?;
+                let dst = self.create_object();
+                let keys = self.own_keys(src_id)?;
+                for k in keys {
+                    if let PropertyKey::String(ref s) = k {
+                        if excluded.contains(s) {
+                            continue;
+                        }
+                    }
+                    if dyn_keys.contains(&k) {
+                        continue;
+                    }
+                    if let Some(desc) = self.get_own_property_descriptor(src_id, &k)? {
+                        if desc.enumerable.unwrap_or(false) {
+                            let v = self.get_property_key(src_id, &k)?;
+                            self.heap
+                                .get_obj_mut(dst)
+                                .set_own_prop(k, PropEntry::data(v, true, true, true));
+                        }
+                    }
+                }
+                frame.stack.push(JsValue::Object(dst));
+            }
+            Op::DeleteSuper => {
+                let _ = self.resolve_this(frame.env)?;
+                return Err(JsError::reference("Unsupported reference to 'super'"));
+            }
             Op::ObjectRest(cidx) => {
                 let ConstValue::Names(excluded) = frame.chunk.consts[cidx as usize].clone() else {
                     unreachable!();
@@ -2210,12 +2432,8 @@ impl JsRuntime {
             }
             Op::ToNumber => {
                 let v = frame.stack.pop().unwrap();
-                if let JsValue::BigInt(n) = v {
-                    frame.stack.push(JsValue::BigInt(n));
-                } else {
-                    let n = self.to_number(&v)?;
-                    frame.stack.push(JsValue::Number(n));
-                }
+                let num = self.to_numeric(&v)?;
+                frame.stack.push(num);
             }
             Op::ToString => {
                 let v = frame.stack.pop().unwrap();
@@ -2387,6 +2605,26 @@ impl JsRuntime {
                 let val = frame.stack.pop().unwrap_or(JsValue::Undefined);
                 return Err(JsError::thrown(val));
             }
+            Op::ResolveBinding(idx) => {
+                let name = get_const_str(&frame.chunk, idx).to_string();
+                let target_env = self.resolve_binding_env(frame.env, &name)?;
+                frame.ref_stack.push(target_env);
+            }
+            Op::GetResolvedBinding(idx) => {
+                let name = get_const_str(&frame.chunk, idx).to_string();
+                let target_env = *frame.ref_stack.last().unwrap_or(&None);
+                let val = self.get_resolved_binding(target_env, &name, frame.chunk.strict)?;
+                frame.stack.push(val);
+            }
+            Op::SetResolvedBinding(idx) => {
+                let name = get_const_str(&frame.chunk, idx).to_string();
+                let val = frame.stack.pop().unwrap();
+                let target_env = frame.ref_stack.pop().unwrap_or(None);
+                self.set_resolved_binding(target_env, &name, val, frame.chunk.strict)?;
+            }
+            Op::PopBindingRef => {
+                frame.ref_stack.pop();
+            }
             Op::TryPush {
                 catch_ip,
                 finally_ip,
@@ -2396,6 +2634,7 @@ impl JsRuntime {
                     finally_ip,
                     stack_len: frame.stack.len(),
                     env_depth: frame.env_stack.len(),
+                    ref_depth: frame.ref_stack.len(),
                     in_catch: false,
                     in_finally: false,
                     pending: PendingCompletion::Normal,
@@ -2480,6 +2719,50 @@ impl JsRuntime {
                 let val = frame.stack.pop().unwrap();
                 let iter = self.get_iterator(&val, is_async)?;
                 frame.stack.push(iter);
+            }
+            Op::AsyncIteratorNextCall => {
+                let iter = frame.stack.last().cloned().unwrap();
+                let res: Result<JsValue, JsError> = (|| {
+                    let JsValue::Object(oid) = iter else {
+                        return Err(JsError::type_err("Iterator must be an object"));
+                    };
+                    let next_fn = self.get_property(oid, "next")?;
+                    self.call_function(next_fn, iter, &[])
+                })();
+                match res {
+                    Ok(v) => frame.stack.push(v),
+                    Err(e) => {
+                        *frame.stack.last_mut().unwrap() = JsValue::Undefined;
+                        return Err(e);
+                    }
+                }
+            }
+            Op::IteratorResultUnpack(done_target) => {
+                let res = frame.stack.pop().unwrap();
+                let step: Result<Option<JsValue>, JsError> = (|| {
+                    let JsValue::Object(res_id) = res else {
+                        return Err(JsError::type_err("Iterator result is not an object"));
+                    };
+                    let done = self.get_property(res_id, "done")?.to_boolean();
+                    if done {
+                        Ok(None)
+                    } else {
+                        Ok(Some(self.get_property(res_id, "value")?))
+                    }
+                })();
+                match step {
+                    Ok(Some(val)) => {
+                        frame.stack.push(val);
+                    }
+                    Ok(None) => {
+                        *frame.stack.last_mut().unwrap() = JsValue::Undefined;
+                        frame.ip = done_target as usize;
+                    }
+                    Err(e) => {
+                        *frame.stack.last_mut().unwrap() = JsValue::Undefined;
+                        return Err(e);
+                    }
+                }
             }
             Op::IteratorNext(done_target) => {
                 let iter = frame.stack.last().cloned().unwrap();
@@ -2865,23 +3148,40 @@ impl JsRuntime {
         frame: &mut CallFrame,
         args: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let Some(callee) = frame.callee else {
-            return Err(JsError::reference("super() outside constructor"));
+        let mut cur_env = frame.env;
+        let (this_env, ctor_id) = loop {
+            let rec = self.heap.get_env(cur_env);
+            if let Some(cid) = rec.ctor_callee {
+                break (cur_env, cid);
+            }
+            let Some(p) = rec.parent else {
+                return Err(JsError::reference("super() outside constructor"));
+            };
+            cur_env = p;
         };
-        let super_ctor = match &self.heap.get_obj(callee).kind {
-            ObjectKind::Function(f) => f.super_ctor,
-            _ => None,
+        let super_ctor = self
+            .get_prototype_of(ctor_id)?
+            .ok_or_else(|| JsError::type_err("Super constructor is not valid"))?;
+        if !self.is_constructor(&JsValue::Object(super_ctor)) {
+            return Err(JsError::type_err("Super constructor is not a constructor"));
         }
-        .ok_or_else(|| JsError::type_err("Super constructor is not valid"))?;
         let new_target = self.resolve_new_target(frame.env);
         let result =
             self.construct_with_new_target(JsValue::Object(super_ctor), args, new_target)?;
+        if !self.heap.get_env(this_env).this_uninitialized {
+            return Err(JsError::reference("Super constructor may only be called once"));
+        }
+        {
+            let env_mut = self.heap.get_env_mut(this_env);
+            env_mut.this_binding = Some(result.clone());
+            env_mut.this_uninitialized = false;
+        }
         if let JsValue::Object(inst) = result {
-            frame.this_for_ctor = Some(inst);
-            frame.super_called = true;
-            let fn_env = self.nearest_function_env(frame.env);
-            self.heap.get_env_mut(fn_env).this_binding = Some(JsValue::Object(inst));
-            self.init_instance_fields(callee, inst)?;
+            if frame.callee == Some(ctor_id) {
+                frame.this_for_ctor = Some(inst);
+                frame.super_called = true;
+            }
+            self.init_instance_fields(ctor_id, inst)?;
         }
         Ok(result)
     }
@@ -2932,6 +3232,8 @@ impl JsRuntime {
                     ));
                 }
             }
+        } else if tmpl.has_super {
+            None
         } else {
             Some(self.intrinsics.object_proto)
         };
@@ -3408,14 +3710,19 @@ impl JsRuntime {
         }
     }
 
-    fn resolve_this(&self, mut env: EnvId) -> JsValue {
+    fn resolve_this(&self, mut env: EnvId) -> Result<JsValue, JsError> {
         loop {
             let rec = self.heap.get_env(env);
+            if rec.this_uninitialized {
+                return Err(JsError::reference(
+                    "Must call super constructor in derived class before accessing 'this'",
+                ));
+            }
             if let Some(ref t) = rec.this_binding {
-                return t.clone();
+                return Ok(t.clone());
             }
             let Some(p) = rec.parent else {
-                return JsValue::Object(self.global_object);
+                return Ok(JsValue::Object(self.global_object));
             };
             env = p;
         }
@@ -3434,27 +3741,28 @@ impl JsRuntime {
         }
     }
 
-    fn resolve_super_proto(&self, mut env: EnvId) -> Option<ObjectId> {
+    fn resolve_super_base(&mut self, mut env: EnvId) -> Result<ObjectId, JsError> {
         loop {
-            let rec = self.heap.get_env(env);
-            if let Some(sp) = rec.super_proto {
-                return Some(sp);
+            let (home_obj, super_proto, parent) = {
+                let rec = self.heap.get_env(env);
+                (rec.home_object, rec.super_proto, rec.parent)
+            };
+            if let Some(home) = home_obj {
+                return self
+                    .get_prototype_of(home)?
+                    .ok_or_else(|| JsError::type_err("Cannot access property of null super prototype"));
             }
-            env = rec.parent?;
+            if let Some(sp) = super_proto {
+                return Ok(sp);
+            }
+            let Some(p) = parent else {
+                return Err(JsError::type_err("Cannot access super property"));
+            };
+            env = p;
         }
     }
 
     fn nearest_var_env(&self, mut env: EnvId) -> EnvId {
-        loop {
-            let rec = self.heap.get_env(env);
-            if rec.is_function_scope || rec.parent.is_none() {
-                return env;
-            }
-            env = rec.parent.unwrap();
-        }
-    }
-
-    fn nearest_function_env(&self, mut env: EnvId) -> EnvId {
         loop {
             let rec = self.heap.get_env(env);
             if rec.is_function_scope || rec.parent.is_none() {
@@ -3597,17 +3905,157 @@ impl JsRuntime {
         }
     }
 
+    fn resolve_binding_env(&mut self, mut env: EnvId, name: &str) -> Result<Option<EnvId>, JsError> {
+        loop {
+            let (has_binding, obj_env, parent) = {
+                let rec = self.heap.get_env(env);
+                (rec.bindings.contains_key(name), rec.object_env, rec.parent)
+            };
+            if has_binding {
+                return Ok(Some(env));
+            }
+            if let Some(oid) = obj_env {
+                let key = PropertyKey::String(name.to_string());
+                if self.has_property(oid, &key)? {
+                    if parent.is_some() {
+                        let unscop = PropertyKey::Symbol(self.symbols.unscopables);
+                        let u = self.get_property_key(oid, &unscop)?;
+                        if let JsValue::Object(uid) = u {
+                            if self.get_property(uid, name)?.to_boolean() {
+                                if let Some(p) = parent {
+                                    env = p;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    return Ok(Some(env));
+                }
+            }
+            let Some(p) = parent else {
+                return Ok(None);
+            };
+            env = p;
+        }
+    }
+
+    fn get_resolved_binding(
+        &mut self,
+        target_env: Option<EnvId>,
+        name: &str,
+        strict: bool,
+    ) -> Result<JsValue, JsError> {
+        let Some(env) = target_env else {
+            return Err(JsError::reference(format!("{} is not defined", name)));
+        };
+        let (binding, obj_env, is_with) = {
+            let rec = self.heap.get_env(env);
+            (
+                rec.bindings.get(name).cloned(),
+                rec.object_env,
+                rec.object_env.is_some() && rec.parent.is_some(),
+            )
+        };
+        if let Some(b) = binding {
+            if !b.initialized {
+                return Err(JsError::reference(format!(
+                    "Cannot access '{}' before initialization",
+                    name
+                )));
+            }
+            return Ok(b.value);
+        }
+        if let Some(oid) = obj_env {
+            let key = PropertyKey::String(name.to_string());
+            if strict || is_with {
+                if !self.has_property(oid, &key)? {
+                    if strict {
+                        return Err(JsError::reference(format!("{} is not defined", name)));
+                    }
+                    return Ok(JsValue::Undefined);
+                }
+            }
+            return self.get_property_key(oid, &key);
+        }
+        Err(JsError::reference(format!("{} is not defined", name)))
+    }
+
+    fn set_resolved_binding(
+        &mut self,
+        target_env: Option<EnvId>,
+        name: &str,
+        val: JsValue,
+        strict: bool,
+    ) -> Result<(), JsError> {
+        let Some(env) = target_env else {
+            if strict {
+                return Err(JsError::reference(format!("{} is not defined", name)));
+            }
+            self.set_property_key_strict(
+                self.global_object,
+                PropertyKey::String(name.to_string()),
+                val,
+                false,
+            )?;
+            return Ok(());
+        };
+        let (has_binding, obj_env) = {
+            let rec = self.heap.get_env(env);
+            (rec.bindings.contains_key(name), rec.object_env)
+        };
+        if has_binding {
+            let b = self.heap.get_env_mut(env).bindings.get_mut(name).unwrap();
+            if !b.initialized {
+                return Err(JsError::reference(format!(
+                    "Cannot access '{}' before initialization",
+                    name
+                )));
+            }
+            if !b.mutable {
+                if strict || b.strict_immutable {
+                    return Err(JsError::type_err(format!(
+                        "Assignment to constant variable '{}'",
+                        name
+                    )));
+                }
+                return Ok(());
+            }
+            b.value = val;
+            return Ok(());
+        }
+        if let Some(oid) = obj_env {
+            let key = PropertyKey::String(name.to_string());
+            if strict && !self.has_property(oid, &key)? {
+                return Err(JsError::reference(format!("{} is not defined", name)));
+            }
+            self.set_property_key_strict(oid, key, val, strict)?;
+            return Ok(());
+        }
+        if strict {
+            return Err(JsError::reference(format!("{} is not defined", name)));
+        }
+        self.set_property_key_strict(
+            self.global_object,
+            PropertyKey::String(name.to_string()),
+            val,
+            false,
+        )?;
+        Ok(())
+    }
+
     fn exec_unary(&mut self, op: UnaryOp, val: JsValue) -> Result<JsValue, JsError> {
         match op {
             UnaryOp::Plus => Ok(JsValue::Number(self.to_number(&val)?)),
-            UnaryOp::Minus => match val {
+            UnaryOp::Minus => match self.to_numeric(&val)? {
                 JsValue::BigInt(n) => Ok(JsValue::BigInt(n.wrapping_neg())),
-                other => Ok(JsValue::Number(-self.to_number(&other)?)),
+                JsValue::Number(n) => Ok(JsValue::Number(-n)),
+                _ => unreachable!(),
             },
             UnaryOp::Not => Ok(JsValue::Boolean(!val.to_boolean())),
-            UnaryOp::BitNot => match val {
+            UnaryOp::BitNot => match self.to_numeric(&val)? {
                 JsValue::BigInt(n) => Ok(JsValue::BigInt(!n)),
-                other => Ok(JsValue::Number((!to_int32(self.to_number(&other)?)) as f64)),
+                JsValue::Number(n) => Ok(JsValue::Number((!to_int32(n)) as f64)),
+                _ => unreachable!(),
             },
             UnaryOp::TypeOf => Ok(JsValue::String(self.typeof_value(&val).to_string())),
             UnaryOp::Void => Ok(JsValue::Undefined),
@@ -3703,11 +4151,16 @@ impl JsRuntime {
                 |a, b| a.wrapping_shr(b as u32),
             ),
             BinaryOp::UShr => {
-                if matches!(left, JsValue::BigInt(_)) || matches!(right, JsValue::BigInt(_)) {
+                let ln = self.to_numeric(&left)?;
+                let rn = self.to_numeric(&right)?;
+                if matches!(ln, JsValue::BigInt(_)) || matches!(rn, JsValue::BigInt(_)) {
                     return Err(JsError::type_err("BigInts have no unsigned right shift"));
                 }
-                let a = to_uint32(self.to_number(&left)?);
-                let b = to_uint32(self.to_number(&right)?) & 0x1f;
+                let (JsValue::Number(la), JsValue::Number(rb)) = (ln, rn) else {
+                    unreachable!()
+                };
+                let a = to_uint32(la);
+                let b = to_uint32(rb) & 0x1f;
                 Ok(JsValue::Number((a >> b) as f64))
             }
             BinaryOp::BitAnd => {
@@ -3724,16 +4177,20 @@ impl JsRuntime {
             BinaryOp::StrictEq => Ok(JsValue::Boolean(left.strict_eq(&right))),
             BinaryOp::StrictNeq => Ok(JsValue::Boolean(!left.strict_eq(&right))),
             BinaryOp::Lt => Ok(JsValue::Boolean(
-                self.relational_lt(&left, &right)?.unwrap_or(false),
+                self.relational_lt(&left, &right, true)?.unwrap_or(false),
             )),
             BinaryOp::Gt => Ok(JsValue::Boolean(
-                self.relational_lt(&right, &left)?.unwrap_or(false),
+                self.relational_lt(&right, &left, false)?.unwrap_or(false),
             )),
             BinaryOp::Lte => Ok(JsValue::Boolean(
-                self.relational_lt(&right, &left)?.map(|b| !b).unwrap_or(false),
+                self.relational_lt(&right, &left, false)?
+                    .map(|b| !b)
+                    .unwrap_or(false),
             )),
             BinaryOp::Gte => Ok(JsValue::Boolean(
-                self.relational_lt(&left, &right)?.map(|b| !b).unwrap_or(false),
+                self.relational_lt(&left, &right, true)?
+                    .map(|b| !b)
+                    .unwrap_or(false),
             )),
             BinaryOp::In => {
                 let JsValue::Object(oid) = right else {
@@ -3759,17 +4216,13 @@ impl JsRuntime {
         F: Fn(f64, f64) -> f64,
         B: Fn(i128, i128) -> Result<i128, JsError>,
     {
-        let lp = self.to_primitive(&left, "number")?;
-        let rp = self.to_primitive(&right, "number")?;
-        if let (JsValue::BigInt(a), JsValue::BigInt(b)) = (&lp, &rp) {
-            return Ok(JsValue::BigInt(bop(*a, *b)?));
+        let lp = self.to_numeric(&left)?;
+        let rp = self.to_numeric(&right)?;
+        match (lp, rp) {
+            (JsValue::BigInt(a), JsValue::BigInt(b)) => Ok(JsValue::BigInt(bop(a, b)?)),
+            (JsValue::Number(a), JsValue::Number(b)) => Ok(JsValue::Number(fop(a, b))),
+            _ => Err(JsError::type_err("Cannot mix BigInt and other types")),
         }
-        if matches!(lp, JsValue::BigInt(_)) || matches!(rp, JsValue::BigInt(_)) {
-            return Err(JsError::type_err("Cannot mix BigInt and other types"));
-        }
-        let a = self.to_number(&lp)?;
-        let b = self.to_number(&rp)?;
-        Ok(JsValue::Number(fop(a, b)))
     }
 
     fn bitwise_binop<F, B>(
@@ -3783,17 +4236,15 @@ impl JsRuntime {
         F: Fn(i32, i32) -> f64,
         B: Fn(i128, i128) -> i128,
     {
-        let lp = self.to_primitive(&left, "number")?;
-        let rp = self.to_primitive(&right, "number")?;
-        if let (JsValue::BigInt(a), JsValue::BigInt(b)) = (&lp, &rp) {
-            return Ok(JsValue::BigInt(bop(*a, *b)));
+        let lp = self.to_numeric(&left)?;
+        let rp = self.to_numeric(&right)?;
+        match (lp, rp) {
+            (JsValue::BigInt(a), JsValue::BigInt(b)) => Ok(JsValue::BigInt(bop(a, b))),
+            (JsValue::Number(a), JsValue::Number(b)) => {
+                Ok(JsValue::Number(iop(to_int32(a), to_int32(b))))
+            }
+            _ => Err(JsError::type_err("Cannot mix BigInt and other types")),
         }
-        if matches!(lp, JsValue::BigInt(_)) || matches!(rp, JsValue::BigInt(_)) {
-            return Err(JsError::type_err("Cannot mix BigInt and other types"));
-        }
-        let a = to_int32(self.to_number(&lp)?);
-        let b = to_int32(self.to_number(&rp)?);
-        Ok(JsValue::Number(iop(a, b)))
     }
 }
 

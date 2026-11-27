@@ -1,4 +1,4 @@
-use crate::bytecode::{CallFrame, Chunk, FuncTemplate};
+use crate::bytecode::{CallFrame, Chunk, FuncTemplate, PendingCompletion};
 use crate::compiler::Compiler;
 use crate::error::{ErrorKind, JsError};
 use crate::heap::*;
@@ -53,6 +53,8 @@ pub struct Intrinsics {
     pub set_proto: ObjectId,
     pub weak_map_proto: ObjectId,
     pub weak_set_proto: ObjectId,
+    pub weak_ref_proto: ObjectId,
+    pub finalization_registry_proto: ObjectId,
     pub promise_proto: ObjectId,
     pub array_buffer_proto: ObjectId,
     pub shared_array_buffer_proto: ObjectId,
@@ -60,6 +62,7 @@ pub struct Intrinsics {
     pub typed_array_proto: ObjectId,
     pub typed_array_protos: [ObjectId; 11],
     pub iterator_proto: ObjectId,
+    pub async_iterator_proto: ObjectId,
     pub array_iterator_proto: ObjectId,
     pub string_iterator_proto: ObjectId,
     pub map_iterator_proto: ObjectId,
@@ -122,6 +125,7 @@ pub struct JsRuntime {
     pub native_new_target: Option<JsValue>,
     pub call_stack_callees: Vec<ObjectId>,
     pub template_cache: HashMap<(usize, u64), ObjectId>,
+    pub host_root_tracers: Vec<Box<dyn Fn(&mut Vec<ObjectId>)>>,
 }
 
 fn alloc_realm_parts(heap: &mut Heap) -> Realm {
@@ -177,6 +181,10 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
         heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
     let weak_set_proto =
         heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
+    let weak_ref_proto =
+        heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
+    let finalization_registry_proto =
+        heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
     let promise_proto =
         heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
     let array_buffer_proto =
@@ -193,6 +201,8 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
     }
     let iterator_proto =
         heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
+    let async_iterator_proto =
+        heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
     let array_iterator_proto =
         heap.alloc_object(JsObject::new(Some(iterator_proto), ObjectKind::Ordinary));
     let string_iterator_proto =
@@ -206,7 +216,7 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
     let generator_proto =
         heap.alloc_object(JsObject::new(Some(iterator_proto), ObjectKind::Ordinary));
     let async_generator_proto =
-        heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
+        heap.alloc_object(JsObject::new(Some(async_iterator_proto), ObjectKind::Ordinary));
     let generator_function_proto =
         heap.alloc_object(JsObject::new(Some(function_proto), ObjectKind::Ordinary));
     let async_function_proto =
@@ -268,6 +278,8 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
         set_proto,
         weak_map_proto,
         weak_set_proto,
+        weak_ref_proto,
+        finalization_registry_proto,
         promise_proto,
         array_buffer_proto,
         shared_array_buffer_proto,
@@ -275,6 +287,7 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
         typed_array_proto,
         typed_array_protos,
         iterator_proto,
+        async_iterator_proto,
         array_iterator_proto,
         string_iterator_proto,
         map_iterator_proto,
@@ -352,6 +365,7 @@ impl JsRuntime {
             native_new_target: None,
             call_stack_callees: Vec::new(),
             template_cache: HashMap::new(),
+            host_root_tracers: Vec::new(),
         };
 
         crate::builtins::init_builtins(&mut rt);
@@ -474,12 +488,15 @@ impl JsRuntime {
         if default_proto == cur.set_proto { return tgt.set_proto; }
         if default_proto == cur.weak_map_proto { return tgt.weak_map_proto; }
         if default_proto == cur.weak_set_proto { return tgt.weak_set_proto; }
+        if default_proto == cur.weak_ref_proto { return tgt.weak_ref_proto; }
+        if default_proto == cur.finalization_registry_proto { return tgt.finalization_registry_proto; }
         if default_proto == cur.promise_proto { return tgt.promise_proto; }
         if default_proto == cur.array_buffer_proto { return tgt.array_buffer_proto; }
         if default_proto == cur.shared_array_buffer_proto { return tgt.shared_array_buffer_proto; }
         if default_proto == cur.data_view_proto { return tgt.data_view_proto; }
         if default_proto == cur.typed_array_proto { return tgt.typed_array_proto; }
         if default_proto == cur.iterator_proto { return tgt.iterator_proto; }
+        if default_proto == cur.async_iterator_proto { return tgt.async_iterator_proto; }
         if default_proto == cur.array_iterator_proto { return tgt.array_iterator_proto; }
         if default_proto == cur.string_iterator_proto { return tgt.string_iterator_proto; }
         if default_proto == cur.map_iterator_proto { return tgt.map_iterator_proto; }
@@ -1129,7 +1146,19 @@ impl JsRuntime {
         }
     }
 
+    pub fn add_gc_root_tracer<F: Fn(&mut Vec<ObjectId>) + 'static>(&mut self, tracer: F) {
+        self.host_root_tracers.push(Box::new(tracer));
+    }
+
     pub fn collect_garbage(&mut self) {
+        self.collect_garbage_inner(None);
+    }
+
+    pub fn collect_garbage_with_frame(&mut self, frame: &CallFrame) {
+        self.collect_garbage_inner(Some(frame));
+    }
+
+    fn collect_garbage_inner(&mut self, active_frame: Option<&CallFrame>) {
         let mut root_objs = vec![
             self.global_object,
             self.intrinsics.object_proto,
@@ -1154,12 +1183,15 @@ impl JsRuntime {
             self.intrinsics.set_proto,
             self.intrinsics.weak_map_proto,
             self.intrinsics.weak_set_proto,
+            self.intrinsics.weak_ref_proto,
+            self.intrinsics.finalization_registry_proto,
             self.intrinsics.promise_proto,
             self.intrinsics.array_buffer_proto,
             self.intrinsics.shared_array_buffer_proto,
             self.intrinsics.data_view_proto,
             self.intrinsics.typed_array_proto,
             self.intrinsics.iterator_proto,
+            self.intrinsics.async_iterator_proto,
             self.intrinsics.array_iterator_proto,
             self.intrinsics.string_iterator_proto,
             self.intrinsics.map_iterator_proto,
@@ -1226,12 +1258,15 @@ impl JsRuntime {
             root_objs.push(r.intrinsics.set_proto);
             root_objs.push(r.intrinsics.weak_map_proto);
             root_objs.push(r.intrinsics.weak_set_proto);
+            root_objs.push(r.intrinsics.weak_ref_proto);
+            root_objs.push(r.intrinsics.finalization_registry_proto);
             root_objs.push(r.intrinsics.promise_proto);
             root_objs.push(r.intrinsics.array_buffer_proto);
             root_objs.push(r.intrinsics.shared_array_buffer_proto);
             root_objs.push(r.intrinsics.data_view_proto);
             root_objs.push(r.intrinsics.typed_array_proto);
             root_objs.push(r.intrinsics.iterator_proto);
+            root_objs.push(r.intrinsics.async_iterator_proto);
             root_objs.push(r.intrinsics.array_iterator_proto);
             root_objs.push(r.intrinsics.string_iterator_proto);
             root_objs.push(r.intrinsics.map_iterator_proto);
@@ -1259,6 +1294,33 @@ impl JsRuntime {
             root_envs.push(r.global_env);
         }
         root_envs.extend_from_slice(&self.active_frames);
+        if let Some(frame) = active_frame {
+            trace_frame(frame, &mut root_objs, &mut root_envs);
+            trace_value(&frame.last_value, &mut root_objs);
+            if let Some(t) = frame.this_for_ctor {
+                root_objs.push(t);
+            }
+            if let Some(ap) = frame.async_promise {
+                root_objs.push(ap);
+            }
+            for h in &frame.handlers {
+                if let Some(ref sv) = h.saved_last_value {
+                    trace_value(sv, &mut root_objs);
+                }
+                match &h.pending {
+                    PendingCompletion::Return(v) => trace_value(v, &mut root_objs),
+                    PendingCompletion::Throw(JsError::Thrown(v)) => trace_value(v, &mut root_objs),
+                    _ => {}
+                }
+            }
+        }
+        root_objs.extend_from_slice(&self.call_stack_callees);
+        if let Some(ref nt) = self.native_new_target {
+            trace_value(nt, &mut root_objs);
+        }
+        for tracer in &self.host_root_tracers {
+            tracer(&mut root_objs);
+        }
         self.heap.collect_garbage(&root_objs, &root_envs);
     }
 
@@ -1725,8 +1787,43 @@ impl JsRuntime {
                 ObjectKind::TypedArray(ta) => {
                     let ta_clone = ta.clone();
                     if let Some(num_idx) = canonical_numeric_index_string(k) {
-                        self.typed_array_set_checked(obj, &ta_clone, num_idx, &val)?;
-                        return Ok(true);
+                        let is_imm = self
+                            .heap
+                            .buffer_meta
+                            .get(&ta_clone.buffer)
+                            .is_some_and(|m| m.immutable);
+                        if receiver == JsValue::Object(obj) {
+                            if is_imm {
+                                return Ok(false);
+                            }
+                            self.typed_array_set_checked(obj, &ta_clone, num_idx, &val)?;
+                            return Ok(true);
+                        }
+                        let Some(eff_len) = self.typed_array_effective_length(obj) else {
+                            return Ok(true);
+                        };
+                        if valid_integer_index(num_idx, eff_len).is_none() {
+                            return Ok(true);
+                        }
+                        if is_imm {
+                            return Ok(false);
+                        }
+                        let JsValue::Object(recv_id) = receiver else {
+                            return Ok(false);
+                        };
+                        if let Some(existing) = self.get_own_property_descriptor(recv_id, &key)? {
+                            if existing.is_accessor() || existing.writable == Some(false) {
+                                return Ok(false);
+                            }
+                            let mut value_desc = PropertyDescriptor::empty();
+                            value_desc.value = Some(val);
+                            return self.define_property(recv_id, key, value_desc);
+                        }
+                        return self.define_property(
+                            recv_id,
+                            key,
+                            PropertyDescriptor::data(val, true, true, true),
+                        );
                     }
                     0
                 }
@@ -2010,20 +2107,27 @@ impl JsRuntime {
                                 return Ok(false);
                             }
                             let plain = !desc.is_accessor()
-                                && desc.writable.unwrap_or(true)
-                                && desc.enumerable.unwrap_or(true)
-                                && desc.configurable.unwrap_or(true)
                                 && !arr.has_custom_index_props
-                                && (idx as usize) < 65_536;
+                                && (idx as usize) < 65_536
+                                && if exists {
+                                    desc.writable.unwrap_or(true)
+                                        && desc.enumerable.unwrap_or(true)
+                                        && desc.configurable.unwrap_or(true)
+                                } else {
+                                    desc.writable == Some(true)
+                                        && desc.enumerable == Some(true)
+                                        && desc.configurable == Some(true)
+                                };
                             if plain {
-                                let val = desc.value.clone().unwrap_or(JsValue::Undefined);
+                                let val = desc
+                                    .value
+                                    .clone()
+                                    .or_else(|| arr.get(idx as usize).cloned())
+                                    .unwrap_or(JsValue::Undefined);
                                 arr.set(idx as usize, val);
                                 (true, None)
                             } else {
                                 arr.has_custom_index_props = true;
-                                if (idx as usize) >= arr.length {
-                                    arr.length = (idx as usize) + 1;
-                                }
                                 (false, arr.get(idx as usize).cloned())
                             }
                         }
@@ -2038,6 +2142,48 @@ impl JsRuntime {
                             o.set_own_prop(key.clone(), PropEntry::data(ev, true, true, true));
                         }
                     }
+                    let ok = self.ordinary_define_own_property(obj, key, desc)?;
+                    if ok {
+                        if let ObjectKind::Array(ref mut arr) = self.heap.get_obj_mut(obj).kind {
+                            if (idx as usize) >= arr.length {
+                                arr.length = (idx as usize) + 1;
+                            }
+                        }
+                    }
+                    return Ok(ok);
+                }
+            }
+            let ta_clone = match &self.heap.get_obj(obj).kind {
+                ObjectKind::TypedArray(ta) => Some(ta.clone()),
+                _ => None,
+            };
+            if let Some(ta) = ta_clone {
+                if let Some(num_idx) = canonical_numeric_index_string(k) {
+                    let Some(eff_len) = self.typed_array_effective_length(obj) else {
+                        return Ok(false);
+                    };
+                    if valid_integer_index(num_idx, eff_len).is_none() {
+                        return Ok(false);
+                    }
+                    if self
+                        .heap
+                        .buffer_meta
+                        .get(&ta.buffer)
+                        .is_some_and(|m| m.immutable)
+                    {
+                        return Ok(false);
+                    }
+                    if desc.configurable == Some(false)
+                        || desc.is_accessor()
+                        || desc.enumerable == Some(false)
+                        || desc.writable == Some(false)
+                    {
+                        return Ok(false);
+                    }
+                    if let Some(ref v) = desc.value {
+                        self.typed_array_set_checked(obj, &ta, num_idx, v)?;
+                    }
+                    return Ok(true);
                 }
             }
             if matches!(self.heap.get_obj(obj).kind, ObjectKind::Arguments(_)) {
@@ -2220,7 +2366,22 @@ impl JsRuntime {
                 if cur_is_acc != desc.is_accessor() {
                     return Ok(false);
                 }
-                if !cur_is_acc && !cur.writable {
+                if cur_is_acc {
+                    if let PropValue::Accessor { ref get, ref set } = cur.value {
+                        if let Some(ref ng) = desc.get {
+                            let cg = get.as_ref().unwrap_or(&JsValue::Undefined);
+                            if !ng.same_value(cg) {
+                                return Ok(false);
+                            }
+                        }
+                        if let Some(ref ns) = desc.set {
+                            let cs = set.as_ref().unwrap_or(&JsValue::Undefined);
+                            if !ns.same_value(cs) {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                } else if !cur.writable {
                     if desc.writable == Some(true) {
                         return Ok(false);
                     }
@@ -2704,7 +2865,12 @@ impl JsRuntime {
                         if let Some(eff_len) = self.typed_array_effective_length(obj) {
                             if let Some(idx) = valid_integer_index(num_idx, eff_len) {
                                 let v = self.typed_array_get(&ta_clone, idx)?;
-                                return Ok(Some(PropertyDescriptor::data(v, true, true, true)));
+                                let is_imm = self
+                                    .heap
+                                    .buffer_meta
+                                    .get(&ta_clone.buffer)
+                                    .is_some_and(|m| m.immutable);
+                                return Ok(Some(PropertyDescriptor::data(v, !is_imm, true, !is_imm)));
                             }
                         }
                         return Ok(None);
@@ -3122,35 +3288,62 @@ impl JsRuntime {
         }
     }
 
-    pub fn relational_lt(&mut self, a: &JsValue, b: &JsValue) -> Result<Option<bool>, JsError> {
-        let px = self.to_primitive(a, "number")?;
-        let py = self.to_primitive(b, "number")?;
+    pub fn to_numeric(&mut self, val: &JsValue) -> Result<JsValue, JsError> {
+        let prim = self.to_primitive(val, "number")?;
+        if let JsValue::BigInt(n) = prim {
+            Ok(JsValue::BigInt(n))
+        } else {
+            Ok(JsValue::Number(self.to_number(&prim)?))
+        }
+    }
+
+    pub fn relational_lt(
+        &mut self,
+        a: &JsValue,
+        b: &JsValue,
+        left_first: bool,
+    ) -> Result<Option<bool>, JsError> {
+        let (px, py) = if left_first {
+            let x = self.to_primitive(a, "number")?;
+            let y = self.to_primitive(b, "number")?;
+            (x, y)
+        } else {
+            let y = self.to_primitive(b, "number")?;
+            let x = self.to_primitive(a, "number")?;
+            (x, y)
+        };
         if let (JsValue::String(sx), JsValue::String(sy)) = (&px, &py) {
             let ux: Vec<u16> = sx.encode_utf16().collect();
             let uy: Vec<u16> = sy.encode_utf16().collect();
             return Ok(Some(ux < uy));
         }
-        if let (JsValue::BigInt(x), JsValue::BigInt(y)) = (&px, &py) {
-            return Ok(Some(x < y));
-        }
-        if let (JsValue::BigInt(x), JsValue::Number(y)) = (&px, &py) {
-            if y.is_nan() {
+        if let (JsValue::BigInt(x), JsValue::String(sy)) = (&px, &py) {
+            let Some(ny) = parse_string_to_bigint(sy) else {
                 return Ok(None);
-            }
-            return Ok(Some((*x as f64) < *y));
+            };
+            return Ok(Some(*x < ny));
         }
-        if let (JsValue::Number(x), JsValue::BigInt(y)) = (&px, &py) {
-            if x.is_nan() {
+        if let (JsValue::String(sx), JsValue::BigInt(y)) = (&px, &py) {
+            let Some(nx) = parse_string_to_bigint(sx) else {
                 return Ok(None);
+            };
+            return Ok(Some(nx < *y));
+        }
+        let nx = self.to_numeric(&px)?;
+        let ny = self.to_numeric(&py)?;
+        match (&nx, &ny) {
+            (JsValue::BigInt(x), JsValue::BigInt(y)) => Ok(Some(x < y)),
+            (JsValue::Number(x), JsValue::Number(y)) => {
+                if x.is_nan() || y.is_nan() {
+                    Ok(None)
+                } else {
+                    Ok(Some(x < y))
+                }
             }
-            return Ok(Some(*x < (*y as f64)));
+            (JsValue::BigInt(x), JsValue::Number(y)) => Ok(cmp_bigint_f64(*x, *y).map(|o| o.is_lt())),
+            (JsValue::Number(x), JsValue::BigInt(y)) => Ok(cmp_bigint_f64(*y, *x).map(|o| o.is_gt())),
+            _ => Ok(None),
         }
-        let nx = self.to_number(&px)?;
-        let ny = self.to_number(&py)?;
-        if nx.is_nan() || ny.is_nan() {
-            return Ok(None);
-        }
-        Ok(Some(nx < ny))
     }
 
     pub fn instanceof(&mut self, lhs: &JsValue, rhs: &JsValue) -> Result<bool, JsError> {
@@ -3435,10 +3628,190 @@ impl JsRuntime {
             return Err(JsError::type_err("Value is not iterable"));
         }
         let iter = self.call_function(method, val.clone(), &[])?;
-        if !iter.is_object() {
+        let JsValue::Object(iter_oid) = iter else {
             return Err(JsError::type_err("Iterator must return an object"));
+        };
+        if is_async {
+            let next_fn = self.get_property(iter_oid, "next")?;
+            return Ok(JsValue::Object(
+                self.create_async_from_sync_iterator(iter_oid, next_fn),
+            ));
         }
         Ok(iter)
+    }
+
+    fn async_from_sync_continuation(
+        &mut self,
+        sync_iter: ObjectId,
+        result: JsValue,
+        out_p: ObjectId,
+    ) {
+        let step: Result<(bool, JsValue), JsError> = (|| {
+            let JsValue::Object(r_oid) = result else {
+                return Err(JsError::type_err("Iterator result is not an object"));
+            };
+            let done = self.get_property(r_oid, "done")?.to_boolean();
+            let val = self.get_property(r_oid, "value")?;
+            Ok((done, val))
+        })();
+        let (done, val) = match step {
+            Ok(pair) => pair,
+            Err(e) => {
+                let ev = self.error_to_js_value(e);
+                self.reject_promise(out_p, ev);
+                return;
+            }
+        };
+        let value_p = match self.promise_resolve_checked(val) {
+            Ok(p) => p,
+            Err(e) => {
+                if !done {
+                    self.iterator_close(&JsValue::Object(sync_iter));
+                }
+                let ev = self.error_to_js_value(e);
+                self.reject_promise(out_p, ev);
+                return;
+            }
+        };
+        let on_ok = self.create_native_function(
+            "",
+            1,
+            Rc::new(move |rt, _, a| {
+                let v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ir = rt.create_iter_result(v, done);
+                rt.resolve_promise(out_p, ir);
+                Ok(JsValue::Undefined)
+            }),
+        );
+        let on_err = self.create_native_function(
+            "",
+            1,
+            Rc::new(move |rt, _, a| {
+                let err = a.first().cloned().unwrap_or(JsValue::Undefined);
+                if !done {
+                    let _ = rt.iterator_close_checked(&JsValue::Object(sync_iter), true);
+                }
+                rt.reject_promise(out_p, err);
+                Ok(JsValue::Undefined)
+            }),
+        );
+        self.promise_then(
+            value_p,
+            Some(JsValue::Object(on_ok)),
+            Some(JsValue::Object(on_err)),
+        );
+    }
+
+    fn promise_resolve_checked(&mut self, value: JsValue) -> Result<ObjectId, JsError> {
+        if let JsValue::Object(oid) = value {
+            if matches!(self.heap.get_obj(oid).kind, ObjectKind::Promise(_)) {
+                let ctor = self.get_property(oid, "constructor")?;
+                if ctor == JsValue::Object(self.intrinsics.promise_ctor) {
+                    return Ok(oid);
+                }
+            }
+        }
+        let p = self.create_promise();
+        self.resolve_promise(p, value);
+        Ok(p)
+    }
+
+    fn create_async_from_sync_iterator(&mut self, sync_iter: ObjectId, next_fn: JsValue) -> ObjectId {
+        let obj = self.create_object_with_proto(Some(self.intrinsics.async_iterator_proto));
+        let next_method = next_fn;
+        let next_wrapper = self.create_native_function(
+            "next",
+            1,
+            Rc::new(move |rt, _, args| {
+                let out_p = rt.create_promise();
+                let call_args: &[JsValue] = if args.is_empty() { &[] } else { &args[..1] };
+                let res = rt.call_function(
+                    next_method.clone(),
+                    JsValue::Object(sync_iter),
+                    call_args,
+                );
+                match res {
+                    Ok(v) => rt.async_from_sync_continuation(sync_iter, v, out_p),
+                    Err(e) => {
+                        let ev = rt.error_to_js_value(e);
+                        rt.reject_promise(out_p, ev);
+                    }
+                }
+                Ok(JsValue::Object(out_p))
+            }),
+        );
+        let return_wrapper = self.create_native_function(
+            "return",
+            1,
+            Rc::new(move |rt, _, args| {
+                let out_p = rt.create_promise();
+                let ret_fn = match rt.get_property(sync_iter, "return") {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let ev = rt.error_to_js_value(e);
+                        rt.reject_promise(out_p, ev);
+                        return Ok(JsValue::Object(out_p));
+                    }
+                };
+                if ret_fn.is_nullish() {
+                    let v = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let ir = rt.create_iter_result(v, true);
+                    rt.resolve_promise(out_p, ir);
+                    return Ok(JsValue::Object(out_p));
+                }
+                let call_args: &[JsValue] = if args.is_empty() { &[] } else { &args[..1] };
+                let res = rt.call_function(ret_fn, JsValue::Object(sync_iter), call_args);
+                match res {
+                    Ok(v) => rt.async_from_sync_continuation(sync_iter, v, out_p),
+                    Err(e) => {
+                        let ev = rt.error_to_js_value(e);
+                        rt.reject_promise(out_p, ev);
+                    }
+                }
+                Ok(JsValue::Object(out_p))
+            }),
+        );
+        let throw_wrapper = self.create_native_function(
+            "throw",
+            1,
+            Rc::new(move |rt, _, args| {
+                let out_p = rt.create_promise();
+                let throw_fn = match rt.get_property(sync_iter, "throw") {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let ev = rt.error_to_js_value(e);
+                        rt.reject_promise(out_p, ev);
+                        return Ok(JsValue::Object(out_p));
+                    }
+                };
+                if throw_fn.is_nullish() {
+                    if let Err(e) = rt.iterator_close_checked(&JsValue::Object(sync_iter), false) {
+                        let ev = rt.error_to_js_value(e);
+                        rt.reject_promise(out_p, ev);
+                        return Ok(JsValue::Object(out_p));
+                    }
+                    let ev = rt.error_to_js_value(JsError::type_err(
+                        "The iterator does not provide a 'throw' method",
+                    ));
+                    rt.reject_promise(out_p, ev);
+                    return Ok(JsValue::Object(out_p));
+                }
+                let call_args: &[JsValue] = if args.is_empty() { &[] } else { &args[..1] };
+                let res = rt.call_function(throw_fn, JsValue::Object(sync_iter), call_args);
+                match res {
+                    Ok(v) => rt.async_from_sync_continuation(sync_iter, v, out_p),
+                    Err(e) => {
+                        let ev = rt.error_to_js_value(e);
+                        rt.reject_promise(out_p, ev);
+                    }
+                }
+                Ok(JsValue::Object(out_p))
+            }),
+        );
+        let _ = self.set_property(obj, "next", JsValue::Object(next_wrapper));
+        let _ = self.set_property(obj, "return", JsValue::Object(return_wrapper));
+        let _ = self.set_property(obj, "throw", JsValue::Object(throw_wrapper));
+        obj
     }
 
     pub fn iterator_step(&mut self, iter: &JsValue) -> Result<Option<JsValue>, JsError> {
@@ -3650,27 +4023,33 @@ impl JsRuntime {
             } else {
                 reaction.on_rejected
             };
+            let resolve_target = |rt: &mut JsRuntime, v: JsValue| {
+                if let Some(ref res_fn) = reaction.resolve {
+                    let _ = rt.call_function(res_fn.clone(), JsValue::Undefined, &[v]);
+                } else if let Some(target) = reaction.target {
+                    rt.resolve_promise(target, v);
+                }
+            };
+            let reject_target = |rt: &mut JsRuntime, r: JsValue| {
+                if let Some(ref rej_fn) = reaction.reject {
+                    let _ = rt.call_function(rej_fn.clone(), JsValue::Undefined, &[r]);
+                } else if let Some(target) = reaction.target {
+                    rt.reject_promise(target, r);
+                }
+            };
             match handler {
                 Some(h) if rt.is_callable(&h) => match rt.call_function(h, JsValue::Undefined, &[arg]) {
-                    Ok(v) => {
-                        if let Some(target) = reaction.target {
-                            rt.resolve_promise(target, v);
-                        }
-                    }
+                    Ok(v) => resolve_target(rt, v),
                     Err(e) => {
-                        if let Some(target) = reaction.target {
-                            let ev = rt.error_to_js_value(e);
-                            rt.reject_promise(target, ev);
-                        }
+                        let ev = rt.error_to_js_value(e);
+                        reject_target(rt, ev);
                     }
                 },
                 _ => {
-                    if let Some(target) = reaction.target {
-                        if fulfilled {
-                            rt.resolve_promise(target, arg);
-                        } else {
-                            rt.reject_promise(target, arg);
-                        }
+                    if fulfilled {
+                        resolve_target(rt, arg);
+                    } else {
+                        reject_target(rt, arg);
                     }
                 }
             }
@@ -3688,6 +4067,8 @@ impl JsRuntime {
             on_fulfilled: on_fulfilled.filter(|v| self.is_callable(v)),
             on_rejected: on_rejected.filter(|v| self.is_callable(v)),
             target: Some(next_promise),
+            resolve: None,
+            reject: None,
         };
         let state = match &mut self.heap.get_obj_mut(promise_id).kind {
             ObjectKind::Promise(p) => {
@@ -3707,6 +4088,40 @@ impl JsRuntime {
             self.schedule_promise_reaction(reaction, fulfilled, val);
         }
         next_promise
+    }
+
+    pub fn promise_then_with_capability(
+        &mut self,
+        promise_id: ObjectId,
+        on_fulfilled: Option<JsValue>,
+        on_rejected: Option<JsValue>,
+        resolve: JsValue,
+        reject: JsValue,
+    ) {
+        let reaction = PromiseReaction {
+            on_fulfilled: on_fulfilled.filter(|v| self.is_callable(v)),
+            on_rejected: on_rejected.filter(|v| self.is_callable(v)),
+            target: None,
+            resolve: Some(resolve),
+            reject: Some(reject),
+        };
+        let state = match &mut self.heap.get_obj_mut(promise_id).kind {
+            ObjectKind::Promise(p) => {
+                p.handled = true;
+                match &p.state {
+                    PromiseState::Pending => {
+                        p.reactions.push(reaction);
+                        return;
+                    }
+                    PromiseState::Fulfilled(v) => Some((true, v.clone())),
+                    PromiseState::Rejected(r) => Some((false, r.clone())),
+                }
+            }
+            _ => None,
+        };
+        if let Some((fulfilled, val)) = state {
+            self.schedule_promise_reaction(reaction, fulfilled, val);
+        }
     }
 
     pub fn create_iter_result(&mut self, value: JsValue, done: bool) -> JsValue {
@@ -3766,6 +4181,77 @@ fn compute_func_length(params: &[crate::ast::Param]) -> usize {
         len += 1;
     }
     len
+}
+
+fn parse_string_to_bigint(s: &str) -> Option<i128> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Some(0);
+    }
+    let (neg, rest) = if let Some(r) = t.strip_prefix('-') {
+        (true, r)
+    } else if let Some(r) = t.strip_prefix('+') {
+        (false, r)
+    } else {
+        (false, t)
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let (radix, digits) = if !neg && !t.starts_with('+') {
+        if let Some(d) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+            (16, d)
+        } else if let Some(d) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+            (8, d)
+        } else if let Some(d) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+            (2, d)
+        } else {
+            (10, rest)
+        }
+    } else {
+        (10, rest)
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| (b as char).is_digit(radix)) {
+        return None;
+    }
+    let u = u128::from_str_radix(digits, radix).ok()?;
+    if neg {
+        if u == (i128::MAX as u128) + 1 {
+            Some(i128::MIN)
+        } else {
+            i128::try_from(u).ok().map(|v| -v)
+        }
+    } else {
+        i128::try_from(u).ok()
+    }
+}
+
+fn cmp_bigint_f64(b: i128, n: f64) -> Option<std::cmp::Ordering> {
+    if n.is_nan() {
+        return None;
+    }
+    if n.is_infinite() {
+        return Some(if n.is_sign_positive() {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        });
+    }
+    if n >= 170141183460469231731687303715884105728.0 {
+        return Some(std::cmp::Ordering::Less);
+    }
+    if n < -170141183460469231731687303715884105728.0 {
+        return Some(std::cmp::Ordering::Greater);
+    }
+    let fl = n.floor();
+    let fi = fl as i128;
+    if fl == n {
+        Some(b.cmp(&fi))
+    } else if b <= fi {
+        Some(std::cmp::Ordering::Less)
+    } else {
+        Some(std::cmp::Ordering::Greater)
+    }
 }
 
 pub fn canonical_numeric_index_string(s: &str) -> Option<f64> {

@@ -44,6 +44,7 @@ pub fn init(rt: &mut JsRuntime) {
                 ("multiline", 'm'),
                 ("dotAll", 's'),
                 ("unicode", 'u'),
+                ("unicodeSets", 'v'),
                 ("sticky", 'y'),
             ] {
                 if rt.get_property(oid, prop)?.to_boolean() {
@@ -60,6 +61,7 @@ pub fn init(rt: &mut JsRuntime) {
         ("multiline", |f| f.multiline),
         ("dotAll", |f| f.dot_all),
         ("unicode", |f| f.unicode),
+        ("unicodeSets", |f| f.unicode_sets),
         ("sticky", |f| f.sticky),
         ("hasIndices", |f| f.has_indices),
     ] {
@@ -106,12 +108,7 @@ pub fn init(rt: &mut JsRuntime) {
                 return Err(JsError::type_err("RegExp.prototype.test called on non-object"));
             };
             let input = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
-            let exec_fn = rt.get_property(oid, "exec")?;
-            let res = if rt.is_callable(&exec_fn) {
-                rt.call_function(exec_fn, this, &[JsValue::String(input)])?
-            } else {
-                regexp_exec(rt, oid, &input)?
-            };
+            let res = regexp_exec_step(rt, oid, &input)?;
             Ok(JsValue::Boolean(!res.is_null()))
         }),
     );
@@ -145,20 +142,18 @@ pub fn init(rt: &mut JsRuntime) {
                 return Err(JsError::type_err("RegExp.prototype[Symbol.match] called on non-object"));
             };
             let input = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
-            let global = rt.get_property(oid, "global")?.to_boolean();
+            let flags_v = rt.get_property(oid, "flags")?;
+            let flags_s = rt.to_string(&flags_v)?;
+            let global = flags_s.contains('g');
             if !global {
-                let exec_fn = rt.get_property(oid, "exec")?;
-                return rt.call_function(exec_fn, this, &[JsValue::String(input)]);
+                return regexp_exec_step(rt, oid, &input);
             }
-            let _ = rt.set_property(oid, "lastIndex", JsValue::Number(0.0));
+            let full_unicode = flags_s.contains('u') || flags_s.contains('v');
+            set_last_index(rt, oid, JsValue::Number(0.0))?;
+            let units: Vec<u16> = input.encode_utf16().collect();
             let mut results = Vec::new();
-            let exec_fn = rt.get_property(oid, "exec")?;
             loop {
-                let m = rt.call_function(
-                    exec_fn.clone(),
-                    this.clone(),
-                    &[JsValue::String(input.clone())],
-                )?;
+                let m = regexp_exec_step(rt, oid, &input)?;
                 if m.is_null() {
                     break;
                 }
@@ -167,12 +162,13 @@ pub fn init(rt: &mut JsRuntime) {
                 };
                 let s0 = rt.get_property(mid, "0")?;
                 let matched = rt.to_string(&s0)?;
+                results.push(JsValue::String(matched.clone()));
                 if matched.is_empty() {
                     let li = rt.get_property(oid, "lastIndex")?;
                     let n = to_length(rt.to_number(&li)?);
-                    let _ = rt.set_property(oid, "lastIndex", JsValue::Number((n + 1) as f64));
+                    let next_idx = advance_string_index(&units, n, full_unicode);
+                    set_last_index(rt, oid, JsValue::Number(next_idx as f64))?;
                 }
-                results.push(JsValue::String(matched));
             }
             if results.is_empty() {
                 Ok(JsValue::Null)
@@ -196,25 +192,19 @@ pub fn init(rt: &mut JsRuntime) {
                 ));
             };
             let input = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
-            let (source, flags_str, global) = match &rt.heap.get_obj(oid).kind {
-                ObjectKind::RegExp(re) => (
-                    re.original_source.clone(),
-                    re.compiled.flags.canonical_string(),
-                    re.compiled.flags.global,
-                ),
-                _ => {
-                    let src = rt.get_property(oid, "source")?;
-                    let fl = rt.get_property(oid, "flags")?;
-                    let fs = rt.to_string(&fl)?;
-                    let g = fs.contains('g');
-                    (rt.to_string(&src)?, fs, g)
-                }
+            let ctor = rt.species_constructor(oid, rt.intrinsics.regexp_ctor)?;
+            let flags_v = rt.get_property(oid, "flags")?;
+            let flags_str = rt.to_string(&flags_v)?;
+            let global = flags_str.contains('g');
+            let matcher_val = rt.construct(ctor, &[this.clone(), JsValue::String(flags_str)])?;
+            let JsValue::Object(matcher) = matcher_val else {
+                return Err(JsError::type_err("RegExp species constructor returned non-object"));
             };
-            let clone = rt.create_regexp_object(&source, &flags_str)?;
             let li = rt.get_property(oid, "lastIndex")?;
-            let _ = rt.set_property(clone, "lastIndex", li);
+            let li_num = to_length(rt.to_number(&li)?);
+            set_last_index(rt, matcher, JsValue::Number(li_num as f64))?;
             let it = rt.create_builtin_iterator(BuiltinIteratorKind::RegExpMatchAll {
-                regexp: clone,
+                regexp: matcher,
                 input,
                 global,
                 done: false,
@@ -244,18 +234,17 @@ pub fn init(rt: &mut JsRuntime) {
             } else {
                 rt.to_string(&replace_val)?
             };
-            let global = rt.get_property(oid, "global")?.to_boolean();
+            let flags_v = rt.get_property(oid, "flags")?;
+            let flags_s = rt.to_string(&flags_v)?;
+            let global = flags_s.contains('g');
+            let full_unicode = flags_s.contains('u') || flags_s.contains('v');
             if global {
-                let _ = rt.set_property(oid, "lastIndex", JsValue::Number(0.0));
+                set_last_index(rt, oid, JsValue::Number(0.0))?;
             }
-            let exec_fn = rt.get_property(oid, "exec")?;
+            let units: Vec<u16> = input.encode_utf16().collect();
             let mut matches = Vec::new();
             loop {
-                let m = rt.call_function(
-                    exec_fn.clone(),
-                    this.clone(),
-                    &[JsValue::String(input.clone())],
-                )?;
+                let m = regexp_exec_step(rt, oid, &input)?;
                 if m.is_null() {
                     break;
                 }
@@ -270,10 +259,10 @@ pub fn init(rt: &mut JsRuntime) {
                 if rt.to_string(&s0)?.is_empty() {
                     let li = rt.get_property(oid, "lastIndex")?;
                     let n = to_length(rt.to_number(&li)?);
-                    let _ = rt.set_property(oid, "lastIndex", JsValue::Number((n + 1) as f64));
+                    let next_idx = advance_string_index(&units, n, full_unicode);
+                    set_last_index(rt, oid, JsValue::Number(next_idx as f64))?;
                 }
             }
-            let units: Vec<u16> = input.encode_utf16().collect();
             let mut out = String::new();
             let mut next_pos = 0usize;
             for mid in matches {
@@ -285,9 +274,6 @@ pub fn init(rt: &mut JsRuntime) {
                 let idx_v = rt.get_property(mid, "index")?;
                 let pos = to_integer_or_infinity(rt.to_number(&idx_v)?)
                     .clamp(0.0, units.len() as f64) as usize;
-                if pos < next_pos {
-                    continue;
-                }
                 let mut caps: Vec<Option<String>> = Vec::with_capacity(n_caps - 1);
                 for i in 1..n_caps {
                     let v = rt.get_property(mid, &i.to_string())?;
@@ -330,6 +316,23 @@ pub fn init(rt: &mut JsRuntime) {
                             }
                         }
                         Some(hm)
+                    } else if !groups_val.is_undefined() {
+                        let gid = rt.to_object(&groups_val)?;
+                        let mut hm = HashMap::new();
+                        for k in rt.own_keys(gid)? {
+                            if let PropertyKey::String(s) = k {
+                                let v = rt.get_property(gid, &s)?;
+                                hm.insert(
+                                    s,
+                                    if v.is_undefined() {
+                                        None
+                                    } else {
+                                        Some(rt.to_string(&v)?)
+                                    },
+                                );
+                            }
+                        }
+                        Some(hm)
                     } else {
                         None
                     };
@@ -342,9 +345,11 @@ pub fn init(rt: &mut JsRuntime) {
                         named_map.as_ref(),
                     )
                 };
-                out.push_str(&String::from_utf16_lossy(&units[next_pos..pos]));
-                out.push_str(&repl);
-                next_pos = (pos + matched_len).min(units.len());
+                if pos >= next_pos {
+                    out.push_str(&String::from_utf16_lossy(&units[next_pos..pos]));
+                    out.push_str(&repl);
+                    next_pos = (pos + matched_len).min(units.len());
+                }
             }
             out.push_str(&String::from_utf16_lossy(&units[next_pos..]));
             Ok(JsValue::String(out))
@@ -366,10 +371,14 @@ pub fn init(rt: &mut JsRuntime) {
             };
             let input = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
             let prev = rt.get_property(oid, "lastIndex")?;
-            let _ = rt.set_property(oid, "lastIndex", JsValue::Number(0.0));
-            let exec_fn = rt.get_property(oid, "exec")?;
-            let m = rt.call_function(exec_fn, this, &[JsValue::String(input)])?;
-            let _ = rt.set_property(oid, "lastIndex", prev);
+            if !prev.same_value(&JsValue::Number(0.0)) {
+                set_last_index(rt, oid, JsValue::Number(0.0))?;
+            }
+            let m = regexp_exec_step(rt, oid, &input)?;
+            let curr = rt.get_property(oid, "lastIndex")?;
+            if !curr.same_value(&prev) {
+                set_last_index(rt, oid, prev)?;
+            }
             if m.is_null() {
                 Ok(JsValue::Number(-1.0))
             } else if let JsValue::Object(mid) = m {
@@ -394,6 +403,19 @@ pub fn init(rt: &mut JsRuntime) {
                 ));
             };
             let input = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
+            let ctor = rt.species_constructor(oid, rt.intrinsics.regexp_ctor)?;
+            let flags_v = rt.get_property(oid, "flags")?;
+            let flags_s = rt.to_string(&flags_v)?;
+            let unicode_matching = flags_s.contains('u') || flags_s.contains('v');
+            let new_flags = if flags_s.contains('y') {
+                flags_s
+            } else {
+                format!("{}y", flags_s)
+            };
+            let splitter_val = rt.construct(ctor, &[this.clone(), JsValue::String(new_flags)])?;
+            let JsValue::Object(splitter) = splitter_val else {
+                return Err(JsError::type_err("RegExp species constructor returned non-object"));
+            };
             let limit = match args.get(1) {
                 None | Some(JsValue::Undefined) => u32::MAX as usize,
                 Some(v) => to_uint32(rt.to_number(v)?) as usize,
@@ -401,25 +423,10 @@ pub fn init(rt: &mut JsRuntime) {
             if limit == 0 {
                 return Ok(JsValue::Object(rt.create_array(Vec::new())));
             }
-            let (source, mut flags_str) = match &rt.heap.get_obj(oid).kind {
-                ObjectKind::RegExp(re) => (
-                    re.original_source.clone(),
-                    re.compiled.flags.canonical_string(),
-                ),
-                _ => {
-                    let sp = rt.get_property(oid, "source")?;
-                    let fp = rt.get_property(oid, "flags")?;
-                    (rt.to_string(&sp)?, rt.to_string(&fp)?)
-                }
-            };
-            if !flags_str.contains('y') {
-                flags_str.push('y');
-            }
-            let splitter = rt.create_regexp_object(&source, &flags_str)?;
             let units: Vec<u16> = input.encode_utf16().collect();
             let size = units.len();
             if size == 0 {
-                let m = regexp_exec(rt, splitter, &input)?;
+                let m = regexp_exec_step(rt, splitter, &input)?;
                 if !m.is_null() {
                     return Ok(JsValue::Object(rt.create_array(Vec::new())));
                 }
@@ -429,16 +436,16 @@ pub fn init(rt: &mut JsRuntime) {
             let mut p = 0usize;
             let mut q = 0usize;
             while q < size {
-                let _ = rt.set_property(splitter, "lastIndex", JsValue::Number(q as f64));
-                let m = regexp_exec(rt, splitter, &input)?;
+                set_last_index(rt, splitter, JsValue::Number(q as f64))?;
+                let m = regexp_exec_step(rt, splitter, &input)?;
                 if m.is_null() {
-                    q += 1;
+                    q = advance_string_index(&units, q, unicode_matching);
                     continue;
                 }
                 let li_v = rt.get_property(splitter, "lastIndex")?;
                 let e = to_length(rt.to_number(&li_v)?).min(size);
                 if e == p {
-                    q += 1;
+                    q = advance_string_index(&units, q, unicode_matching);
                     continue;
                 }
                 out.push(JsValue::String(String::from_utf16_lossy(&units[p..q])));
@@ -571,6 +578,43 @@ fn is_regexp_val(rt: &mut JsRuntime, val: &JsValue) -> Result<bool, JsError> {
     Ok(matches!(rt.heap.get_obj(*oid).kind, ObjectKind::RegExp(_)))
 }
 
+fn set_last_index(rt: &mut JsRuntime, oid: ObjectId, val: JsValue) -> Result<(), JsError> {
+    rt.set_property_key_strict(oid, PropertyKey::String("lastIndex".into()), val, true)?;
+    Ok(())
+}
+
+fn regexp_exec_step(rt: &mut JsRuntime, oid: ObjectId, input: &str) -> Result<JsValue, JsError> {
+    let exec_fn = rt.get_property(oid, "exec")?;
+    if rt.is_callable(&exec_fn) {
+        let res = rt.call_function(
+            exec_fn,
+            JsValue::Object(oid),
+            &[JsValue::String(input.to_string())],
+        )?;
+        if !res.is_null() && !matches!(res, JsValue::Object(_)) {
+            return Err(JsError::type_err(
+                "RegExp exec method returned something other than an Object or null",
+            ));
+        }
+        return Ok(res);
+    }
+    regexp_exec(rt, oid, input)
+}
+
+fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
+    if !unicode || index + 1 >= units.len() {
+        return index + 1;
+    }
+    let first = units[index];
+    if (0xD800..=0xDBFF).contains(&first) {
+        let second = units[index + 1];
+        if (0xDC00..=0xDFFF).contains(&second) {
+            return index + 2;
+        }
+    }
+    index + 1
+}
+
 pub(crate) fn regexp_exec(rt: &mut JsRuntime, oid: ObjectId, input: &str) -> Result<JsValue, JsError> {
     let compiled = match &rt.heap.get_obj(oid).kind {
         ObjectKind::RegExp(re) => re.compiled.clone(),
@@ -588,19 +632,19 @@ pub(crate) fn regexp_exec(rt: &mut JsRuntime, oid: ObjectId, input: &str) -> Res
     let units: Vec<u16> = input.encode_utf16().collect();
     if last_index > units.len() {
         if global || sticky {
-            let _ = rt.set_property(oid, "lastIndex", JsValue::Number(0.0));
+            set_last_index(rt, oid, JsValue::Number(0.0))?;
         }
         return Ok(JsValue::Null);
     }
     let Some(m) = compiled.exec_utf16(&units, last_index) else {
         if global || sticky {
-            let _ = rt.set_property(oid, "lastIndex", JsValue::Number(0.0));
+            set_last_index(rt, oid, JsValue::Number(0.0))?;
         }
         return Ok(JsValue::Null);
     };
     if global || sticky {
         last_index = m.end;
-        let _ = rt.set_property(oid, "lastIndex", JsValue::Number(last_index as f64));
+        set_last_index(rt, oid, JsValue::Number(last_index as f64))?;
     }
     let mut elems = Vec::with_capacity(m.captures.len());
     for cap in &m.captures {

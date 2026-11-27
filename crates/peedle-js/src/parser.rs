@@ -6,6 +6,7 @@ use std::rc::Rc;
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
     cur: Token,
+    last_token_end: usize,
     strict: bool,
     is_module: bool,
     in_async: bool,
@@ -54,6 +55,7 @@ impl<'a> Parser<'a> {
         let mut parser = Parser {
             lexer,
             cur,
+            last_token_end: 0,
             strict: initial_strict || is_module,
             is_module,
             in_async: is_module,
@@ -113,6 +115,7 @@ impl<'a> Parser<'a> {
             }
         }
         let prev = std::mem::replace(&mut self.cur, self.lexer.next_token(allow_regexp)?);
+        self.last_token_end = prev.end;
         Ok(prev)
     }
 
@@ -366,7 +369,7 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::FuncDecl(func))
             }
             TokenKind::Ident(s, false) if s == "async" => {
-                let next = self.peek_next(true)?;
+                let next = self.peek_next(false)?;
                 if !next.preceded_by_newline && next.kind == TokenKind::KwFunction {
                     let func = self.parse_function(true, true)?;
                     Ok(Stmt::FuncDecl(func))
@@ -406,7 +409,7 @@ impl<'a> Parser<'a> {
                 ));
             }
             TokenKind::Ident(s, false) if s == "let" => {
-                let next = self.peek_next(true)?;
+                let next = self.peek_next(false)?;
                 let forbidden = next.kind == TokenKind::LBracket
                     || (!next.preceded_by_newline
                         && matches!(
@@ -442,7 +445,7 @@ impl<'a> Parser<'a> {
                 }
             }
             TokenKind::Ident(s, false) if s == "async" => {
-                let next = self.peek_next(true)?;
+                let next = self.peek_next(false)?;
                 if !next.preceded_by_newline && next.kind == TokenKind::KwFunction {
                     return Err(JsError::syntax(
                         "Async function declaration cannot appear in a single-statement context",
@@ -461,7 +464,7 @@ impl<'a> Parser<'a> {
     }
 
     fn is_using_decl_start(&self) -> Result<bool, JsError> {
-        let next = self.peek_next(true)?;
+        let next = self.peek_next(false)?;
         if next.preceded_by_newline {
             return Ok(false);
         }
@@ -491,7 +494,7 @@ impl<'a> Parser<'a> {
     }
 
     fn is_let_decl_start(&self) -> Result<bool, JsError> {
-        let next = self.peek_next(true)?;
+        let next = self.peek_next(false)?;
         if next.preceded_by_newline {
             if self.in_async && matches!(next.kind, TokenKind::KwAwait) {
                 return Ok(true);
@@ -896,7 +899,7 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LParen, true)?;
         let object = self.parse_expr(true)?;
         self.expect(&TokenKind::RParen, true)?;
-        let body = Box::new(self.parse_stmt()?);
+        let body = Box::new(self.parse_sub_stmt(false)?);
         Ok(Stmt::With { object, body })
     }
 
@@ -929,7 +932,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwAwait if !self.in_async => "await".to_string(),
             _ => return Ok(None),
         };
-        let next = self.peek_next(true)?;
+        let next = self.peek_next(false)?;
         if next.kind == TokenKind::Colon {
             Ok(Some(name))
         } else {
@@ -937,7 +940,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_function(&mut self, require_name: bool, _is_decl: bool) -> Result<Rc<FuncNode>, JsError> {
+    fn parse_function(&mut self, require_name: bool, is_decl: bool) -> Result<Rc<FuncNode>, JsError> {
         let func_start = self.cur.start;
         let is_async = if self.is_ident_word("async") {
             self.advance(true)?;
@@ -965,9 +968,9 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LParen, true)?;
         let params = self.parse_param_list()?;
         self.expect(&TokenKind::RParen, true)?;
-        let (body, strict, has_use_strict) = self.parse_func_body_block_info()?;
+        let (body, strict, has_use_strict) = self.parse_func_body_block_info(is_decl)?;
         validate_func_params(&params, strict, has_use_strict, false)?;
-        let func_end = self.cur.start.min(self.lexer.source().len());
+        let func_end = self.last_token_end.min(self.lexer.source().len());
 
         self.in_async = prev_async;
         self.in_generator = prev_gen;
@@ -986,12 +989,10 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn parse_func_body_block(&mut self) -> Result<(Vec<Stmt>, bool), JsError> {
-        let (stmts, strict, _) = self.parse_func_body_block_info()?;
-        Ok((stmts, strict))
-    }
-
-    fn parse_func_body_block_info(&mut self) -> Result<(Vec<Stmt>, bool, bool), JsError> {
+    fn parse_func_body_block_info(
+        &mut self,
+        allow_regexp_after: bool,
+    ) -> Result<(Vec<Stmt>, bool, bool), JsError> {
         self.expect(&TokenKind::LBrace, true)?;
         let mut stmts = Vec::new();
         let mut checking = true;
@@ -1029,7 +1030,7 @@ impl<'a> Parser<'a> {
             }
             stmts.push(st);
         }
-        self.expect(&TokenKind::RBrace, true)?;
+        self.expect(&TokenKind::RBrace, allow_regexp_after)?;
         self.strict = prev_strict;
         Ok((stmts, strict, has_use_strict))
     }
@@ -1127,6 +1128,7 @@ impl<'a> Parser<'a> {
             }
         }
 
+        let method_start = self.cur.start;
         let mut is_async = false;
         let mut is_generator = false;
         let mut kind = MethodKind::Method;
@@ -1173,7 +1175,7 @@ impl<'a> Parser<'a> {
                     kind = MethodKind::Constructor;
                 }
             }
-            let func = self.parse_method_func(is_async, is_generator, None)?;
+            let func = self.parse_method_func(method_start, is_async, is_generator, None)?;
             return Ok(ClassElement::Method {
                 key,
                 kind,
@@ -1234,11 +1236,11 @@ impl<'a> Parser<'a> {
 
     fn parse_method_func(
         &mut self,
+        start: usize,
         is_async: bool,
         is_generator: bool,
         name: Option<String>,
     ) -> Result<Rc<FuncNode>, JsError> {
-        let start = self.cur.start;
         let prev_async = self.in_async;
         let prev_gen = self.in_generator;
         let prev_fn = self.in_function;
@@ -1249,8 +1251,9 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LParen, true)?;
         let params = self.parse_param_list()?;
         self.expect(&TokenKind::RParen, true)?;
-        let (body, strict) = self.parse_func_body_block()?;
-        let end = self.cur.start.min(self.lexer.source().len());
+        let (body, strict, has_use_strict) = self.parse_func_body_block_info(true)?;
+        validate_func_params(&params, strict, has_use_strict, false)?;
+        let end = self.last_token_end.min(self.lexer.source().len());
 
         self.in_async = prev_async;
         self.in_generator = prev_gen;
@@ -1421,7 +1424,7 @@ impl<'a> Parser<'a> {
 
     fn try_parse_arrow(&mut self, allow_in: bool) -> Result<Option<Expr>, JsError> {
         let is_async_arrow = if self.is_ident_word("async") {
-            let next = self.peek_next(true)?;
+            let next = self.peek_next(false)?;
             if !next.preceded_by_newline {
                 if matches!(next.kind, TokenKind::LParen) {
                     self.is_paren_followed_by_arrow(true)
@@ -1558,14 +1561,14 @@ impl<'a> Parser<'a> {
         self.in_function = true;
 
         let (body, strict, has_use_strict) = if self.cur.kind == TokenKind::LBrace {
-            let (stmts, st, hs) = self.parse_func_body_block_info()?;
+            let (stmts, st, hs) = self.parse_func_body_block_info(false)?;
             (FuncBody::Block(stmts), st, hs)
         } else {
             let expr = self.parse_assign_expr(allow_in)?;
             (FuncBody::Expr(Box::new(expr)), self.strict, false)
         };
         validate_func_params(&params, strict, has_use_strict, true)?;
-        let end = self.cur.start.min(self.lexer.source().len());
+        let end = self.last_token_end.min(self.lexer.source().len());
 
         self.in_async = prev_async;
         self.in_generator = prev_gen;
@@ -1599,6 +1602,16 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_binary_expr(&mut self, min_prec: u8, allow_in: bool) -> Result<Expr, JsError> {
+        let left_was_unary = matches!(
+            self.cur.kind,
+            TokenKind::Plus
+                | TokenKind::Minus
+                | TokenKind::Bang
+                | TokenKind::Tilde
+                | TokenKind::KwTypeof
+                | TokenKind::KwVoid
+                | TokenKind::KwDelete
+        ) || (self.in_async && self.cur.kind == TokenKind::KwAwait);
         let mut left = if let TokenKind::PrivateIdent(name) = self.cur.kind.clone() {
             self.advance(false)?;
             if !allow_in || self.cur.kind != TokenKind::KwIn {
@@ -1613,6 +1626,11 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_unary_expr()?
         };
+        if left_was_unary && self.cur.kind == TokenKind::StarStar {
+            return Err(JsError::syntax(
+                "Unary operator used immediately before exponentiation expression",
+            ));
+        }
 
         let mut saw_coalesce = false;
         let mut saw_logical_and_or = false;
@@ -1987,7 +2005,7 @@ impl<'a> Parser<'a> {
                 Ok(Expr::DynamicImport(Box::new(spec)))
             }
             TokenKind::Ident(s, false) if s == "async" => {
-                let next = self.peek_next(true)?;
+                let next = self.peek_next(false)?;
                 if !next.preceded_by_newline && next.kind == TokenKind::KwFunction {
                     let func = self.parse_function(false, false)?;
                     Ok(Expr::Function(func))
@@ -2077,6 +2095,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            let method_start = self.cur.start;
             let mut is_async = false;
             let mut is_generator = false;
             let mut method_kind = None;
@@ -2127,7 +2146,7 @@ impl<'a> Parser<'a> {
                     PropKey::Ident(s) | PropKey::String(s) => Some(s.clone()),
                     _ => None,
                 };
-                let func = self.parse_method_func(is_async, is_generator, name)?;
+                let func = self.parse_method_func(method_start, is_async, is_generator, name)?;
                 props.push(ObjectProp::Method { key, kind, func });
             } else if self.eat(&TokenKind::Colon, true)? {
                 let value = self.parse_assign_expr(true)?;
@@ -3462,8 +3481,13 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
         }
         Expr::OptionalChain(e)
         | Expr::DynamicImport(e)
-        | Expr::Unary { arg: e, .. }
-        | Expr::Update { arg: e, .. } => validate_expr(e, ctx),
+        | Expr::Unary { arg: e, .. } => validate_expr(e, ctx),
+        Expr::Update { arg: e, .. } => {
+            if let Expr::Ident(n) = e.as_ref() {
+                check_strict_binding_name(n, ctx.strict)?;
+            }
+            validate_expr(e, ctx)
+        }
         Expr::PrivateIn { right: e, .. } => {
             if !ctx.allow_private {
                 return Err(JsError::syntax("Private identifier outside class"));

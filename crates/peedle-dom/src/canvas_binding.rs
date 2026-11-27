@@ -227,6 +227,57 @@ pub fn define_canvas2d_proto(rt: &mut JsRuntime, dom: SharedDom, proto: ObjectId
         Ok(JsValue::Undefined)
     });
 
+    cv_method!("roundRect", 5, |rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, args: &[JsValue]| {
+        let x = arg_f32(rt, args, 0, 0.0);
+        let y = arg_f32(rt, args, 1, 0.0);
+        let w = arg_f32(rt, args, 2, 0.0);
+        let h = arg_f32(rt, args, 3, 0.0);
+        let r = arg_f32(rt, args, 4, 0.0);
+        if let Some(cv) = dm.borrow_mut().canvases.get_mut(&nid) {
+            cv.round_rect(x, y, w, h, r);
+        }
+        Ok(JsValue::Undefined)
+    });
+
+    cv_method!("ellipse", 7, |rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, args: &[JsValue]| {
+        let cx = arg_f32(rt, args, 0, 0.0);
+        let cy = arg_f32(rt, args, 1, 0.0);
+        let rx = arg_f32(rt, args, 2, 0.0);
+        let ry = arg_f32(rt, args, 3, 0.0);
+        let rot = arg_f32(rt, args, 4, 0.0);
+        let sa = arg_f32(rt, args, 5, 0.0);
+        let ea = arg_f32(rt, args, 6, std::f32::consts::TAU);
+        let ccw = args.get(7).map_or(false, |v| rt.to_boolean(v));
+        if let Some(cv) = dm.borrow_mut().canvases.get_mut(&nid) {
+            cv.ellipse(cx, cy, rx, ry, rot, sa, ea, ccw);
+        }
+        Ok(JsValue::Undefined)
+    });
+
+    cv_method!("quadraticCurveTo", 4, |rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, args: &[JsValue]| {
+        let cpx = arg_f32(rt, args, 0, 0.0);
+        let cpy = arg_f32(rt, args, 1, 0.0);
+        let x = arg_f32(rt, args, 2, 0.0);
+        let y = arg_f32(rt, args, 3, 0.0);
+        if let Some(cv) = dm.borrow_mut().canvases.get_mut(&nid) {
+            cv.quadratic_curve_to(cpx, cpy, x, y);
+        }
+        Ok(JsValue::Undefined)
+    });
+
+    cv_method!("bezierCurveTo", 6, |rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, args: &[JsValue]| {
+        let cp1x = arg_f32(rt, args, 0, 0.0);
+        let cp1y = arg_f32(rt, args, 1, 0.0);
+        let cp2x = arg_f32(rt, args, 2, 0.0);
+        let cp2y = arg_f32(rt, args, 3, 0.0);
+        let x = arg_f32(rt, args, 4, 0.0);
+        let y = arg_f32(rt, args, 5, 0.0);
+        if let Some(cv) = dm.borrow_mut().canvases.get_mut(&nid) {
+            cv.bezier_curve_to(cp1x, cp1y, cp2x, cp2y, x, y);
+        }
+        Ok(JsValue::Undefined)
+    });
+
     cv_method!("arc", 5, |rt: &mut JsRuntime, dm: &SharedDom, nid: NodeId, args: &[JsValue]| {
         let x = arg_f32(rt, args, 0, 0.0);
         let y = arg_f32(rt, args, 1, 0.0);

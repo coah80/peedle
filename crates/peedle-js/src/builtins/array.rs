@@ -597,7 +597,8 @@ pub fn init(rt: &mut JsRuntime) {
                 return Err(JsError::type_err("Callback is not a function"));
             }
             let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-            let mut kept = Vec::new();
+            let out = array_species_create(rt, oid, 0)?;
+            let mut to = 0usize;
             for k in 0..len {
                 let pk = PropertyKey::String(k.to_string());
                 if rt.has_property(oid, &pk)? {
@@ -608,11 +609,12 @@ pub fn init(rt: &mut JsRuntime) {
                         &[v.clone(), JsValue::Number(k as f64), JsValue::Object(oid)],
                     )?;
                     if ok.to_boolean() {
-                        kept.push(v);
+                        create_data_property_or_throw(rt, out, PropertyKey::String(to.to_string()), v)?;
+                        to += 1;
                     }
                 }
             }
-            Ok(JsValue::Object(rt.create_array(kept)))
+            Ok(JsValue::Object(out))
         }),
     );
 
@@ -909,13 +911,15 @@ pub fn init(rt: &mut JsRuntime) {
         0,
         Rc::new(|rt, this, args| {
             let oid = rt.to_object(&this)?;
+            let len_v = rt.get_property(oid, "length")?;
+            let len = to_length(rt.to_number(&len_v)?);
             let depth = match args.first() {
                 None | Some(JsValue::Undefined) => 1.0,
                 Some(v) => to_integer_or_infinity(rt.to_number(v)?),
             };
-            let mut out = Vec::new();
-            flatten_into(rt, oid, depth, &mut out)?;
-            Ok(JsValue::Object(rt.create_array(out)))
+            let out = array_species_create(rt, oid, 0)?;
+            flatten_into_array(rt, out, oid, len, 0, depth, None, &JsValue::Undefined)?;
+            Ok(JsValue::Object(out))
         }),
     );
 
@@ -933,26 +937,9 @@ pub fn init(rt: &mut JsRuntime) {
                 return Err(JsError::type_err("Callback is not a function"));
             }
             let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-            let mut out = Vec::new();
-            for k in 0..len {
-                let pk = PropertyKey::String(k.to_string());
-                if rt.has_property(oid, &pk)? {
-                    let v = rt.get_property_key(oid, &pk)?;
-                    let res = rt.call_function(
-                        cb.clone(),
-                        this_arg.clone(),
-                        &[v, JsValue::Number(k as f64), JsValue::Object(oid)],
-                    )?;
-                    if is_array_val(rt, &res) {
-                        if let JsValue::Object(rid) = res {
-                            flatten_into(rt, rid, 0.0, &mut out)?;
-                        }
-                    } else {
-                        out.push(res);
-                    }
-                }
-            }
-            Ok(JsValue::Object(rt.create_array(out)))
+            let out = array_species_create(rt, oid, 0)?;
+            flatten_into_array(rt, out, oid, len, 0, 1.0, Some(&cb), &this_arg)?;
+            Ok(JsValue::Object(out))
         }),
     );
 
@@ -1550,28 +1537,61 @@ fn resolve_index(
     }
 }
 
-fn flatten_into(
+fn flatten_into_array(
     rt: &mut JsRuntime,
+    target: ObjectId,
     src: ObjectId,
+    src_len: usize,
+    start: usize,
     depth: f64,
-    out: &mut Vec<JsValue>,
-) -> Result<(), JsError> {
-    let len_v = rt.get_property(src, "length")?;
-    let len = to_length(rt.to_number(&len_v)?);
-    for k in 0..len {
+    mapper: Option<&JsValue>,
+    this_arg: &JsValue,
+) -> Result<usize, JsError> {
+    let mut target_index = start;
+    for k in 0..src_len {
         let pk = PropertyKey::String(k.to_string());
         if rt.has_property(src, &pk)? {
-            let v = rt.get_property_key(src, &pk)?;
-            if depth > 0.0 && is_array_val(rt, &v) {
-                if let JsValue::Object(sub_id) = v {
-                    flatten_into(rt, sub_id, depth - 1.0, out)?;
+            let mut elem = rt.get_property_key(src, &pk)?;
+            if let Some(m) = mapper {
+                elem = rt.call_function(
+                    m.clone(),
+                    this_arg.clone(),
+                    &[elem, JsValue::Number(k as f64), JsValue::Object(src)],
+                )?;
+            }
+            let should_flatten = if depth > 0.0 {
+                is_array_val_checked(rt, &elem)?
+            } else {
+                false
+            };
+            if should_flatten {
+                if let JsValue::Object(sub_id) = elem {
+                    let sub_len_v = rt.get_property(sub_id, "length")?;
+                    let sub_len = to_length(rt.to_number(&sub_len_v)?);
+                    let next_depth = if depth.is_infinite() { depth } else { depth - 1.0 };
+                    target_index = flatten_into_array(
+                        rt,
+                        target,
+                        sub_id,
+                        sub_len,
+                        target_index,
+                        next_depth,
+                        None,
+                        &JsValue::Undefined,
+                    )?;
                 }
             } else {
-                out.push(v);
+                create_data_property_or_throw(
+                    rt,
+                    target,
+                    PropertyKey::String(target_index.to_string()),
+                    elem,
+                )?;
+                target_index += 1;
             }
         }
     }
-    Ok(())
+    Ok(target_index)
 }
 
 fn compare_sort_elements(

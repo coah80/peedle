@@ -10,6 +10,8 @@ pub fn init(rt: &mut JsRuntime) {
     init_set(rt);
     init_weak_map(rt);
     init_weak_set(rt);
+    init_weak_ref(rt);
+    init_finalization_registry(rt);
 }
 
 fn init_map(rt: &mut JsRuntime) {
@@ -1357,4 +1359,168 @@ fn init_weak_set(rt: &mut JsRuntime) {
         }),
     );
     set_global(rt, "WeakSet", JsValue::Object(ctor));
+}
+
+fn init_weak_ref(rt: &mut JsRuntime) {
+    let proto = rt.intrinsics.weak_ref_proto;
+    let tag = rt.symbols.to_string_tag;
+    rt.heap.get_obj_mut(proto).set_own_prop(
+        PropertyKey::Symbol(tag),
+        PropEntry::data(JsValue::String("WeakRef".into()), false, false, true),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "deref",
+        0,
+        Rc::new(|rt, this, _| {
+            let JsValue::Object(oid) = this else {
+                return Err(JsError::type_err("WeakRef.prototype.deref called on non-object"));
+            };
+            match &rt.heap.get_obj(oid).kind {
+                ObjectKind::WeakRef(target) => Ok(target.clone().unwrap_or(JsValue::Undefined)),
+                _ => Err(JsError::type_err("WeakRef.prototype.deref called on non-WeakRef")),
+            }
+        }),
+    );
+
+    let ctor = rt.create_spec_constructor(
+        "WeakRef",
+        1,
+        proto,
+        Rc::new(|rt, _, args| {
+            rt.require_new_target("WeakRef")?;
+            let target = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if can_be_held_weakly(rt, &target).is_none() {
+                return Err(JsError::type_err("WeakRef target must be an object or non-registered symbol"));
+            }
+            let obj_proto = rt.get_prototype_from_new_target(rt.intrinsics.weak_ref_proto)?;
+            let wr = rt.heap.alloc_object(JsObject::new(
+                Some(obj_proto),
+                ObjectKind::WeakRef(Some(target)),
+            ));
+            Ok(JsValue::Object(wr))
+        }),
+    );
+    set_global(rt, "WeakRef", JsValue::Object(ctor));
+}
+
+fn init_finalization_registry(rt: &mut JsRuntime) {
+    let proto = rt.intrinsics.finalization_registry_proto;
+    let tag = rt.symbols.to_string_tag;
+    rt.heap.get_obj_mut(proto).set_own_prop(
+        PropertyKey::Symbol(tag),
+        PropEntry::data(JsValue::String("FinalizationRegistry".into()), false, false, true),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "register",
+        2,
+        Rc::new(|rt, this, args| {
+            let JsValue::Object(oid) = this else {
+                return Err(JsError::type_err(
+                    "FinalizationRegistry.prototype.register called on non-object",
+                ));
+            };
+            if !matches!(rt.heap.get_obj(oid).kind, ObjectKind::FinalizationRegistry(_)) {
+                return Err(JsError::type_err(
+                    "FinalizationRegistry.prototype.register called on non-FinalizationRegistry",
+                ));
+            }
+            let target = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let held_value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let unregister_token = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+            if can_be_held_weakly(rt, &target).is_none() {
+                return Err(JsError::type_err(
+                    "FinalizationRegistry target must be an object or non-registered symbol",
+                ));
+            }
+            if target.same_value(&held_value) {
+                return Err(JsError::type_err(
+                    "FinalizationRegistry target and heldValue must not be the same",
+                ));
+            }
+            let token_opt = if unregister_token.is_undefined() {
+                None
+            } else {
+                if can_be_held_weakly(rt, &unregister_token).is_none() {
+                    return Err(JsError::type_err(
+                        "FinalizationRegistry unregisterToken must be an object, non-registered symbol, or undefined",
+                    ));
+                }
+                Some(unregister_token)
+            };
+            if let ObjectKind::FinalizationRegistry(ref mut fr) = rt.heap.get_obj_mut(oid).kind {
+                fr.cells.push(FinalizationCell {
+                    target,
+                    held_value,
+                    unregister_token: token_opt,
+                });
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "unregister",
+        1,
+        Rc::new(|rt, this, args| {
+            let JsValue::Object(oid) = this else {
+                return Err(JsError::type_err(
+                    "FinalizationRegistry.prototype.unregister called on non-object",
+                ));
+            };
+            if !matches!(rt.heap.get_obj(oid).kind, ObjectKind::FinalizationRegistry(_)) {
+                return Err(JsError::type_err(
+                    "FinalizationRegistry.prototype.unregister called on non-FinalizationRegistry",
+                ));
+            }
+            let unregister_token = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if can_be_held_weakly(rt, &unregister_token).is_none() {
+                return Err(JsError::type_err(
+                    "FinalizationRegistry unregisterToken must be an object or non-registered symbol",
+                ));
+            }
+            let mut removed = false;
+            if let ObjectKind::FinalizationRegistry(ref mut fr) = rt.heap.get_obj_mut(oid).kind {
+                let before = fr.cells.len();
+                fr.cells.retain(|c| {
+                    !matches!(&c.unregister_token, Some(tok) if tok.same_value(&unregister_token))
+                });
+                removed = fr.cells.len() < before;
+            }
+            Ok(JsValue::Boolean(removed))
+        }),
+    );
+
+    let ctor = rt.create_spec_constructor(
+        "FinalizationRegistry",
+        1,
+        proto,
+        Rc::new(|rt, _, args| {
+            rt.require_new_target("FinalizationRegistry")?;
+            let cleanup = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !rt.is_callable(&cleanup) {
+                return Err(JsError::type_err(
+                    "FinalizationRegistry cleanup callback must be callable",
+                ));
+            }
+            let obj_proto =
+                rt.get_prototype_from_new_target(rt.intrinsics.finalization_registry_proto)?;
+            let fr = rt.heap.alloc_object(JsObject::new(
+                Some(obj_proto),
+                ObjectKind::FinalizationRegistry(FinalizationRegistryData {
+                    cleanup_callback: cleanup,
+                    cells: Vec::new(),
+                }),
+            ));
+            Ok(JsValue::Object(fr))
+        }),
+    );
+    set_global(rt, "FinalizationRegistry", JsValue::Object(ctor));
 }

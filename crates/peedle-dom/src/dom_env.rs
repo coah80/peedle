@@ -194,6 +194,13 @@ impl BrowserJsEnv {
         dom.borrow_mut().document_obj = Some(doc_obj);
         let _ = rt.set_property(global, "document", JsValue::Object(doc_obj));
 
+        let dom_for_gc = dom.clone();
+        rt.add_gc_root_tracer(move |roots| {
+            if let Ok(st) = dom_for_gc.try_borrow() {
+                st.trace_js_roots(roots);
+            }
+        });
+
         Self { rt, dom }
     }
 

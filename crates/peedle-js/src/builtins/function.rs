@@ -200,6 +200,9 @@ pub fn init(rt: &mut JsRuntime) {
                     "function {}() {{ [native code] }}",
                     nf.name
                 ))),
+                ObjectKind::Proxy(_) if rt.is_callable(&this) => {
+                    Ok(JsValue::String("function () { [native code] }".into()))
+                }
                 _ => Err(JsError::type_err(
                     "Function.prototype.toString requires that 'this' be a Function",
                 )),

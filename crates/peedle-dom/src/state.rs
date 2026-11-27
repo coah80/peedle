@@ -206,6 +206,80 @@ impl DomState {
         st
     }
 
+    pub fn trace_js_roots(&self, roots: &mut Vec<ObjectId>) {
+        fn push_val(v: &JsValue, roots: &mut Vec<ObjectId>) {
+            if let JsValue::Object(oid) = v {
+                roots.push(*oid);
+            }
+        }
+        if let Some(p) = self.protos {
+            roots.extend_from_slice(&[
+                p.event_target,
+                p.node,
+                p.element,
+                p.html_element,
+                p.svg_element,
+                p.document,
+                p.character_data,
+                p.text,
+                p.comment,
+                p.fragment,
+                p.shadow_root,
+                p.doctype,
+                p.event,
+                p.css_style_decl,
+                p.dom_token_list,
+                p.canvas2d,
+                p.url_proto,
+                p.url_search_params_proto,
+                p.headers_proto,
+                p.response_proto,
+                p.range_proto,
+                p.dom_exception_proto,
+                p.node_iterator_proto,
+                p.tree_walker_proto,
+            ]);
+        }
+        if let Some(doc_obj) = self.document_obj {
+            roots.push(doc_obj);
+        }
+        for &oid in self.node_wrappers.values() {
+            roots.push(oid);
+        }
+        for list in self.listeners.values() {
+            for entry in list {
+                push_val(&entry.callback, roots);
+            }
+        }
+        for entry in &self.window_listeners {
+            push_val(&entry.callback, roots);
+        }
+        for timer in &self.timers {
+            push_val(&timer.callback, roots);
+            for arg in &timer.args {
+                push_val(arg, roots);
+            }
+        }
+        for (data, origin) in &self.message_queue {
+            push_val(data, roots);
+            push_val(origin, roots);
+        }
+        for obs in &self.mutation_observers {
+            push_val(&obs.callback, roots);
+        }
+        for &oid in self.custom_elements.values() {
+            roots.push(oid);
+        }
+        for (_, state) in &self.history_stack {
+            push_val(state, roots);
+        }
+        for iter in &self.live_iterators {
+            if let Ok(it) = iter.try_borrow() {
+                push_val(&it.filter, roots);
+            }
+        }
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty_style = true;
         self.dirty_layout = true;

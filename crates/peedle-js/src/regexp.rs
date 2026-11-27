@@ -8,11 +8,16 @@ pub struct RegExpFlags {
     pub multiline: bool,
     pub dot_all: bool,
     pub unicode: bool,
+    pub unicode_sets: bool,
     pub sticky: bool,
     pub has_indices: bool,
 }
 
 impl RegExpFlags {
+    pub fn is_unicode(&self) -> bool {
+        self.unicode || self.unicode_sets
+    }
+
     pub fn parse(s: &str) -> Result<Self, JsError> {
         let mut flags = RegExpFlags::default();
         for ch in s.chars() {
@@ -42,8 +47,8 @@ impl RegExpFlags {
                     flags.dot_all = true;
                 }
                 'u' => {
-                    if flags.unicode {
-                        return Err(JsError::syntax("Duplicate regex flag 'u'"));
+                    if flags.unicode || flags.unicode_sets {
+                        return Err(JsError::syntax("Duplicate or incompatible regex flag 'u'"));
                     }
                     flags.unicode = true;
                 }
@@ -60,10 +65,10 @@ impl RegExpFlags {
                     flags.has_indices = true;
                 }
                 'v' => {
-                    if flags.unicode {
-                        return Err(JsError::syntax("Duplicate regex flag 'v'"));
+                    if flags.unicode_sets || flags.unicode {
+                        return Err(JsError::syntax("Duplicate or incompatible regex flag 'v'"));
                     }
-                    flags.unicode = true;
+                    flags.unicode_sets = true;
                 }
                 other => {
                     return Err(JsError::syntax(format!("Invalid regex flag '{}'", other)));
@@ -92,6 +97,9 @@ impl RegExpFlags {
         }
         if self.unicode {
             s.push('u');
+        }
+        if self.unicode_sets {
+            s.push('v');
         }
         if self.sticky {
             s.push('y');
@@ -193,7 +201,7 @@ impl CompiledRegExp {
             &root,
             parser.capture_count,
             &parser.named_groups,
-            flags.unicode,
+            flags.is_unicode(),
         )?;
         Ok(CompiledRegExp {
             source: if pattern.is_empty() {
@@ -375,13 +383,13 @@ impl<'a> RegexParser<'a> {
                 if self.try_parse_brace_quantifier()?.is_some() {
                     return Err(JsError::syntax("Nothing to repeat in regular expression"));
                 }
-                if self.flags.unicode {
+                if self.flags.is_unicode() {
                     return Err(JsError::syntax("Lone quantifier bracket in Unicode regex"));
                 }
                 self.pos += 1;
                 Ok((Node::Literal('{' as u32), empty))
             }
-            '}' | ']' if self.flags.unicode => {
+            '}' | ']' if self.flags.is_unicode() => {
                 Err(JsError::syntax("Lone bracket in Unicode regex"))
             }
             other => Ok((Node::Literal(other as u32), empty)),
@@ -694,7 +702,7 @@ impl<'a> RegexParser<'a> {
             'v' => Ok(Node::Literal(0x0B)),
             '0' => {
                 if self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-                    if self.flags.unicode {
+                    if self.flags.is_unicode() {
                         return Err(JsError::syntax("Invalid octal escape in Unicode regex"));
                     }
                     if !in_class && self.peek().is_some_and(|ch| ('0'..='7').contains(&ch)) {
@@ -726,7 +734,7 @@ impl<'a> RegexParser<'a> {
                 }
                 Ok(Node::Backref(num))
             }
-            '1'..='9' if in_class && self.flags.unicode => {
+            '1'..='9' if in_class && self.flags.is_unicode() => {
                 Err(JsError::syntax("Invalid decimal escape in Unicode character class"))
             }
             'k' if !in_class => {
@@ -734,7 +742,7 @@ impl<'a> RegexParser<'a> {
                     self.pos += 1;
                     let name = self.parse_group_name()?;
                     Ok(Node::NamedBackref(name))
-                } else if self.flags.unicode {
+                } else if self.flags.is_unicode() {
                     Err(JsError::syntax("Invalid named backreference in Unicode regex"))
                 } else {
                     Ok(Node::Literal('k' as u32))
@@ -743,7 +751,7 @@ impl<'a> RegexParser<'a> {
             'x' => {
                 if let Some(val) = self.try_read_hex(2) {
                     Ok(Node::Literal(val))
-                } else if self.flags.unicode {
+                } else if self.flags.is_unicode() {
                     Err(JsError::syntax("Invalid hex escape in Unicode regex"))
                 } else {
                     Ok(Node::Literal('x' as u32))
@@ -771,7 +779,7 @@ impl<'a> RegexParser<'a> {
                     }
                     if ok && val <= 0x10FFFF {
                         Ok(Node::Literal(val))
-                    } else if self.flags.unicode {
+                    } else if self.flags.is_unicode() {
                         Err(JsError::syntax("Invalid Unicode escape in regex"))
                     } else {
                         self.pos = saved;
@@ -779,7 +787,7 @@ impl<'a> RegexParser<'a> {
                     }
                 } else if let Some(val) = self.try_read_hex(4) {
                     Ok(Node::Literal(val))
-                } else if self.flags.unicode {
+                } else if self.flags.is_unicode() {
                     Err(JsError::syntax("Invalid Unicode escape in regex"))
                 } else {
                     Ok(Node::Literal('u' as u32))
@@ -792,7 +800,7 @@ impl<'a> RegexParser<'a> {
                         return Ok(Node::Literal((ch as u32) % 32));
                     }
                 }
-                if self.flags.unicode {
+                if self.flags.is_unicode() {
                     return Err(JsError::syntax("Invalid control escape in Unicode regex"));
                 }
                 Ok(Node::Literal('c' as u32))
@@ -810,7 +818,7 @@ impl<'a> RegexParser<'a> {
                 Ok(Node::UnicodeProp(prop, negated))
             }
             other => {
-                if self.flags.unicode
+                if self.flags.is_unicode()
                     && !matches!(
                         other,
                         '^' | '$'
@@ -866,17 +874,55 @@ impl<'a> RegexParser<'a> {
                 self.pos += 1;
                 return Ok(Node::CharClass { negated, atoms });
             }
+            if self.flags.unicode_sets && c != '\\' {
+                if matches!(c, '(' | ')' | '[' | '{' | '}' | '/' | '-' | '|') {
+                    return Err(JsError::syntax(
+                        "Invalid character in unicodeSets character class",
+                    ));
+                }
+                if matches!(
+                    c,
+                    '&' | '!'
+                        | '#'
+                        | '$'
+                        | '%'
+                        | '*'
+                        | '+'
+                        | ','
+                        | '.'
+                        | ':'
+                        | ';'
+                        | '<'
+                        | '='
+                        | '>'
+                        | '?'
+                        | '@'
+                        | '^'
+                        | '`'
+                        | '~'
+                ) && self.chars.get(self.pos + 1) == Some(&c)
+                {
+                    return Err(JsError::syntax(
+                        "Invalid double punctuator in unicodeSets character class",
+                    ));
+                }
+            }
             let first = self.parse_class_atom()?;
             if self.peek() == Some('-') && self.chars.get(self.pos + 1) != Some(&']') {
                 if let ClassAtom::Char(start) = first {
                     self.pos += 1;
+                    if self.flags.unicode_sets && self.peek() == Some('-') {
+                        return Err(JsError::syntax(
+                            "Invalid '-' in unicodeSets character class",
+                        ));
+                    }
                     let second = self.parse_class_atom()?;
                     if let ClassAtom::Char(end) = second {
                         if start > end {
                             return Err(JsError::syntax("Range out of order in character class"));
                         }
                         atoms.push(ClassAtom::Range(start, end));
-                    } else if self.flags.unicode {
+                    } else if self.flags.is_unicode() {
                         return Err(JsError::syntax("Invalid character class range in Unicode regex"));
                     } else {
                         atoms.push(ClassAtom::Char(start));
@@ -884,7 +930,7 @@ impl<'a> RegexParser<'a> {
                         atoms.push(second);
                     }
                     continue;
-                } else if self.flags.unicode {
+                } else if self.flags.is_unicode() {
                     return Err(JsError::syntax("Invalid character class range in Unicode regex"));
                 }
             }
@@ -951,7 +997,7 @@ impl<'a> RegexParser<'a> {
                 | Node::AnchorStart
                 | Node::AnchorEnd
                 | Node::WordBoundary(_)
-        ) || (self.flags.unicode && matches!(atom, Node::Lookaround { .. }))
+        ) || (self.flags.is_unicode() && matches!(atom, Node::Lookaround { .. }))
         {
             return Err(JsError::syntax("Nothing to repeat in regular expression"));
         }
@@ -1500,7 +1546,7 @@ impl<'a> MatchState<'a> {
                 return None;
             }
             let u = self.units[pos - 1];
-            if self.flags.unicode && (0xDC00..=0xDFFF).contains(&u) && pos >= 2 {
+            if self.flags.is_unicode() && (0xDC00..=0xDFFF).contains(&u) && pos >= 2 {
                 let hi = self.units[pos - 2];
                 if (0xD800..=0xDBFF).contains(&hi) {
                     let cp = 0x10000 + (((hi as u32) - 0xD800) << 10) + ((u as u32) - 0xDC00);
@@ -1513,7 +1559,7 @@ impl<'a> MatchState<'a> {
                 return None;
             }
             let u = self.units[pos];
-            if self.flags.unicode && (0xD800..=0xDBFF).contains(&u) && pos + 1 < self.units.len() {
+            if self.flags.is_unicode() && (0xD800..=0xDBFF).contains(&u) && pos + 1 < self.units.len() {
                 let lo = self.units[pos + 1];
                 if (0xDC00..=0xDFFF).contains(&lo) {
                     let cp = 0x10000 + (((u as u32) - 0xD800) << 10) + ((lo as u32) - 0xDC00);

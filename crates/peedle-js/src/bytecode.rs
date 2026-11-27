@@ -201,6 +201,15 @@ pub enum Op {
         sync_ip: u32,
         end_ip: u32,
     },
+    RecordExcludedKey,
+    ObjectRestDyn(u32),
+    DeleteSuper,
+    ResolveBinding(u32),
+    GetResolvedBinding(u32),
+    SetResolvedBinding(u32),
+    PopBindingRef,
+    AsyncIteratorNextCall,
+    IteratorResultUnpack(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -259,7 +268,8 @@ impl Chunk {
             | Op::JumpIfNotNullish(t)
             | Op::JumpIfNotUndefined(t)
             | Op::ForInNext(t)
-            | Op::IteratorNext(t) => *t = target,
+            | Op::IteratorNext(t)
+            | Op::IteratorResultUnpack(t) => *t = target,
             Op::Break { target: t, .. } => *t = target,
             _ => panic!("patch_jump on non-jump op"),
         }
@@ -285,6 +295,7 @@ pub struct TryHandler {
     pub finally_ip: Option<u32>,
     pub stack_len: usize,
     pub env_depth: usize,
+    pub ref_depth: usize,
     pub in_catch: bool,
     pub in_finally: bool,
     pub pending: PendingCompletion,
@@ -298,6 +309,7 @@ pub struct CallFrame {
     pub stack: Vec<JsValue>,
     pub env: EnvId,
     pub env_stack: Vec<EnvId>,
+    pub ref_stack: Vec<Option<EnvId>>,
     pub handlers: Vec<TryHandler>,
     pub callee: Option<ObjectId>,
     pub last_value: JsValue,
@@ -318,6 +330,7 @@ impl CallFrame {
             stack: Vec::with_capacity(32),
             env,
             env_stack: Vec::new(),
+            ref_stack: Vec::new(),
             handlers: Vec::new(),
             callee,
             last_value: JsValue::Undefined,

@@ -55,6 +55,24 @@ fn get_promise_resolve(rt: &mut JsRuntime, ctor: ObjectId) -> Result<JsValue, Js
     Ok(f)
 }
 
+fn promise_resolve_ctor(
+    rt: &mut JsRuntime,
+    ctor: JsValue,
+    val: JsValue,
+) -> Result<JsValue, JsError> {
+    if let JsValue::Object(vid) = val {
+        if matches!(rt.heap.get_obj(vid).kind, ObjectKind::Promise(_)) {
+            let vctor = rt.get_property(vid, "constructor")?;
+            if vctor == ctor {
+                return Ok(val);
+            }
+        }
+    }
+    let cap = new_promise_capability(rt, ctor)?;
+    rt.call_function(cap.resolve, JsValue::Undefined, &[val])?;
+    Ok(cap.promise)
+}
+
 pub fn init(rt: &mut JsRuntime) {
     let proto = rt.intrinsics.promise_proto;
     let tag = rt.symbols.to_string_tag;
@@ -75,10 +93,16 @@ pub fn init(rt: &mut JsRuntime) {
             if !matches!(rt.heap.get_obj(pid).kind, ObjectKind::Promise(_)) {
                 return Err(JsError::type_err("Promise.prototype.then called on non-Promise"));
             }
+            let ctor = rt.species_constructor(pid, rt.intrinsics.promise_ctor)?;
             let on_ful = args.first().cloned();
             let on_rej = args.get(1).cloned();
-            let next = rt.promise_then(pid, on_ful, on_rej);
-            Ok(JsValue::Object(next))
+            if ctor == JsValue::Object(rt.intrinsics.promise_ctor) {
+                let next = rt.promise_then(pid, on_ful, on_rej);
+                return Ok(JsValue::Object(next));
+            }
+            let cap = new_promise_capability(rt, ctor)?;
+            rt.promise_then_with_capability(pid, on_ful, on_rej, cap.resolve, cap.reject);
+            Ok(cap.promise)
         }),
     );
 
@@ -101,53 +125,56 @@ pub fn init(rt: &mut JsRuntime) {
         "finally",
         1,
         Rc::new(|rt, this, args| {
+            let JsValue::Object(oid) = this else {
+                return Err(JsError::type_err("Promise.prototype.finally called on non-object"));
+            };
             let on_fin = args.first().cloned().unwrap_or(JsValue::Undefined);
-            let oid = rt.to_object(&this)?;
+            let ctor = rt.species_constructor(oid, rt.intrinsics.promise_ctor)?;
+            let (then_fin, catch_fin) = if !rt.is_callable(&on_fin) {
+                (on_fin.clone(), on_fin)
+            } else {
+                let f1 = on_fin.clone();
+                let c1 = ctor.clone();
+                let on_ful = rt.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, a| {
+                        let val = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        let res = rt.call_function(f1.clone(), JsValue::Undefined, &[])?;
+                        let p = promise_resolve_ctor(rt, c1.clone(), res)?;
+                        let p_oid = rt.to_object(&p)?;
+                        let p_then = rt.get_property(p_oid, "then")?;
+                        let ret_val = rt.create_native_function(
+                            "",
+                            0,
+                            Rc::new(move |_, _, _| Ok(val.clone())),
+                        );
+                        rt.call_function(p_then, p, &[JsValue::Object(ret_val)])
+                    }),
+                );
+                let f2 = on_fin;
+                let c2 = ctor;
+                let on_rej = rt.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, a| {
+                        let reason = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        let res = rt.call_function(f2.clone(), JsValue::Undefined, &[])?;
+                        let p = promise_resolve_ctor(rt, c2.clone(), res)?;
+                        let p_oid = rt.to_object(&p)?;
+                        let p_then = rt.get_property(p_oid, "then")?;
+                        let thrower = rt.create_native_function(
+                            "",
+                            0,
+                            Rc::new(move |_, _, _| Err(JsError::thrown(reason.clone()))),
+                        );
+                        rt.call_function(p_then, p, &[JsValue::Object(thrower)])
+                    }),
+                );
+                (JsValue::Object(on_ful), JsValue::Object(on_rej))
+            };
             let then_fn = rt.get_property(oid, "then")?;
-            if !rt.is_callable(&on_fin) {
-                return rt.call_function(then_fn, this, &[on_fin.clone(), on_fin]);
-            }
-            let f1 = on_fin.clone();
-            let on_ful = rt.create_native_function(
-                "",
-                1,
-                Rc::new(move |rt, _, a| {
-                    let val = a.first().cloned().unwrap_or(JsValue::Undefined);
-                    let res = rt.call_function(f1.clone(), JsValue::Undefined, &[])?;
-                    let p = rt.promise_resolve_value(res);
-                    let ret_val = rt.create_native_function(
-                        "",
-                        0,
-                        Rc::new(move |_, _, _| Ok(val.clone())),
-                    );
-                    Ok(JsValue::Object(rt.promise_then(
-                        p,
-                        Some(JsValue::Object(ret_val)),
-                        None,
-                    )))
-                }),
-            );
-            let f2 = on_fin;
-            let on_rej = rt.create_native_function(
-                "",
-                1,
-                Rc::new(move |rt, _, a| {
-                    let reason = a.first().cloned().unwrap_or(JsValue::Undefined);
-                    let res = rt.call_function(f2.clone(), JsValue::Undefined, &[])?;
-                    let p = rt.promise_resolve_value(res);
-                    let thrower = rt.create_native_function(
-                        "",
-                        0,
-                        Rc::new(move |_, _, _| Err(JsError::thrown(reason.clone()))),
-                    );
-                    Ok(JsValue::Object(rt.promise_then(
-                        p,
-                        Some(JsValue::Object(thrower)),
-                        None,
-                    )))
-                }),
-            );
-            rt.call_function(then_fn, this, &[JsValue::Object(on_ful), JsValue::Object(on_rej)])
+            rt.call_function(then_fn, this, &[then_fin, catch_fin])
         }),
     );
 
@@ -251,6 +278,31 @@ pub fn init(rt: &mut JsRuntime) {
             let _ = rt.set_property(obj, "resolve", cap.resolve);
             let _ = rt.set_property(obj, "reject", cap.reject);
             Ok(JsValue::Object(obj))
+        }),
+    );
+
+    set_method(
+        rt,
+        ctor,
+        "try",
+        1,
+        Rc::new(|rt, this, args| {
+            if !this.is_object() {
+                return Err(JsError::type_err("Promise.try called on non-object"));
+            }
+            let cap = new_promise_capability(rt, this)?;
+            let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let rest = if args.len() > 1 { &args[1..] } else { &[] };
+            match rt.call_function(cb, JsValue::Undefined, rest) {
+                Ok(v) => {
+                    rt.call_function(cap.resolve, JsValue::Undefined, &[v])?;
+                }
+                Err(e) => {
+                    let ev = rt.error_to_js_value(e);
+                    rt.call_function(cap.reject, JsValue::Undefined, &[ev])?;
+                }
+            }
+            Ok(cap.promise)
         }),
     );
 
@@ -480,10 +532,35 @@ pub fn init(rt: &mut JsRuntime) {
                 let resolve_fn = get_promise_resolve(rt, cid)?;
                 let iter = rt.get_iterator(args.first().unwrap_or(&JsValue::Undefined), false)?;
                 while let Some(item) = rt.iterator_step(&iter)? {
-                    let next_p = rt.call_function(resolve_fn.clone(), this.clone(), &[item])?;
-                    let next_oid = rt.to_object(&next_p)?;
-                    let then_fn = rt.get_property(next_oid, "then")?;
-                    rt.call_function(then_fn, next_p, &[cap.resolve.clone(), cap.reject.clone()])?;
+                    let next_p = match rt.call_function(resolve_fn.clone(), this.clone(), &[item]) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            rt.iterator_close(&iter);
+                            return Err(e);
+                        }
+                    };
+                    let next_oid = match rt.to_object(&next_p) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            rt.iterator_close(&iter);
+                            return Err(e);
+                        }
+                    };
+                    let then_fn = match rt.get_property(next_oid, "then") {
+                        Ok(f) => f,
+                        Err(e) => {
+                            rt.iterator_close(&iter);
+                            return Err(e);
+                        }
+                    };
+                    if let Err(e) = rt.call_function(
+                        then_fn,
+                        next_p,
+                        &[cap.resolve.clone(), cap.reject.clone()],
+                    ) {
+                        rt.iterator_close(&iter);
+                        return Err(e);
+                    }
                 }
                 Ok(())
             })();

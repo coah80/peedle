@@ -644,7 +644,11 @@ impl Compiler {
             cont_handler_depth: cont_handler,
         });
 
-        let names_const = if !per_iter_names.is_empty() {
+        let needs_per_iter_clone = !per_iter_names.is_empty()
+            && (stmt_may_capture_env(body)
+                || test.as_ref().is_some_and(expr_may_capture_env)
+                || update.as_ref().is_some_and(expr_may_capture_env));
+        let names_const = if needs_per_iter_clone {
             Some(self.chunk.add_const(ConstValue::Names(per_iter_names)))
         } else {
             None
@@ -860,11 +864,16 @@ impl Compiler {
         });
 
         let loop_start = self.current_ip();
-        let j_done = self.emit(Op::IteratorNext(0));
-        self.stack_depth += 1;
-        if is_await {
+        let j_done = if is_await {
+            self.emit(Op::AsyncIteratorNextCall);
+            self.stack_depth += 1;
             self.emit(Op::Await);
-        }
+            self.emit(Op::IteratorResultUnpack(0))
+        } else {
+            let j = self.emit(Op::IteratorNext(0));
+            self.stack_depth += 1;
+            j
+        };
 
         let has_lex = matches!(
             left,
@@ -1352,6 +1361,13 @@ impl Compiler {
             }
             Pattern::Object { props, rest } => {
                 self.emit(Op::RequireObjectCoercible);
+                let track_computed = rest.is_some()
+                    && props.iter().any(|p| matches!(p.key, PropKey::Computed(_)));
+                if track_computed {
+                    self.emit(Op::CreateArray(0));
+                    self.stack_depth += 1;
+                    self.emit(Op::Swap);
+                }
                 let mut excluded_names = Vec::new();
                 for prop in props {
                     self.emit(Op::Dup);
@@ -1370,6 +1386,9 @@ impl Compiler {
                         }
                         PropKey::Computed(expr) => {
                             self.compile_expr(expr)?;
+                            if track_computed {
+                                self.emit(Op::RecordExcludedKey);
+                            }
                             self.emit(Op::GetElem);
                             self.stack_depth -= 1;
                         }
@@ -1382,7 +1401,12 @@ impl Compiler {
                 }
                 if let Some(rest_pat) = rest {
                     let cidx = self.chunk.add_const(ConstValue::Names(excluded_names));
-                    self.emit(Op::ObjectRest(cidx));
+                    if track_computed {
+                        self.emit(Op::ObjectRestDyn(cidx));
+                        self.stack_depth -= 1;
+                    } else {
+                        self.emit(Op::ObjectRest(cidx));
+                    }
                     self.compile_pattern_bind(rest_pat, kind)?;
                 } else {
                     self.emit(Op::Pop);
@@ -1451,6 +1475,13 @@ impl Compiler {
             }
             Pattern::Object { props, rest } => {
                 self.emit(Op::RequireObjectCoercible);
+                let track_computed = rest.is_some()
+                    && props.iter().any(|p| matches!(p.key, PropKey::Computed(_)));
+                if track_computed {
+                    self.emit(Op::CreateArray(0));
+                    self.stack_depth += 1;
+                    self.emit(Op::Swap);
+                }
                 let mut excluded = Vec::new();
                 for prop in props {
                     self.emit(Op::Dup);
@@ -1469,6 +1500,9 @@ impl Compiler {
                         }
                         PropKey::Computed(expr) => {
                             self.compile_expr(expr)?;
+                            if track_computed {
+                                self.emit(Op::RecordExcludedKey);
+                            }
                             self.emit(Op::GetElem);
                             self.stack_depth -= 1;
                         }
@@ -1481,7 +1515,12 @@ impl Compiler {
                 }
                 if let Some(rest_pat) = rest {
                     let cidx = self.chunk.add_const(ConstValue::Names(excluded));
-                    self.emit(Op::ObjectRest(cidx));
+                    if track_computed {
+                        self.emit(Op::ObjectRestDyn(cidx));
+                        self.stack_depth -= 1;
+                    } else {
+                        self.emit(Op::ObjectRest(cidx));
+                    }
                     self.compile_pattern_assign(rest_pat)?;
                 } else {
                     self.emit(Op::Pop);
@@ -2280,19 +2319,29 @@ impl Compiler {
                 Expr::Member {
                     object, property, ..
                 } => {
-                    self.compile_expr(object)?;
-                    match property {
-                        MemberProp::Ident(name) => {
-                            let idx = self.str_const(name);
-                            self.emit(Op::DeleteProp(idx));
-                        }
-                        MemberProp::Computed(k) => {
+                    if matches!(object.as_ref(), Expr::Super) {
+                        if let MemberProp::Computed(k) = property {
                             self.compile_expr(k)?;
-                            self.emit(Op::DeleteElem);
+                            self.emit(Op::Pop);
                             self.stack_depth -= 1;
                         }
-                        MemberProp::Private(_) => {
-                            return Err(JsError::syntax("Private fields cannot be deleted"));
+                        self.emit(Op::DeleteSuper);
+                        self.stack_depth += 1;
+                    } else {
+                        self.compile_expr(object)?;
+                        match property {
+                            MemberProp::Ident(name) => {
+                                let idx = self.str_const(name);
+                                self.emit(Op::DeleteProp(idx));
+                            }
+                            MemberProp::Computed(k) => {
+                                self.compile_expr(k)?;
+                                self.emit(Op::DeleteElem);
+                                self.stack_depth -= 1;
+                            }
+                            MemberProp::Private(_) => {
+                                return Err(JsError::syntax("Private fields cannot be deleted"));
+                            }
                         }
                     }
                 }
@@ -2361,7 +2410,8 @@ impl Compiler {
         match arg {
             Expr::Ident(name) => {
                 let idx = self.str_const(name);
-                self.emit(Op::GetVar(idx));
+                self.emit(Op::ResolveBinding(idx));
+                self.emit(Op::GetResolvedBinding(idx));
                 self.stack_depth += 1;
                 self.emit(Op::ToNumber);
                 if !prefix {
@@ -2373,7 +2423,7 @@ impl Compiler {
                     self.emit(Op::Dup);
                     self.stack_depth += 1;
                 }
-                self.emit(Op::SetVar(idx));
+                self.emit(Op::SetResolvedBinding(idx));
                 self.stack_depth -= 1;
             }
             Expr::Member {
@@ -2428,6 +2478,7 @@ impl Compiler {
                 MemberProp::Computed(key) => {
                     self.compile_expr(object)?;
                     self.compile_expr(key)?;
+                    self.emit(Op::ToPropertyKey);
                     self.emit(Op::Dup2);
                     self.stack_depth += 2;
                     self.emit(Op::GetElem);
@@ -2472,11 +2523,12 @@ impl Compiler {
         if op == AssignOp::Assign {
             match left {
                 AssignTarget::Ident(name) => {
+                    let idx = self.str_const(name);
+                    self.emit(Op::ResolveBinding(idx));
                     self.compile_expr_with_name(right, name)?;
                     self.emit(Op::Dup);
                     self.stack_depth += 1;
-                    let idx = self.str_const(name);
-                    self.emit(Op::SetVar(idx));
+                    self.emit(Op::SetResolvedBinding(idx));
                     self.stack_depth -= 1;
                 }
                 AssignTarget::Member { object, property } => {
@@ -2535,7 +2587,8 @@ impl Compiler {
         match left {
             AssignTarget::Ident(name) => {
                 let idx = self.str_const(name);
-                self.emit(Op::GetVar(idx));
+                self.emit(Op::ResolveBinding(idx));
+                self.emit(Op::GetResolvedBinding(idx));
                 self.stack_depth += 1;
                 if is_logical {
                     self.emit(Op::Dup);
@@ -2552,17 +2605,21 @@ impl Compiler {
                     self.compile_expr_with_name(right, name)?;
                     self.emit(Op::Dup);
                     self.stack_depth += 1;
-                    self.emit(Op::SetVar(idx));
+                    self.emit(Op::SetResolvedBinding(idx));
                     self.stack_depth -= 1;
+                    let j_end = self.emit(Op::Jump(0));
+                    let skip_ip = self.current_ip();
+                    self.chunk.patch_jump(j_skip, skip_ip);
+                    self.emit(Op::PopBindingRef);
                     let end = self.current_ip();
-                    self.chunk.patch_jump(j_skip, end);
+                    self.chunk.patch_jump(j_end, end);
                 } else {
                     self.compile_expr(right)?;
                     self.emit(Op::Binary(assign_to_binary(op)));
                     self.stack_depth -= 1;
                     self.emit(Op::Dup);
                     self.stack_depth += 1;
-                    self.emit(Op::SetVar(idx));
+                    self.emit(Op::SetResolvedBinding(idx));
                     self.stack_depth -= 1;
                 }
             }
@@ -2825,6 +2882,181 @@ fn assign_to_binary(op: AssignOp) -> BinaryOp {
         AssignOp::BitOr => BinaryOp::BitOr,
         AssignOp::BitXor => BinaryOp::BitXor,
         _ => unreachable!(),
+    }
+}
+
+fn stmt_may_capture_env(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::FuncDecl(_) | Stmt::ClassDecl(_) | Stmt::With { .. } => true,
+        Stmt::Block(stmts) => stmts.iter().any(stmt_may_capture_env),
+        Stmt::VarDecl { decls, .. } => decls.iter().any(|d| {
+            pattern_may_capture_env(&d.pattern)
+                || d.init.as_ref().is_some_and(expr_may_capture_env)
+        }),
+        Stmt::Expr(e) | Stmt::Throw(e) => expr_may_capture_env(e),
+        Stmt::Return(e) => e.as_ref().is_some_and(expr_may_capture_env),
+        Stmt::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_may_capture_env(test)
+                || stmt_may_capture_env(consequent)
+                || alternate.as_deref().is_some_and(stmt_may_capture_env)
+        }
+        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+            expr_may_capture_env(test) || stmt_may_capture_env(body)
+        }
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            let init_cap = match init {
+                Some(ForInit::Expr(e)) => expr_may_capture_env(e),
+                Some(ForInit::VarDecl { decls, .. }) => decls.iter().any(|d| {
+                    pattern_may_capture_env(&d.pattern)
+                        || d.init.as_ref().is_some_and(expr_may_capture_env)
+                }),
+                None => false,
+            };
+            init_cap
+                || test.as_ref().is_some_and(expr_may_capture_env)
+                || update.as_ref().is_some_and(expr_may_capture_env)
+                || stmt_may_capture_env(body)
+        }
+        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body, .. } => {
+            let left_cap = match left {
+                ForInOfLeft::VarDecl { pattern, .. } | ForInOfLeft::Pattern(pattern) => {
+                    pattern_may_capture_env(pattern)
+                }
+            };
+            left_cap || expr_may_capture_env(right) || stmt_may_capture_env(body)
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            expr_may_capture_env(discriminant)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().is_some_and(expr_may_capture_env)
+                        || c.consequent.iter().any(stmt_may_capture_env)
+                })
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            block.iter().any(stmt_may_capture_env)
+                || handler.as_ref().is_some_and(|h| {
+                    h.param.as_ref().is_some_and(pattern_may_capture_env)
+                        || h.body.iter().any(stmt_may_capture_env)
+                })
+                || finalizer
+                    .as_ref()
+                    .is_some_and(|f| f.iter().any(stmt_may_capture_env))
+        }
+        Stmt::Labeled { body, .. } => stmt_may_capture_env(body),
+        _ => false,
+    }
+}
+
+fn pattern_may_capture_env(pat: &Pattern) -> bool {
+    match pat {
+        Pattern::Ident(_) => false,
+        Pattern::Assign { left, right } => {
+            pattern_may_capture_env(left) || expr_may_capture_env(right)
+        }
+        Pattern::Array { elements, rest } => {
+            elements
+                .iter()
+                .any(|e| e.as_ref().is_some_and(pattern_may_capture_env))
+                || rest.as_deref().is_some_and(pattern_may_capture_env)
+        }
+        Pattern::Object { props, rest } => {
+            props.iter().any(|p| {
+                matches!(&p.key, PropKey::Computed(e) if expr_may_capture_env(e))
+                    || pattern_may_capture_env(&p.value)
+            }) || rest.as_deref().is_some_and(pattern_may_capture_env)
+        }
+        Pattern::Member(e) => expr_may_capture_env(e),
+    }
+}
+
+fn expr_may_capture_env(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(_)
+        | Expr::Arrow(_)
+        | Expr::Class(_)
+        | Expr::Yield { .. }
+        | Expr::Await(_) => true,
+        Expr::Call { callee, args, .. } => {
+            matches!(callee.as_ref(), Expr::Ident(s) if s == "eval")
+                || expr_may_capture_env(callee)
+                || args.iter().any(|a| match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => expr_may_capture_env(e),
+                })
+        }
+        Expr::New { callee, args } => {
+            expr_may_capture_env(callee)
+                || args.iter().any(|a| match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => expr_may_capture_env(e),
+                })
+        }
+        Expr::Member {
+            object, property, ..
+        } => {
+            expr_may_capture_env(object)
+                || matches!(property, MemberProp::Computed(e) if expr_may_capture_env(e))
+        }
+        Expr::Array(elems) => elems.iter().any(|el| match el {
+            ArrayElem::Hole => false,
+            ArrayElem::Expr(e) | ArrayElem::Spread(e, _) => expr_may_capture_env(e),
+        }),
+        Expr::Object(props) => props.iter().any(|p| match p {
+            ObjectProp::Method { .. } => true,
+            ObjectProp::Property { key, value, .. } => {
+                matches!(key, PropKey::Computed(e) if expr_may_capture_env(e))
+                    || expr_may_capture_env(value)
+            }
+            ObjectProp::Spread(e, _) => expr_may_capture_env(e),
+        }),
+        Expr::Unary { arg, .. }
+        | Expr::Update { arg, .. }
+        | Expr::OptionalChain(arg)
+        | Expr::DynamicImport(arg)
+        | Expr::PrivateIn { right: arg, .. } => expr_may_capture_env(arg),
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            expr_may_capture_env(left) || expr_may_capture_env(right)
+        }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_may_capture_env(test)
+                || expr_may_capture_env(consequent)
+                || expr_may_capture_env(alternate)
+        }
+        Expr::Assign { left, right, .. } => {
+            let lcap = match left {
+                AssignTarget::Ident(_) => false,
+                AssignTarget::Member { object, property } => {
+                    expr_may_capture_env(object)
+                        || matches!(property, MemberProp::Computed(e) if expr_may_capture_env(e))
+                }
+                AssignTarget::Pattern(p) => pattern_may_capture_env(p),
+            };
+            lcap || expr_may_capture_env(right)
+        }
+        Expr::Sequence(es) => es.iter().any(expr_may_capture_env),
+        Expr::Template { tag, exprs, .. } => {
+            tag.as_deref().is_some_and(expr_may_capture_env)
+                || exprs.iter().any(expr_may_capture_env)
+        }
+        _ => false,
     }
 }
 
