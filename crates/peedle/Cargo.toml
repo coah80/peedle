@@ -1,0 +1,19 @@
+[package]
+name = "peedle"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+peedle-url.workspace = true
+peedle-net.workspace = true
+peedle-html.workspace = true
+peedle-css.workspace = true
+peedle-layout.workspace = true
+peedle-js.workspace = true
+peedle-render.workspace = true
+peedle-dom.workspace = true
+peedle-engine.workspace = true
+winit.workspace = true
+softbuffer.workspace = true
+image.workspace = true
+fontdue.workspace = true

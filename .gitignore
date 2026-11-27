@@ -1,0 +1,6 @@
+/target
+/fixtures
+/screenshots
+*.png
+*.log
+.DS_Store

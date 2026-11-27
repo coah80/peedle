@@ -1,0 +1,11 @@
+[package]
+name = "peedle-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+peedle-html.workspace = true
+peedle-css.workspace = true
+peedle-layout.workspace = true
+fontdue.workspace = true
+image.workspace = true

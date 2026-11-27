@@ -1,0 +1,9 @@
+[package]
+name = "peedle-layout"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+peedle-html.workspace = true
+peedle-css.workspace = true
+fontdue.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "peedle-js"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+unicode-normalization.workspace = true
+chrono.workspace = true
+getrandom.workspace = true
+base64.workspace = true

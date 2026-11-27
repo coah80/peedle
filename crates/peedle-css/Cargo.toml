@@ -1,0 +1,8 @@
+[package]
+name = "peedle-css"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+peedle-html.workspace = true
+peedle-url.workspace = true
