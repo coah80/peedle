@@ -1260,13 +1260,10 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
             let (new_oid, new_data) =
                 ta_species_create(rt, oid, ta.kind, &[JsValue::Number(count as f64)])?;
             if count > 0 {
-                if is_buffer_immutable(rt, ta.buffer) {
-                    return Err(JsError::type_err("TypedArray buffer is immutable"));
-                }
                 let Some(cur_len) = rt.typed_array_effective_length(oid) else {
                     return Err(JsError::type_err("TypedArray buffer is detached or out of bounds"));
                 };
-                if is_buffer_immutable(rt, ta.buffer) {
+                if is_buffer_immutable(rt, new_data.buffer) {
                     return Err(JsError::type_err("TypedArray buffer is immutable"));
                 }
                 if new_data.kind.is_bigint() != ta.kind.is_bigint() {
@@ -2131,8 +2128,461 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
             PropertyKey::from("BYTES_PER_ELEMENT"),
             PropEntry::data(JsValue::Number(kind.element_size() as f64), false, false, false),
         );
+        if kind == TypedArrayKind::Uint8 {
+            init_uint8_encoding(rt, ctor, proto);
+        }
         set_global(rt, kind.name(), JsValue::Object(ctor));
     }
+}
+
+fn require_uint8_array(rt: &JsRuntime, val: &JsValue) -> Result<(ObjectId, TypedArrayData, usize), JsError> {
+    let JsValue::Object(oid) = val else {
+        return Err(JsError::type_err("Receiver is not a Uint8Array"));
+    };
+    let ta = match &rt.heap.get_obj(*oid).kind {
+        ObjectKind::TypedArray(t) if t.kind == TypedArrayKind::Uint8 => t.clone(),
+        _ => return Err(JsError::type_err("Receiver is not a Uint8Array")),
+    };
+    let Some(len) = rt.typed_array_effective_length(*oid) else {
+        return Err(JsError::type_err("Uint8Array buffer is detached or out of bounds"));
+    };
+    Ok((*oid, ta, len))
+}
+
+fn parse_base64_options(
+    rt: &mut JsRuntime,
+    arg: Option<&JsValue>,
+) -> Result<(bool, u8), JsError> {
+    let mut is_url = false;
+    let mut last_chunk: u8 = 0;
+    let Some(v) = arg else {
+        return Ok((is_url, last_chunk));
+    };
+    if v.is_undefined() {
+        return Ok((is_url, last_chunk));
+    }
+    let JsValue::Object(opt_id) = v else {
+        return Err(JsError::type_err("Options must be an object or undefined"));
+    };
+    let alpha = rt.get_property(*opt_id, "alphabet")?;
+    if !alpha.is_undefined() {
+        match alpha {
+            JsValue::String(ref s) if s == "base64" => is_url = false,
+            JsValue::String(ref s) if s == "base64url" => is_url = true,
+            _ => return Err(JsError::type_err("Invalid base64 alphabet option")),
+        }
+    }
+    let lch = rt.get_property(*opt_id, "lastChunkHandling")?;
+    if !lch.is_undefined() {
+        match lch {
+            JsValue::String(ref s) if s == "loose" => last_chunk = 0,
+            JsValue::String(ref s) if s == "strict" => last_chunk = 1,
+            JsValue::String(ref s) if s == "stop-before-partial" => last_chunk = 2,
+            _ => return Err(JsError::type_err("Invalid lastChunkHandling option")),
+        }
+    }
+    Ok((is_url, last_chunk))
+}
+
+fn decode_b64_char(b: u8, is_url: bool) -> Option<u8> {
+    match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'+' if !is_url => Some(62),
+        b'/' if !is_url => Some(63),
+        b'-' if is_url => Some(62),
+        b'_' if is_url => Some(63),
+        _ => None,
+    }
+}
+
+fn is_b64_ws(b: u8) -> bool {
+    matches!(b, 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
+}
+
+fn from_base64_impl(
+    s: &str,
+    is_url: bool,
+    last_chunk: u8,
+    max_len: usize,
+) -> (Vec<u8>, usize, Option<JsError>) {
+    let raw = s.as_bytes();
+    let len = raw.len();
+    let mut out = Vec::new();
+    let mut read = 0usize;
+    let mut idx = 0usize;
+    let mut chunk = [0u8; 4];
+    let mut chunk_len = 0usize;
+
+    if max_len == 0 {
+        return (out, 0, None);
+    }
+
+    let skip_ws = |pos: &mut usize| {
+        while *pos < len && is_b64_ws(raw[*pos]) {
+            *pos += 1;
+        }
+    };
+
+    loop {
+        skip_ws(&mut idx);
+        if idx == len {
+            if chunk_len > 0 {
+                if last_chunk == 2 {
+                    return (out, read, None);
+                }
+                if last_chunk == 1 {
+                    return (
+                        out,
+                        read,
+                        Some(JsError::syntax("Invalid base64 padding in strict mode")),
+                    );
+                }
+                if chunk_len == 1 {
+                    return (
+                        out,
+                        read,
+                        Some(JsError::syntax("Invalid base64 trailing single character")),
+                    );
+                }
+                if chunk_len == 2 {
+                    out.push((chunk[0] << 2) | (chunk[1] >> 4));
+                } else if chunk_len == 3 {
+                    out.push((chunk[0] << 2) | (chunk[1] >> 4));
+                    out.push((chunk[1] << 4) | (chunk[2] >> 2));
+                }
+                read = len;
+            } else {
+                read = len;
+            }
+            return (out, read, None);
+        }
+
+        let b = raw[idx];
+        idx += 1;
+        if b == b'=' {
+            if chunk_len < 2 {
+                return (out, read, Some(JsError::syntax("Unexpected '=' in base64")));
+            }
+            skip_ws(&mut idx);
+            if chunk_len == 2 {
+                if idx == len {
+                    if last_chunk == 2 {
+                        return (out, read, None);
+                    }
+                    return (out, read, Some(JsError::syntax("Incomplete base64 padding")));
+                }
+                if raw[idx] != b'=' {
+                    return (out, read, Some(JsError::syntax("Invalid base64 padding")));
+                }
+                idx += 1;
+                skip_ws(&mut idx);
+            }
+            if idx < len {
+                return (
+                    out,
+                    read,
+                    Some(JsError::syntax("Unexpected trailing data after base64 padding")),
+                );
+            }
+            if chunk_len == 2 {
+                if last_chunk == 1 && (chunk[1] & 0x0F) != 0 {
+                    return (
+                        out,
+                        read,
+                        Some(JsError::syntax("Non-zero padding bits in strict base64")),
+                    );
+                }
+                out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            } else {
+                if last_chunk == 1 && (chunk[2] & 0x03) != 0 {
+                    return (
+                        out,
+                        read,
+                        Some(JsError::syntax("Non-zero padding bits in strict base64")),
+                    );
+                }
+                out.push((chunk[0] << 2) | (chunk[1] >> 4));
+                out.push((chunk[1] << 4) | (chunk[2] >> 2));
+            }
+            read = len;
+            return (out, read, None);
+        }
+
+        let Some(v) = decode_b64_char(b, is_url) else {
+            return (out, read, Some(JsError::syntax("Invalid character in base64")));
+        };
+        let remaining = max_len - out.len();
+        if (remaining == 1 && chunk_len == 2) || (remaining == 2 && chunk_len == 3) {
+            return (out, read, None);
+        }
+        chunk[chunk_len] = v;
+        chunk_len += 1;
+        if chunk_len == 4 {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+            out.push((chunk[2] << 6) | chunk[3]);
+            chunk_len = 0;
+            read = idx;
+            if out.len() == max_len {
+                return (out, read, None);
+            }
+        }
+    }
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn init_uint8_encoding(rt: &mut JsRuntime, ctor: ObjectId, proto: ObjectId) {
+    set_method(
+        rt,
+        ctor,
+        "fromBase64",
+        1,
+        Rc::new(|rt, _, args| {
+            let Some(JsValue::String(s)) = args.first() else {
+                return Err(JsError::type_err("Uint8Array.fromBase64 requires a string"));
+            };
+            let s = s.clone();
+            let (is_url, last_chunk) = parse_base64_options(rt, args.get(1))?;
+            let (bytes, _, err) = from_base64_impl(&s, is_url, last_chunk, usize::MAX);
+            if let Some(e) = err {
+                return Err(e);
+            }
+            let obj = alloc_typed_array(rt, TypedArrayKind::Uint8, bytes.len())?;
+            if let ObjectKind::TypedArray(ref ta) = rt.heap.get_obj(obj).kind {
+                let buf = ta.buffer;
+                if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(buf).kind {
+                    ab.bytes.copy_from_slice(&bytes);
+                }
+            }
+            Ok(JsValue::Object(obj))
+        }),
+    );
+
+    set_method(
+        rt,
+        ctor,
+        "fromHex",
+        1,
+        Rc::new(|rt, _, args| {
+            let Some(JsValue::String(s)) = args.first() else {
+                return Err(JsError::type_err("Uint8Array.fromHex requires a string"));
+            };
+            let raw = s.as_bytes();
+            if raw.len() % 2 != 0 {
+                return Err(JsError::syntax("Hex string must have an even length"));
+            }
+            let mut bytes = Vec::with_capacity(raw.len() / 2);
+            let mut i = 0;
+            while i < raw.len() {
+                let Some(hi) = hex_nibble(raw[i]) else {
+                    return Err(JsError::syntax("Invalid hex character"));
+                };
+                let Some(lo) = hex_nibble(raw[i + 1]) else {
+                    return Err(JsError::syntax("Invalid hex character"));
+                };
+                bytes.push((hi << 4) | lo);
+                i += 2;
+            }
+            let obj = alloc_typed_array(rt, TypedArrayKind::Uint8, bytes.len())?;
+            if let ObjectKind::TypedArray(ref ta) = rt.heap.get_obj(obj).kind {
+                let buf = ta.buffer;
+                if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(buf).kind {
+                    ab.bytes.copy_from_slice(&bytes);
+                }
+            }
+            Ok(JsValue::Object(obj))
+        }),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "toBase64",
+        0,
+        Rc::new(|rt, this, args| {
+            let JsValue::Object(oid) = this else {
+                return Err(JsError::type_err("Receiver is not a Uint8Array"));
+            };
+            let ta = match &rt.heap.get_obj(oid).kind {
+                ObjectKind::TypedArray(t) if t.kind == TypedArrayKind::Uint8 => t.clone(),
+                _ => return Err(JsError::type_err("Receiver is not a Uint8Array")),
+            };
+            let mut is_url = false;
+            let mut omit_padding = false;
+            if let Some(v) = args.first() {
+                if !v.is_undefined() {
+                    let JsValue::Object(opt_id) = v else {
+                        return Err(JsError::type_err("Options must be an object or undefined"));
+                    };
+                    let alpha = rt.get_property(*opt_id, "alphabet")?;
+                    if !alpha.is_undefined() {
+                        match alpha {
+                            JsValue::String(ref s) if s == "base64" => is_url = false,
+                            JsValue::String(ref s) if s == "base64url" => is_url = true,
+                            _ => return Err(JsError::type_err("Invalid base64 alphabet option")),
+                        }
+                    }
+                    let op = rt.get_property(*opt_id, "omitPadding")?;
+                    omit_padding = op.to_boolean();
+                }
+            }
+            let Some(len) = rt.typed_array_effective_length(oid) else {
+                return Err(JsError::type_err("Uint8Array buffer is detached or out of bounds"));
+            };
+            let slice = match &rt.heap.get_obj(ta.buffer).kind {
+                ObjectKind::ArrayBuffer(ab) => ab.bytes[ta.byte_offset..ta.byte_offset + len].to_vec(),
+                _ => return Err(JsError::type_err("Invalid buffer")),
+            };
+            let table: &[u8; 64] = if is_url {
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+            } else {
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            };
+            let mut out = String::with_capacity((slice.len() + 2) / 3 * 4);
+            let mut i = 0;
+            while i + 3 <= slice.len() {
+                let (b0, b1, b2) = (slice[i] as usize, slice[i + 1] as usize, slice[i + 2] as usize);
+                out.push(table[b0 >> 2] as char);
+                out.push(table[((b0 & 3) << 4) | (b1 >> 4)] as char);
+                out.push(table[((b1 & 15) << 2) | (b2 >> 6)] as char);
+                out.push(table[b2 & 63] as char);
+                i += 3;
+            }
+            let rem = slice.len() - i;
+            if rem == 1 {
+                let b0 = slice[i] as usize;
+                out.push(table[b0 >> 2] as char);
+                out.push(table[(b0 & 3) << 4] as char);
+                if !omit_padding {
+                    out.push('=');
+                    out.push('=');
+                }
+            } else if rem == 2 {
+                let (b0, b1) = (slice[i] as usize, slice[i + 1] as usize);
+                out.push(table[b0 >> 2] as char);
+                out.push(table[((b0 & 3) << 4) | (b1 >> 4)] as char);
+                out.push(table[(b1 & 15) << 2] as char);
+                if !omit_padding {
+                    out.push('=');
+                }
+            }
+            Ok(JsValue::String(out))
+        }),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "toHex",
+        0,
+        Rc::new(|rt, this, _| {
+            let (_, ta, len) = require_uint8_array(rt, &this)?;
+            let slice = match &rt.heap.get_obj(ta.buffer).kind {
+                ObjectKind::ArrayBuffer(ab) => &ab.bytes[ta.byte_offset..ta.byte_offset + len],
+                _ => return Err(JsError::type_err("Invalid buffer")),
+            };
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut out = String::with_capacity(slice.len() * 2);
+            for &b in slice {
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
+            }
+            Ok(JsValue::String(out))
+        }),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "setFromBase64",
+        1,
+        Rc::new(|rt, this, args| {
+            let (oid, ta, _) = require_uint8_array(rt, &this)?;
+            if is_buffer_immutable(rt, ta.buffer) {
+                return Err(JsError::type_err("Cannot modify an immutable ArrayBuffer"));
+            }
+            let Some(JsValue::String(s)) = args.first() else {
+                return Err(JsError::type_err("setFromBase64 requires a string"));
+            };
+            let s = s.clone();
+            let (is_url, last_chunk) = parse_base64_options(rt, args.get(1))?;
+            let Some(len) = rt.typed_array_effective_length(oid) else {
+                return Err(JsError::type_err("Uint8Array buffer is detached or out of bounds"));
+            };
+            let (bytes, read, err) = from_base64_impl(&s, is_url, last_chunk, len);
+            let written = bytes.len();
+            if written > 0 {
+                if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(ta.buffer).kind {
+                    ab.bytes[ta.byte_offset..ta.byte_offset + written].copy_from_slice(&bytes);
+                }
+            }
+            if let Some(e) = err {
+                return Err(e);
+            }
+            let res = rt.create_object();
+            let _ = rt.set_property(res, "read", JsValue::Number(read as f64));
+            let _ = rt.set_property(res, "written", JsValue::Number(written as f64));
+            Ok(JsValue::Object(res))
+        }),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "setFromHex",
+        1,
+        Rc::new(|rt, this, args| {
+            let (oid, ta, len) = require_uint8_array(rt, &this)?;
+            let Some(JsValue::String(s)) = args.first() else {
+                return Err(JsError::type_err("setFromHex requires a string"));
+            };
+            if is_buffer_immutable(rt, ta.buffer) {
+                return Err(JsError::type_err("Cannot modify an immutable ArrayBuffer"));
+            }
+            let raw = s.as_bytes();
+            if raw.len() % 2 != 0 {
+                return Err(JsError::syntax("Hex string must have an even length"));
+            }
+            let Some(cur_len) = rt.typed_array_effective_length(oid) else {
+                return Err(JsError::type_err("Uint8Array buffer is detached or out of bounds"));
+            };
+            let max_bytes = cur_len.min(len);
+            let mut bytes = Vec::with_capacity((raw.len() / 2).min(max_bytes));
+            let mut read = 0usize;
+            let mut err: Option<JsError> = None;
+            while read + 2 <= raw.len() && bytes.len() < max_bytes {
+                let (Some(hi), Some(lo)) = (hex_nibble(raw[read]), hex_nibble(raw[read + 1])) else {
+                    err = Some(JsError::syntax("Invalid hex character"));
+                    break;
+                };
+                bytes.push((hi << 4) | lo);
+                read += 2;
+            }
+            let written = bytes.len();
+            if written > 0 {
+                if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(ta.buffer).kind {
+                    ab.bytes[ta.byte_offset..ta.byte_offset + written].copy_from_slice(&bytes);
+                }
+            }
+            if let Some(e) = err {
+                return Err(e);
+            }
+            let res = rt.create_object();
+            let _ = rt.set_property(res, "read", JsValue::Number(read as f64));
+            let _ = rt.set_property(res, "written", JsValue::Number(written as f64));
+            Ok(JsValue::Object(res))
+        }),
+    );
 }
 
 fn sort_typed_values(

@@ -381,6 +381,19 @@ impl Page {
                         .any(|tok| tok.eq_ignore_ascii_case("stylesheet"))
                 });
                 if is_sheet {
+                    if let Some(media) = el.get_attr("media") {
+                        let m = media.trim();
+                        if !m.is_empty() {
+                            let vp = peedle_css::Viewport {
+                                width: self.viewport_w,
+                                height: self.viewport_h,
+                                dark_mode: self.dark_mode,
+                            };
+                            if !peedle_css::parse_media_query_list(m).matches(&vp) {
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(href) = el.get_attr("href") {
                         if let Some(resolved) = self.resolve_subresource_url(href) {
                             out.push((nid, resolved));
@@ -391,26 +404,56 @@ impl Page {
             out
         };
 
-        let mut sheets = std::collections::HashMap::new();
-        for (nid, css_url) in css_links.into_iter().take(24) {
-            let start = Instant::now();
-            if let Ok(resp) = self.client.get(&css_url) {
-                self.network_log.push(NetworkEntry {
-                    method: "GET".to_string(),
-                    url: css_url.clone(),
-                    status: resp.status,
-                    content_type: resp.content_type().to_string(),
-                    bytes: resp.body.len(),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
-                let ct = resp.content_type().to_ascii_lowercase();
-                let mime_ok = ct.is_empty()
-                    || ct.contains("css")
-                    || ct.contains("text/plain")
-                    || ct.contains("octet-stream");
-                if resp.status < 400 && mime_ok {
-                    sheets.insert(nid, parse_stylesheet(&resp.text()));
+        let tasks: Vec<(NodeId, String)> = css_links.into_iter().take(24).collect();
+        let queue = std::sync::Mutex::new(std::collections::VecDeque::from(tasks));
+        let results = std::sync::Mutex::new(Vec::new());
+        let workers = queue.lock().unwrap().len().min(6);
+        let client = &self.client;
+
+        if workers > 0 {
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| loop {
+                        let item = queue.lock().unwrap().pop_front();
+                        let Some((nid, css_url)) = item else {
+                            break;
+                        };
+                        let start = Instant::now();
+                        if let Ok(resp) = client.get(&css_url) {
+                            let elapsed = start.elapsed().as_millis() as u64;
+                            let ct = resp.content_type().to_string();
+                            let bytes = resp.body.len();
+                            let status = resp.status;
+                            let low = ct.to_ascii_lowercase();
+                            let mime_ok = low.is_empty()
+                                || low.contains("css")
+                                || low.contains("text/plain")
+                                || low.contains("octet-stream");
+                            let parsed = if status < 400 && mime_ok {
+                                Some(parse_stylesheet(&resp.text()))
+                            } else {
+                                None
+                            };
+                            let entry = NetworkEntry {
+                                method: "GET".to_string(),
+                                url: css_url,
+                                status,
+                                content_type: ct,
+                                bytes,
+                                duration_ms: elapsed,
+                            };
+                            results.lock().unwrap().push((nid, entry, parsed));
+                        }
+                    });
                 }
+            });
+        }
+
+        let mut sheets = std::collections::HashMap::new();
+        for (nid, entry, parsed) in results.into_inner().unwrap() {
+            self.network_log.push(entry);
+            if let Some(sheet) = parsed {
+                sheets.insert(nid, sheet);
             }
         }
 
@@ -423,14 +466,20 @@ impl Page {
         let img_srcs: Vec<(String, Option<String>)> = {
             let st = self.js_env.dom.borrow();
             let mut out = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            let mut push_src = |raw: String, resolved: Option<String>| {
+                if seen.insert(raw.clone()) {
+                    out.push((raw, resolved));
+                }
+            };
             for nid in st.doc.descendants(st.doc.root) {
                 if let Some(el) = st.doc.element(nid) {
                     if el.is_html() && el.tag_is("img") {
                         if let Some(src) = el.get_attr("src") {
                             if !self.images.contains(src) {
-                                out.push((src.to_string(), self.resolve_subresource_url(src)));
+                                push_src(src.to_string(), self.resolve_subresource_url(src));
                             } else if !st.image_sizes.contains_key(src) {
-                                out.push((src.to_string(), None));
+                                push_src(src.to_string(), None);
                             }
                         }
                     } else if el.is_html() && el.tag_is("object") {
@@ -444,26 +493,29 @@ impl Page {
                                 || low.ends_with(".webp");
                             if looks_image {
                                 if !self.images.contains(data_url) {
-                                    out.push((
+                                    push_src(
                                         data_url.to_string(),
                                         self.resolve_subresource_url(data_url),
-                                    ));
+                                    );
                                 } else if !st.image_sizes.contains_key(data_url) {
-                                    out.push((data_url.to_string(), None));
+                                    push_src(data_url.to_string(), None);
                                 }
                             }
                         }
                     }
                 }
-                if let Some(style) = st.styles.get(nid) {
+                for style in [st.styles.get(nid), st.styles.before(nid), st.styles.after(nid)]
+                    .into_iter()
+                    .flatten()
+                {
                     if let peedle_css::BackgroundImage::Url(ref u) = style.background_image {
                         if !self.images.contains(u) {
-                            out.push((u.clone(), self.resolve_subresource_url(u)));
+                            push_src(u.clone(), self.resolve_subresource_url(u));
                         }
                     }
                     if let Some(ref mu) = style.mask_image {
                         if !self.images.contains(mu) {
-                            out.push((mu.clone(), self.resolve_subresource_url(mu)));
+                            push_src(mu.clone(), self.resolve_subresource_url(mu));
                         }
                     }
                 }
@@ -472,6 +524,7 @@ impl Page {
         };
 
         let mut new_sizes = Vec::new();
+        let mut to_fetch: Vec<(String, String)> = Vec::new();
         for (raw_src, resolved_opt) in img_srcs.into_iter().take(96) {
             if self.failed_images.contains(&raw_src) {
                 continue;
@@ -480,32 +533,63 @@ impl Page {
                 new_sizes.push((raw_src, (existing.width, existing.height)));
                 continue;
             }
-            let Some(resolved) = resolved_opt else {
-                self.failed_images.insert(raw_src);
-                continue;
-            };
-            let start = Instant::now();
-            if let Ok(resp) = self.client.get(&resolved) {
-                self.network_log.push(NetworkEntry {
-                    method: "GET".to_string(),
-                    url: resolved.clone(),
-                    status: resp.status,
-                    content_type: resp.content_type().to_string(),
-                    bytes: resp.body.len(),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
-                if resp.status < 400 {
-                    if let Ok(decoded) = DecodedImage::decode(&resp.body) {
-                        new_sizes.push((raw_src.clone(), (decoded.width, decoded.height)));
-                        self.images.insert(raw_src, decoded);
-                    } else {
-                        self.failed_images.insert(raw_src);
-                    }
+            match resolved_opt {
+                Some(resolved) => to_fetch.push((raw_src, resolved)),
+                None => {
+                    self.failed_images.insert(raw_src);
+                }
+            }
+        }
+
+        if !to_fetch.is_empty() {
+            let queue = std::sync::Mutex::new(std::collections::VecDeque::from(to_fetch));
+            let results = std::sync::Mutex::new(Vec::new());
+            let workers = queue.lock().unwrap().len().min(8);
+            let client = &self.client;
+
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| loop {
+                        let item = queue.lock().unwrap().pop_front();
+                        let Some((raw_src, resolved)) = item else {
+                            break;
+                        };
+                        let start = Instant::now();
+                        match client.get(&resolved) {
+                            Ok(resp) => {
+                                let entry = NetworkEntry {
+                                    method: "GET".to_string(),
+                                    url: resolved,
+                                    status: resp.status,
+                                    content_type: resp.content_type().to_string(),
+                                    bytes: resp.body.len(),
+                                    duration_ms: start.elapsed().as_millis() as u64,
+                                };
+                                let decoded = if resp.status < 400 {
+                                    DecodedImage::decode(&resp.body).ok()
+                                } else {
+                                    None
+                                };
+                                results.lock().unwrap().push((raw_src, Some(entry), decoded));
+                            }
+                            Err(_) => {
+                                results.lock().unwrap().push((raw_src, None, None));
+                            }
+                        }
+                    });
+                }
+            });
+
+            for (raw_src, entry_opt, decoded_opt) in results.into_inner().unwrap() {
+                if let Some(entry) = entry_opt {
+                    self.network_log.push(entry);
+                }
+                if let Some(decoded) = decoded_opt {
+                    new_sizes.push((raw_src.clone(), (decoded.width, decoded.height)));
+                    self.images.insert(raw_src, decoded);
                 } else {
                     self.failed_images.insert(raw_src);
                 }
-            } else {
-                self.failed_images.insert(raw_src);
             }
         }
 

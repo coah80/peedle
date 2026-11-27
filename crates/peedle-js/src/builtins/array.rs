@@ -14,9 +14,13 @@ pub fn init(rt: &mut JsRuntime) {
         "push",
         1,
         Rc::new(|rt, this, args| {
+            const MAX_SAFE: usize = 9_007_199_254_740_991;
             let oid = rt.to_object(&this)?;
             let len_v = rt.get_property(oid, "length")?;
             let mut len = to_length(rt.to_number(&len_v)?);
+            if len.saturating_add(args.len()) > MAX_SAFE {
+                return Err(JsError::type_err("Invalid array length"));
+            }
             for a in args {
                 rt.set_property_key_strict(oid, PropertyKey::String(len.to_string()), a.clone(), true)?;
                 len += 1;
@@ -84,11 +88,15 @@ pub fn init(rt: &mut JsRuntime) {
         "unshift",
         1,
         Rc::new(|rt, this, args| {
+            const MAX_SAFE: usize = 9_007_199_254_740_991;
             let oid = rt.to_object(&this)?;
             let len_v = rt.get_property(oid, "length")?;
             let len = to_length(rt.to_number(&len_v)?);
             let ac = args.len();
             if ac > 0 {
+                if len.saturating_add(ac) > MAX_SAFE {
+                    return Err(JsError::type_err("Invalid array length"));
+                }
                 for k in (0..len).rev() {
                     let from = PropertyKey::String(k.to_string());
                     let to = PropertyKey::String((k + ac).to_string());
@@ -120,21 +128,18 @@ pub fn init(rt: &mut JsRuntime) {
             let len = to_length(rt.to_number(&len_v)?);
             let start = resolve_index(rt, args.first(), len, 0)?;
             let end = resolve_index(rt, args.get(1), len, len)?;
-            let out = rt.create_array(Vec::new());
+            let count = end.saturating_sub(start);
+            let out = array_species_create(rt, oid, count)?;
             let mut n = 0usize;
             for k in start..end {
                 let pk = PropertyKey::String(k.to_string());
                 if rt.has_property(oid, &pk)? {
                     let v = rt.get_property_key(oid, &pk)?;
-                    rt.define_property(
-                        out,
-                        PropertyKey::String(n.to_string()),
-                        PropertyDescriptor::data(v, true, true, true),
-                    )?;
+                    create_data_property_or_throw(rt, out, PropertyKey::String(n.to_string()), v)?;
                 }
                 n += 1;
             }
-            let _ = rt.set_property(out, "length", JsValue::Number(n as f64));
+            rt.set_property_key_strict(out, PropertyKey::from("length"), JsValue::Number(n as f64), true)?;
             Ok(JsValue::Object(out))
         }),
     );
@@ -145,29 +150,37 @@ pub fn init(rt: &mut JsRuntime) {
         "splice",
         2,
         Rc::new(|rt, this, args| {
+            const MAX_SAFE: usize = 9_007_199_254_740_991;
             let oid = rt.to_object(&this)?;
             let len_v = rt.get_property(oid, "length")?;
             let len = to_length(rt.to_number(&len_v)?);
             let start = resolve_index(rt, args.first(), len, 0)?;
-            let del_count = if args.is_empty() {
-                0
+            let (ic, del_count) = if args.is_empty() {
+                (0usize, 0usize)
             } else if args.len() == 1 {
-                len - start
+                (0usize, len - start)
             } else {
                 let dc = to_integer_or_infinity(rt.to_number(&args[1])?);
-                dc.clamp(0.0, (len - start) as f64) as usize
+                (args.len() - 2, dc.clamp(0.0, (len - start) as f64) as usize)
             };
-            let deleted = rt.create_array(Vec::new());
+            if (len - del_count).saturating_add(ic) > MAX_SAFE {
+                return Err(JsError::type_err("Invalid array length"));
+            }
+            let deleted = array_species_create(rt, oid, del_count)?;
             for k in 0..del_count {
                 let pk = PropertyKey::String((start + k).to_string());
                 if rt.has_property(oid, &pk)? {
                     let v = rt.get_property_key(oid, &pk)?;
-                    let _ = rt.set_property(deleted, &k.to_string(), v);
+                    create_data_property_or_throw(rt, deleted, PropertyKey::String(k.to_string()), v)?;
                 }
             }
-            let _ = rt.set_property(deleted, "length", JsValue::Number(del_count as f64));
+            rt.set_property_key_strict(
+                deleted,
+                PropertyKey::from("length"),
+                JsValue::Number(del_count as f64),
+                true,
+            )?;
             let insert = if args.len() > 2 { &args[2..] } else { &[] };
-            let ic = insert.len();
             if ic < del_count {
                 for k in start..(len - del_count) {
                     let from = PropertyKey::String((k + del_count).to_string());
@@ -563,10 +576,7 @@ pub fn init(rt: &mut JsRuntime) {
                 return Err(JsError::type_err("Callback is not a function"));
             }
             let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-            let out = rt.heap.alloc_object(JsObject::new(
-                Some(rt.intrinsics.array_proto),
-                ObjectKind::Array(ArrayData::with_len(len)),
-            ));
+            let out = array_species_create(rt, oid, len)?;
             for k in 0..len {
                 let pk = PropertyKey::String(k.to_string());
                 if rt.has_property(oid, &pk)? {
@@ -576,7 +586,7 @@ pub fn init(rt: &mut JsRuntime) {
                         this_arg.clone(),
                         &[v, JsValue::Number(k as f64), JsValue::Object(oid)],
                     )?;
-                    let _ = rt.set_property(out, &k.to_string(), mapped);
+                    create_data_property_or_throw(rt, out, pk, mapped)?;
                 }
             }
             Ok(JsValue::Object(out))
@@ -1036,7 +1046,10 @@ pub fn init(rt: &mut JsRuntime) {
             let oid = rt.to_object(&this)?;
             let len_v = rt.get_property(oid, "length")?;
             let len = to_length(rt.to_number(&len_v)?);
-            let mut out = Vec::with_capacity(len);
+            if len > u32::MAX as usize {
+                return Err(JsError::range("Invalid array length"));
+            }
+            let mut out = Vec::with_capacity(len.min(1024));
             for k in (0..len).rev() {
                 out.push(rt.get_property(oid, &k.to_string())?);
             }
@@ -1057,7 +1070,10 @@ pub fn init(rt: &mut JsRuntime) {
             let oid = rt.to_object(&this)?;
             let len_v = rt.get_property(oid, "length")?;
             let len = to_length(rt.to_number(&len_v)?);
-            let mut items = Vec::with_capacity(len);
+            if len > u32::MAX as usize {
+                return Err(JsError::range("Invalid array length"));
+            }
+            let mut items = Vec::with_capacity(len.min(1024));
             let mut undefs = 0usize;
             for k in 0..len {
                 let v = rt.get_property(oid, &k.to_string())?;
@@ -1085,15 +1101,22 @@ pub fn init(rt: &mut JsRuntime) {
             let len_v = rt.get_property(oid, "length")?;
             let len = to_length(rt.to_number(&len_v)?);
             let start = resolve_index(rt, args.first(), len, 0)?;
-            let skip = if args.is_empty() {
-                0
+            let (insert_count, skip) = if args.is_empty() {
+                (0usize, 0usize)
             } else if args.len() == 1 {
-                len - start
+                (0usize, len - start)
             } else {
                 let dc = to_integer_or_infinity(rt.to_number(&args[1])?);
-                dc.clamp(0.0, (len - start) as f64) as usize
+                (args.len() - 2, dc.clamp(0.0, (len - start) as f64) as usize)
             };
-            let mut out = Vec::new();
+            let new_len = (len - skip).saturating_add(insert_count);
+            if new_len > 9_007_199_254_740_991 {
+                return Err(JsError::type_err("Invalid array length"));
+            }
+            if new_len > u32::MAX as usize {
+                return Err(JsError::range("Invalid array length"));
+            }
+            let mut out = Vec::with_capacity(new_len.min(1024));
             for k in 0..start {
                 out.push(rt.get_property(oid, &k.to_string())?);
             }
@@ -1123,9 +1146,12 @@ pub fn init(rt: &mut JsRuntime) {
             if actual < 0.0 || actual >= len as f64 {
                 return Err(JsError::range("Invalid index in Array.prototype.with"));
             }
+            if len > u32::MAX as usize {
+                return Err(JsError::range("Invalid array length"));
+            }
             let idx = actual as usize;
             let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-            let mut out = Vec::with_capacity(len);
+            let mut out = Vec::with_capacity(len.min(1024));
             for k in 0..len {
                 if k == idx {
                     out.push(val.clone());
@@ -1468,6 +1494,9 @@ pub fn array_species_create(
 ) -> Result<ObjectId, JsError> {
     let is_arr = is_array_val_checked(rt, &JsValue::Object(orig))?;
     if !is_arr {
+        if length > u32::MAX as usize {
+            return Err(JsError::range("Invalid array length"));
+        }
         return Ok(rt.heap.alloc_object(JsObject::new(
             Some(rt.intrinsics.array_proto),
             ObjectKind::Array(ArrayData::with_len(length)),
@@ -1494,6 +1523,9 @@ pub fn array_species_create(
         }
     }
     if ctor.is_undefined() {
+        if length > u32::MAX as usize {
+            return Err(JsError::range("Invalid array length"));
+        }
         return Ok(rt.heap.alloc_object(JsObject::new(
             Some(rt.intrinsics.array_proto),
             ObjectKind::Array(ArrayData::with_len(length)),

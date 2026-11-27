@@ -336,17 +336,33 @@ impl JsRuntime {
     }
 
     pub fn init_instance_fields(&mut self, ctor_id: ObjectId, inst: ObjectId) -> Result<(), JsError> {
-        let (brand, field_inits, env) = match &self.heap.get_obj(ctor_id).kind {
-            ObjectKind::Function(f) => (f.class_brand, f.field_inits.clone(), f.env),
+        let (brand, field_inits, env, home_object) = match &self.heap.get_obj(ctor_id).kind {
+            ObjectKind::Function(f) => (f.class_brand, f.field_inits.clone(), f.env, f.home_object),
             _ => return Ok(()),
         };
         if let Some(b) = brand {
-            self.heap.get_obj_mut(inst).class_brands.push(b);
+            let has_private_methods = home_object
+                .map(|ho| self.heap.get_obj(ho).private_fields.keys().any(|(kb, _)| *kb == b))
+                .unwrap_or(false);
+            if has_private_methods && self.heap.get_obj(inst).class_brands.contains(&b) {
+                return Err(JsError::type_err(
+                    "Cannot initialize private methods twice on the same object",
+                ));
+            }
+            if !self.heap.get_obj(inst).class_brands.contains(&b) {
+                self.heap.get_obj_mut(inst).class_brands.push(b);
+            }
         }
         for fi in field_inits.iter() {
             let val = if let Some(ref chunk) = fi.init_chunk {
                 let mut fenv = EnvRecord::new(Some(env), true, true);
                 fenv.this_binding = Some(JsValue::Object(inst));
+                fenv.new_target = Some(JsValue::Undefined);
+                fenv.home_object = home_object;
+                fenv.allow_super_prop = true;
+                fenv.allow_new_target = true;
+                fenv.allow_private = true;
+                fenv.forbid_arguments = true;
                 let eid = self.heap.alloc_env(fenv);
                 self.exec_script_chunk(chunk.clone(), eid, true)?
             } else {
@@ -354,27 +370,35 @@ impl JsRuntime {
             };
             match &fi.key {
                 FieldKeySpec::Name(name) => {
-                    self.define_property(
+                    if !self.define_property(
                         inst,
                         PropertyKey::String(name.clone()),
                         PropertyDescriptor::data(val, true, true, true),
-                    )?;
+                    )? {
+                        return Err(JsError::type_err("Cannot define class field"));
+                    }
                 }
                 FieldKeySpec::Computed(key_box) => {
                     let kv = self.get_property(*key_box, "k")?;
                     let pk = self.to_property_key(&kv)?;
-                    self.define_property(
+                    if !self.define_property(
                         inst,
                         pk,
                         PropertyDescriptor::data(val, true, true, true),
-                    )?;
+                    )? {
+                        return Err(JsError::type_err("Cannot define class field"));
+                    }
                 }
                 FieldKeySpec::Private(name) => {
                     let b = brand.unwrap_or(0);
-                    self.heap
-                        .get_obj_mut(inst)
-                        .private_fields
-                        .insert((b, name.clone()), PropEntry::data(val, true, false, false));
+                    let pf = &mut self.heap.get_obj_mut(inst).private_fields;
+                    if pf.contains_key(&(b, name.clone())) {
+                        return Err(JsError::type_err(format!(
+                            "Cannot initialize private field #{} twice on the same object",
+                            name
+                        )));
+                    }
+                    pf.insert((b, name.clone()), PropEntry::data(val, true, false, false));
                 }
             }
         }
@@ -524,7 +548,7 @@ impl JsRuntime {
             ));
         }
 
-        let parent_env = if !func.name.is_empty() && !func.is_arrow {
+        let parent_env = if !func.name.is_empty() && !func.is_arrow && func.home_object.is_none() {
             let mut name_env = EnvRecord::new(Some(func.env), false, func.strict);
             name_env.bindings.insert(
                 func.name.clone(),
@@ -1997,7 +2021,7 @@ impl JsRuntime {
                 let JsValue::Object(oid) = obj_val else {
                     return Err(JsError::type_err("Cannot read private member from non-object"));
                 };
-                let val = self.get_private_field(oid, &name)?;
+                let val = self.get_private_field(oid, &name, frame.env)?;
                 frame.stack.push(val);
             }
             Op::SetPrivate(idx) => {
@@ -2007,7 +2031,7 @@ impl JsRuntime {
                 let JsValue::Object(oid) = obj_val else {
                     return Err(JsError::type_err("Cannot write private member to non-object"));
                 };
-                self.set_private_field(oid, &name, val.clone())?;
+                self.set_private_field(oid, &name, val.clone(), frame.env)?;
                 frame.stack.push(val);
             }
             Op::HasPrivate(idx) => {
@@ -2018,21 +2042,25 @@ impl JsRuntime {
                         "Right-hand side of private 'in' must be an object",
                     ));
                 };
-                let mut found = false;
-                let mut cur = Some(oid);
-                while let Some(id) = cur {
-                    if self
-                        .heap
-                        .get_obj(id)
-                        .private_fields
-                        .keys()
-                        .any(|(_, k)| k == &name)
-                    {
-                        found = true;
-                        break;
+                let found = if let Some((brand, is_static, holder)) =
+                    self.resolve_private_binding(frame.env, &name)
+                {
+                    if is_static {
+                        self.heap
+                            .get_obj(oid)
+                            .private_fields
+                            .contains_key(&(brand, name.clone()))
+                    } else if holder.is_some() {
+                        self.heap.get_obj(oid).class_brands.contains(&brand)
+                    } else {
+                        self.heap
+                            .get_obj(oid)
+                            .private_fields
+                            .contains_key(&(brand, name.clone()))
                     }
-                    cur = self.heap.get_obj(id).prototype;
-                }
+                } else {
+                    false
+                };
                 frame.stack.push(JsValue::Boolean(found));
             }
             Op::GetSuperProp(idx) => {
@@ -2184,8 +2212,28 @@ impl JsRuntime {
                     unreachable!();
                 };
                 if let JsValue::Object(fid) = val {
+                    let is_anon = matches!(
+                        &self.heap.get_obj(fid).kind,
+                        ObjectKind::Function(f) if f.name.is_empty()
+                    );
                     if let ObjectKind::Function(ref mut f) = self.heap.get_obj_mut(fid).kind {
                         f.home_object = Some(oid);
+                    }
+                    if is_anon {
+                        let fn_name = match &key {
+                            PropertyKey::String(s) => s.clone(),
+                            PropertyKey::Symbol(sid) => match self.heap.symbol_description(*sid) {
+                                Some(d) => format!("[{}]", d),
+                                None => String::new(),
+                            },
+                        };
+                        if let ObjectKind::Function(ref mut f) = self.heap.get_obj_mut(fid).kind {
+                            f.name = fn_name.clone();
+                        }
+                        self.heap.get_obj_mut(fid).set_own_prop(
+                            PropertyKey::from("name"),
+                            PropEntry::data(JsValue::String(fn_name), false, false, true),
+                        );
                     }
                 }
                 self.heap
@@ -2199,10 +2247,16 @@ impl JsRuntime {
                     unreachable!();
                 };
                 if let JsValue::Object(fid) = getter {
+                    let fn_name = format!("get {}", name);
                     let fobj = self.heap.get_obj_mut(fid);
                     if let ObjectKind::Function(ref mut f) = fobj.kind {
                         f.home_object = Some(oid);
+                        f.name = fn_name.clone();
                     }
+                    fobj.set_own_prop(
+                        PropertyKey::from("name"),
+                        PropEntry::data(JsValue::String(fn_name), false, false, true),
+                    );
                     fobj.remove_own_prop(&PropertyKey::from("prototype"));
                 }
                 self.define_property(
@@ -2225,10 +2279,16 @@ impl JsRuntime {
                     unreachable!();
                 };
                 if let JsValue::Object(fid) = setter {
+                    let fn_name = format!("set {}", name);
                     let fobj = self.heap.get_obj_mut(fid);
                     if let ObjectKind::Function(ref mut f) = fobj.kind {
                         f.home_object = Some(oid);
+                        f.name = fn_name.clone();
                     }
+                    fobj.set_own_prop(
+                        PropertyKey::from("name"),
+                        PropEntry::data(JsValue::String(fn_name), false, false, true),
+                    );
                     fobj.remove_own_prop(&PropertyKey::from("prototype"));
                 }
                 self.define_property(
@@ -2252,10 +2312,23 @@ impl JsRuntime {
                     unreachable!();
                 };
                 if let JsValue::Object(fid) = getter {
+                    let base = match &key {
+                        PropertyKey::String(s) => s.clone(),
+                        PropertyKey::Symbol(sid) => match self.heap.symbol_description(*sid) {
+                            Some(d) => format!("[{}]", d),
+                            None => String::new(),
+                        },
+                    };
+                    let fn_name = format!("get {}", base);
                     let fobj = self.heap.get_obj_mut(fid);
                     if let ObjectKind::Function(ref mut f) = fobj.kind {
                         f.home_object = Some(oid);
+                        f.name = fn_name.clone();
                     }
+                    fobj.set_own_prop(
+                        PropertyKey::from("name"),
+                        PropEntry::data(JsValue::String(fn_name), false, false, true),
+                    );
                     fobj.remove_own_prop(&PropertyKey::from("prototype"));
                 }
                 self.define_property(
@@ -2279,10 +2352,23 @@ impl JsRuntime {
                     unreachable!();
                 };
                 if let JsValue::Object(fid) = setter {
+                    let base = match &key {
+                        PropertyKey::String(s) => s.clone(),
+                        PropertyKey::Symbol(sid) => match self.heap.symbol_description(*sid) {
+                            Some(d) => format!("[{}]", d),
+                            None => String::new(),
+                        },
+                    };
+                    let fn_name = format!("set {}", base);
                     let fobj = self.heap.get_obj_mut(fid);
                     if let ObjectKind::Function(ref mut f) = fobj.kind {
                         f.home_object = Some(oid);
+                        f.name = fn_name.clone();
                     }
+                    fobj.set_own_prop(
+                        PropertyKey::from("name"),
+                        PropEntry::data(JsValue::String(fn_name), false, false, true),
+                    );
                     fobj.remove_own_prop(&PropertyKey::from("prototype"));
                 }
                 self.define_property(
@@ -3356,13 +3442,45 @@ impl JsRuntime {
             PropEntry::data(JsValue::Object(ctor_id), true, false, true),
         );
 
+        for f in &tmpl.fields {
+            if f.is_private {
+                let pname = f.name.clone().unwrap_or_default();
+                let holder = if f.is_static { Some(ctor_id) } else { None };
+                self.heap
+                    .get_env_mut(class_env)
+                    .private_bindings
+                    .insert(pname, (brand, f.is_static, holder));
+            }
+        }
+
         for (m, key) in tmpl.methods.iter().zip(method_keys.into_iter()) {
             let target = if m.is_static { ctor_id } else { proto };
             let fn_id = self.create_js_function(&m.func, class_env);
+            let base_name = if m.is_private {
+                format!("#{}", m.name.as_deref().unwrap_or(""))
+            } else {
+                match &key {
+                    PropertyKey::String(s) => s.clone(),
+                    PropertyKey::Symbol(sid) => match self.heap.symbol_description(*sid) {
+                        Some(d) => format!("[{}]", d),
+                        None => String::new(),
+                    },
+                }
+            };
+            let full_name = match m.kind {
+                MethodKind::Get => format!("get {}", base_name),
+                MethodKind::Set => format!("set {}", base_name),
+                _ => base_name,
+            };
             if let ObjectKind::Function(ref mut f) = self.heap.get_obj_mut(fn_id).kind {
                 f.home_object = Some(target);
                 f.class_brand = Some(brand);
+                f.name = full_name.clone();
             }
+            self.heap.get_obj_mut(fn_id).set_own_prop(
+                PropertyKey::from("name"),
+                PropEntry::data(JsValue::String(full_name), false, false, true),
+            );
             if !m.func.is_generator {
                 self.heap
                     .get_obj_mut(fn_id)
@@ -3370,6 +3488,10 @@ impl JsRuntime {
             }
             if m.is_private {
                 let pname = m.name.clone().unwrap_or_default();
+                self.heap
+                    .get_env_mut(class_env)
+                    .private_bindings
+                    .insert(pname.clone(), (brand, m.is_static, Some(target)));
                 let pf = &mut self.heap.get_obj_mut(target).private_fields;
                 match m.kind {
                     MethodKind::Get => {
@@ -3459,9 +3581,12 @@ impl JsRuntime {
             let val = if let Some(ref chunk) = sf.init_chunk {
                 let mut fenv = EnvRecord::new(Some(class_env), true, true);
                 fenv.this_binding = Some(JsValue::Object(ctor_id));
+                fenv.new_target = Some(JsValue::Undefined);
+                fenv.home_object = Some(ctor_id);
                 fenv.allow_super_prop = true;
                 fenv.allow_new_target = true;
                 fenv.allow_private = true;
+                fenv.forbid_arguments = true;
                 let eid = self.heap.alloc_env(fenv);
                 self.exec_script_chunk(chunk.clone(), eid, true)?
             } else {
@@ -3469,20 +3594,24 @@ impl JsRuntime {
             };
             match sf.key {
                 FieldKeySpec::Name(name) => {
-                    self.define_property(
+                    if !self.define_property(
                         ctor_id,
                         PropertyKey::String(name),
                         PropertyDescriptor::data(val, true, true, true),
-                    )?;
+                    )? {
+                        return Err(JsError::type_err("Cannot define static class field"));
+                    }
                 }
                 FieldKeySpec::Computed(key_box) => {
                     let kv = self.get_property(key_box, "k")?;
                     let pk = self.to_property_key(&kv)?;
-                    self.define_property(
+                    if !self.define_property(
                         ctor_id,
                         pk,
                         PropertyDescriptor::data(val, true, true, true),
-                    )?;
+                    )? {
+                        return Err(JsError::type_err("Cannot define static class field"));
+                    }
                 }
                 FieldKeySpec::Private(name) => {
                     self.heap
@@ -3496,9 +3625,12 @@ impl JsRuntime {
         for sb in &tmpl.static_blocks {
             let mut senv = EnvRecord::new(Some(class_env), true, true);
             senv.this_binding = Some(JsValue::Object(ctor_id));
+            senv.new_target = Some(JsValue::Undefined);
+            senv.home_object = Some(ctor_id);
             senv.allow_super_prop = true;
             senv.allow_new_target = true;
             senv.allow_private = true;
+            senv.forbid_arguments = true;
             let eid = self.heap.alloc_env(senv);
             self.exec_script_chunk(sb.clone(), eid, true)?;
         }
@@ -3506,29 +3638,61 @@ impl JsRuntime {
         Ok(ctor_id)
     }
 
-    fn get_private_field(&mut self, oid: ObjectId, name: &str) -> Result<JsValue, JsError> {
-        let mut cur = Some(oid);
-        while let Some(id) = cur {
-            let found = self
-                .heap
-                .get_obj(id)
-                .private_fields
-                .iter()
-                .find(|((_, k), _)| k == name)
-                .map(|(_, e)| e.clone());
-            if let Some(entry) = found {
-                return match entry.value {
-                    PropValue::Data(v) => Ok(v),
-                    PropValue::Accessor { get, .. } => {
-                        if let Some(g) = get {
-                            self.call_function(g, JsValue::Object(oid), &[])
-                        } else {
-                            Err(JsError::type_err("Private accessor has no getter"))
-                        }
-                    }
-                };
+    fn resolve_private_binding(
+        &self,
+        env: EnvId,
+        name: &str,
+    ) -> Option<(usize, bool, Option<ObjectId>)> {
+        let mut cur = Some(env);
+        while let Some(eid) = cur {
+            let rec = self.heap.get_env(eid);
+            if let Some(&info) = rec.private_bindings.get(name) {
+                return Some(info);
             }
-            cur = self.heap.get_obj(id).prototype;
+            cur = rec.parent;
+        }
+        None
+    }
+
+    fn get_private_field(
+        &mut self,
+        oid: ObjectId,
+        name: &str,
+        env: EnvId,
+    ) -> Result<JsValue, JsError> {
+        let Some((brand, is_static, holder)) = self.resolve_private_binding(env, name) else {
+            return Err(JsError::type_err(format!(
+                "Cannot read private member #{} from object",
+                name
+            )));
+        };
+        let key = (brand, name.to_string());
+        let entry_opt = if let Some(e) = self.heap.get_obj(oid).private_fields.get(&key) {
+            Some(e.clone())
+        } else if !is_static {
+            if let Some(holder_id) = holder {
+                if self.heap.get_obj(oid).class_brands.contains(&brand) {
+                    self.heap.get_obj(holder_id).private_fields.get(&key).cloned()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(entry) = entry_opt {
+            return match entry.value {
+                PropValue::Data(v) => Ok(v),
+                PropValue::Accessor { get, .. } => {
+                    if let Some(g) = get {
+                        self.call_function(g, JsValue::Object(oid), &[])
+                    } else {
+                        Err(JsError::type_err("Private accessor has no getter"))
+                    }
+                }
+            };
         }
         Err(JsError::type_err(format!(
             "Cannot read private member #{} from object",
@@ -3541,51 +3705,61 @@ impl JsRuntime {
         oid: ObjectId,
         name: &str,
         val: JsValue,
+        env: EnvId,
     ) -> Result<(), JsError> {
-        let key_found = self
-            .heap
-            .get_obj(oid)
-            .private_fields
-            .keys()
-            .find(|(_, k)| k == name)
-            .cloned();
-        if let Some(k) = key_found {
-            let entry = self.heap.get_obj(oid).private_fields.get(&k).unwrap().clone();
-            match entry.value {
+        let Some((brand, is_static, holder)) = self.resolve_private_binding(env, name) else {
+            return Err(JsError::type_err(format!(
+                "Cannot write private member #{} to object",
+                name
+            )));
+        };
+        let key = (brand, name.to_string());
+        if let Some(entry) = self.heap.get_obj(oid).private_fields.get(&key).cloned() {
+            return match entry.value {
                 PropValue::Data(_) => {
                     if !entry.writable {
                         return Err(JsError::type_err("Private method is not writable"));
                     }
-                    if let Some(e) = self.heap.get_obj_mut(oid).private_fields.get_mut(&k) {
+                    if let Some(e) = self.heap.get_obj_mut(oid).private_fields.get_mut(&key) {
                         e.value = PropValue::Data(val);
                     }
-                    return Ok(());
+                    Ok(())
                 }
                 PropValue::Accessor { set, .. } => {
                     if let Some(s) = set {
                         self.call_function(s, JsValue::Object(oid), &[val])?;
-                        return Ok(());
+                        Ok(())
+                    } else {
+                        Err(JsError::type_err("Private accessor has no setter"))
                     }
-                    return Err(JsError::type_err("Private accessor has no setter"));
                 }
-            }
+            };
         }
-        let mut cur = self.heap.get_obj(oid).prototype;
-        while let Some(id) = cur {
-            let found = self
-                .heap
-                .get_obj(id)
-                .private_fields
-                .iter()
-                .find(|((_, k), _)| k == name)
-                .map(|(_, e)| e.clone());
-            if let Some(entry) = found {
-                if let PropValue::Accessor { set: Some(s), .. } = entry.value {
-                    self.call_function(s, JsValue::Object(oid), &[val])?;
-                    return Ok(());
+        if !is_static {
+            if let Some(holder_id) = holder {
+                if self.heap.get_obj(oid).class_brands.contains(&brand) {
+                    if let Some(entry) = self
+                        .heap
+                        .get_obj(holder_id)
+                        .private_fields
+                        .get(&key)
+                        .cloned()
+                    {
+                        return match entry.value {
+                            PropValue::Accessor { set: Some(s), .. } => {
+                                self.call_function(s, JsValue::Object(oid), &[val])?;
+                                Ok(())
+                            }
+                            PropValue::Accessor { set: None, .. } => {
+                                Err(JsError::type_err("Private accessor has no setter"))
+                            }
+                            PropValue::Data(_) => {
+                                Err(JsError::type_err("Private method is not writable"))
+                            }
+                        };
+                    }
                 }
             }
-            cur = self.heap.get_obj(id).prototype;
         }
         Err(JsError::type_err(format!(
             "Cannot write private member #{} to object",

@@ -1,9 +1,11 @@
 pub mod array;
+pub mod atomics;
 pub mod collections;
 pub mod date;
 pub mod error;
 pub mod function;
 pub mod globals;
+pub mod iterator;
 pub mod json;
 pub mod number;
 pub mod object;
@@ -74,6 +76,7 @@ pub fn set_getter(rt: &mut JsRuntime, obj: ObjectId, name: &str, cb: NativeCallb
 
 pub fn init_builtins(rt: &mut JsRuntime) {
     init_iterators_and_generators(rt);
+    iterator::init(rt);
     object::init(rt);
     function::init(rt);
     array::init(rt);
@@ -87,6 +90,7 @@ pub fn init_builtins(rt: &mut JsRuntime) {
     promise::init(rt);
     proxy::init(rt);
     typed_array::init(rt);
+    atomics::init(rt);
     globals::init(rt);
 }
 
@@ -100,18 +104,6 @@ fn init_iterators_and_generators(rt: &mut JsRuntime) {
         "[Symbol.iterator]",
         0,
         Rc::new(|_, this, _| Ok(this)),
-    );
-    set_method(
-        rt,
-        iter_proto,
-        "next",
-        0,
-        Rc::new(|rt, this, _| {
-            let JsValue::Object(oid) = this else {
-                return Err(JsError::type_err("Iterator.next called on non-object"));
-            };
-            step_builtin_iterator(rt, oid)
-        }),
     );
 
     let to_str_tag = rt.symbols.to_string_tag;
@@ -524,6 +516,9 @@ fn step_builtin_iterator(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, J
                 }
             }
             Ok(rt.create_iter_result(m, false))
+        }
+        BuiltinIteratorKind::Wrapped(_) | BuiltinIteratorKind::Helper(_) => {
+            Err(JsError::type_err("Not a built-in iterator"))
         }
     }
 }

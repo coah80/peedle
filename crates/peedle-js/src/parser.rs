@@ -15,12 +15,14 @@ pub struct Parser<'a> {
     in_class: bool,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct EvalValidationCtx {
     pub allow_super_call: bool,
     pub allow_super_prop: bool,
     pub allow_new_target: bool,
     pub allow_private: bool,
+    pub forbid_arguments: bool,
+    pub declared_privates: std::collections::HashSet<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -2645,7 +2647,7 @@ fn is_reserved_word(s: &str, strict: bool) -> bool {
 }
 
 #[derive(Clone, Copy)]
-struct ValidationCtx {
+struct ValidationCtx<'a> {
     strict: bool,
     allow_super_call: bool,
     allow_super_prop: bool,
@@ -2655,6 +2657,8 @@ struct ValidationCtx {
     in_static_block: bool,
     forbid_yield_expr: bool,
     forbid_await_expr: bool,
+    forbid_arguments: bool,
+    privates: &'a std::collections::HashSet<String>,
 }
 
 fn is_labeled_func_decl(stmt: &Stmt) -> bool {
@@ -2680,6 +2684,8 @@ fn validate_program_early_errors(
         in_static_block: false,
         forbid_yield_expr: false,
         forbid_await_expr: false,
+        forbid_arguments: eval_ctx.forbid_arguments,
+        privates: &eval_ctx.declared_privates,
     };
     validate_stmt_list(&prog.body, ctx, true, None)?;
     Ok(())
@@ -2804,7 +2810,7 @@ fn check_strict_binding_name(name: &str, strict: bool) -> Result<(), JsError> {
 
 fn validate_stmt_list(
     stmts: &[Stmt],
-    ctx: ValidationCtx,
+    ctx: ValidationCtx<'_>,
     is_top_or_fn_body: bool,
     param_names: Option<&std::collections::HashSet<String>>,
 ) -> Result<(), JsError> {
@@ -2917,7 +2923,7 @@ fn validate_stmt_list(
     Ok(())
 }
 
-fn validate_stmt(stmt: &Stmt, ctx: ValidationCtx) -> Result<(), JsError> {
+fn validate_stmt(stmt: &Stmt, ctx: ValidationCtx<'_>) -> Result<(), JsError> {
     match stmt {
         Stmt::Block(stmts) => validate_stmt_list(stmts, ctx, false, None),
         Stmt::VarDecl { decls, .. } => {
@@ -3149,7 +3155,7 @@ fn validate_stmt(stmt: &Stmt, ctx: ValidationCtx) -> Result<(), JsError> {
 
 fn validate_function(
     func: &FuncNode,
-    outer_ctx: ValidationCtx,
+    outer_ctx: ValidationCtx<'_>,
     allow_super_call: bool,
     allow_super_prop: bool,
 ) -> Result<(), JsError> {
@@ -3161,7 +3167,7 @@ fn validate_function(
         .params
         .iter()
         .all(|p| !p.rest && matches!(p.pattern, Pattern::Ident(_)));
-    let forbid_dupes = fn_strict || func.is_arrow || !has_simple_params;
+    let forbid_dupes = fn_strict || func.is_arrow || !has_simple_params || allow_super_prop;
 
     let mut param_names = std::collections::HashSet::new();
     let param_ctx = ValidationCtx {
@@ -3191,6 +3197,12 @@ fn validate_function(
         forbid_yield_expr: func.is_generator || (func.is_arrow && outer_ctx.forbid_yield_expr),
         forbid_await_expr: func.is_async
             || (func.is_arrow && (outer_ctx.forbid_await_expr || outer_ctx.in_static_block)),
+        forbid_arguments: if func.is_arrow {
+            outer_ctx.forbid_arguments
+        } else {
+            false
+        },
+        privates: outer_ctx.privates,
     };
 
     for p in &func.params {
@@ -3237,6 +3249,12 @@ fn validate_function(
         in_static_block: false,
         forbid_yield_expr: false,
         forbid_await_expr: false,
+        forbid_arguments: if func.is_arrow {
+            outer_ctx.forbid_arguments
+        } else {
+            false
+        },
+        privates: outer_ctx.privates,
     };
 
     match &func.body {
@@ -3245,12 +3263,7 @@ fn validate_function(
     }
 }
 
-fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx) -> Result<(), JsError> {
-    let cls_ctx = ValidationCtx {
-        strict: true,
-        allow_private: true,
-        ..outer_ctx
-    };
+fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx<'_>) -> Result<(), JsError> {
     if let Some(ref n) = cls.name {
         check_strict_binding_name(n, true)?;
     }
@@ -3258,6 +3271,33 @@ fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx) -> Result<(), JsErr
         validate_expr(sup, ValidationCtx { strict: true, ..outer_ctx })?;
     }
     let has_super = cls.super_class.is_some();
+    let mut has_ctor = false;
+    let mut private_names: std::collections::HashMap<String, (bool, u8)> =
+        std::collections::HashMap::new();
+    let mut merged_privates = outer_ctx.privates.clone();
+    for el in &cls.elements {
+        match el {
+            ClassElement::Method {
+                key: PropKey::Private(pn),
+                is_private: true,
+                ..
+            }
+            | ClassElement::Field {
+                key: PropKey::Private(pn),
+                is_private: true,
+                ..
+            } => {
+                merged_privates.insert(pn.clone());
+            }
+            _ => {}
+        }
+    }
+    let cls_ctx = ValidationCtx {
+        strict: true,
+        allow_private: true,
+        privates: &merged_privates,
+        ..outer_ctx
+    };
     for el in &cls.elements {
         match el {
             ClassElement::Method {
@@ -3265,15 +3305,114 @@ fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx) -> Result<(), JsErr
                 kind,
                 func,
                 is_static,
-                ..
+                is_private,
             } => {
+                if *kind == MethodKind::Get && !func.params.is_empty() {
+                    return Err(JsError::syntax("Getter must not have any formal parameters"));
+                }
+                if *kind == MethodKind::Set
+                    && (func.params.len() != 1 || func.params[0].rest)
+                {
+                    return Err(JsError::syntax(
+                        "Setter must have exactly one formal parameter",
+                    ));
+                }
+                if *is_private {
+                    if let PropKey::Private(pn) = key {
+                        if pn == "constructor" {
+                            return Err(JsError::syntax(
+                                "Classes may not have a private element named #constructor",
+                            ));
+                        }
+                        let mask: u8 = match kind {
+                            MethodKind::Get => 2,
+                            MethodKind::Set => 4,
+                            _ => 1,
+                        };
+                        if let Some(&(prev_static, prev_mask)) = private_names.get(pn) {
+                            let ok_pair = prev_static == *is_static
+                                && ((prev_mask == 2 && mask == 4) || (prev_mask == 4 && mask == 2));
+                            if !ok_pair {
+                                return Err(JsError::syntax(format!(
+                                    "Identifier '#{}' has already been declared",
+                                    pn
+                                )));
+                            }
+                            private_names.insert(pn.clone(), (prev_static, prev_mask | mask));
+                        } else {
+                            private_names.insert(pn.clone(), (*is_static, mask));
+                        }
+                    }
+                } else {
+                    if *is_static
+                        && matches!(key, PropKey::Ident(s) | PropKey::String(s) if s == "prototype")
+                    {
+                        return Err(JsError::syntax(
+                            "Classes may not have a static property named prototype",
+                        ));
+                    }
+                    if !*is_static
+                        && matches!(key, PropKey::Ident(s) | PropKey::String(s) if s == "constructor")
+                    {
+                        if *kind == MethodKind::Get || *kind == MethodKind::Set {
+                            return Err(JsError::syntax(
+                                "Class constructor may not be an accessor",
+                            ));
+                        }
+                        if func.is_async || func.is_generator {
+                            return Err(JsError::syntax(
+                                "Class constructor may not be async or generator",
+                            ));
+                        }
+                        if has_ctor {
+                            return Err(JsError::syntax(
+                                "A class may only have one constructor",
+                            ));
+                        }
+                        has_ctor = true;
+                    }
+                }
                 if let PropKey::Computed(e) = key {
                     validate_expr(e, cls_ctx)?;
                 }
                 let is_derived_ctor = *kind == MethodKind::Constructor && !*is_static && has_super;
                 validate_function(func, cls_ctx, is_derived_ctor, true)?;
             }
-            ClassElement::Field { key, init, .. } => {
+            ClassElement::Field {
+                key,
+                init,
+                is_static,
+                is_private,
+            } => {
+                if *is_private {
+                    if let PropKey::Private(pn) = key {
+                        if pn == "constructor" {
+                            return Err(JsError::syntax(
+                                "Classes may not have a private element named #constructor",
+                            ));
+                        }
+                        if private_names.contains_key(pn) {
+                            return Err(JsError::syntax(format!(
+                                "Identifier '#{}' has already been declared",
+                                pn
+                            )));
+                        }
+                        private_names.insert(pn.clone(), (*is_static, 1));
+                    }
+                } else {
+                    if matches!(key, PropKey::Ident(s) | PropKey::String(s) if s == "constructor") {
+                        return Err(JsError::syntax(
+                            "Classes may not have a field named constructor",
+                        ));
+                    }
+                    if *is_static
+                        && matches!(key, PropKey::Ident(s) | PropKey::String(s) if s == "prototype")
+                    {
+                        return Err(JsError::syntax(
+                            "Classes may not have a static property named prototype",
+                        ));
+                    }
+                }
                 if let PropKey::Computed(e) = key {
                     validate_expr(e, cls_ctx)?;
                 }
@@ -3288,6 +3427,8 @@ fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx) -> Result<(), JsErr
                         in_static_block: false,
                         forbid_yield_expr: false,
                         forbid_await_expr: false,
+                        forbid_arguments: true,
+                        privates: &merged_privates,
                     };
                     validate_expr(e, field_ctx)?;
                 }
@@ -3303,6 +3444,8 @@ fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx) -> Result<(), JsErr
                     in_static_block: true,
                     forbid_yield_expr: true,
                     forbid_await_expr: true,
+                    forbid_arguments: true,
+                    privates: &merged_privates,
                 };
                 validate_stmt_list(stmts, sb_ctx, true, None)?;
             }
@@ -3311,7 +3454,7 @@ fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx) -> Result<(), JsErr
     Ok(())
 }
 
-fn validate_pattern(pat: &Pattern, ctx: ValidationCtx) -> Result<(), JsError> {
+fn validate_pattern(pat: &Pattern, ctx: ValidationCtx<'_>) -> Result<(), JsError> {
     match pat {
         Pattern::Ident(n) => {
             if is_reserved_word(n, ctx.strict) {
@@ -3352,7 +3495,7 @@ fn validate_pattern(pat: &Pattern, ctx: ValidationCtx) -> Result<(), JsError> {
     }
 }
 
-fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
+fn validate_expr(expr: &Expr, ctx: ValidationCtx<'_>) -> Result<(), JsError> {
     match expr {
         Expr::Ident(n) => {
             if is_reserved_word(n, ctx.strict) {
@@ -3360,6 +3503,11 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
             }
             if ctx.in_static_block && n == "await" {
                 return Err(JsError::syntax("Cannot use 'await' in class static block"));
+            }
+            if ctx.forbid_arguments && n == "arguments" {
+                return Err(JsError::syntax(
+                    "'arguments' is not allowed in class field initializer or static block",
+                ));
             }
             Ok(())
         }
@@ -3405,8 +3553,11 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
             }
             match property {
                 MemberProp::Computed(e) => validate_expr(e, ctx)?,
-                MemberProp::Private(_) if !ctx.allow_private => {
-                    return Err(JsError::syntax("Private identifier outside class"));
+                MemberProp::Private(pn) if !ctx.allow_private || !ctx.privates.contains(pn) => {
+                    return Err(JsError::syntax(format!(
+                        "Private field '#{}' must be declared in an enclosing class",
+                        pn
+                    )));
                 }
                 _ => {}
             }
@@ -3459,7 +3610,19 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
                         }
                         validate_expr(value, ctx)?;
                     }
-                    ObjectProp::Method { key, func, .. } => {
+                    ObjectProp::Method { key, kind, func } => {
+                        if *kind == MethodKind::Get && !func.params.is_empty() {
+                            return Err(JsError::syntax(
+                                "Getter must not have any formal parameters",
+                            ));
+                        }
+                        if *kind == MethodKind::Set
+                            && (func.params.len() != 1 || func.params[0].rest)
+                        {
+                            return Err(JsError::syntax(
+                                "Setter must have exactly one formal parameter",
+                            ));
+                        }
                         if let PropKey::Computed(e) = key {
                             validate_expr(e, ctx)?;
                         }
@@ -3488,9 +3651,12 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
             }
             validate_expr(e, ctx)
         }
-        Expr::PrivateIn { right: e, .. } => {
-            if !ctx.allow_private {
-                return Err(JsError::syntax("Private identifier outside class"));
+        Expr::PrivateIn { name, right: e } => {
+            if !ctx.allow_private || !ctx.privates.contains(name) {
+                return Err(JsError::syntax(format!(
+                    "Private field '#{}' must be declared in an enclosing class",
+                    name
+                )));
             }
             validate_expr(e, ctx)
         }
@@ -3531,8 +3697,13 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
                     }
                     match property {
                         MemberProp::Computed(e) => validate_expr(e, ctx)?,
-                        MemberProp::Private(_) if !ctx.allow_private => {
-                            return Err(JsError::syntax("Private identifier outside class"));
+                        MemberProp::Private(pn)
+                            if !ctx.allow_private || !ctx.privates.contains(pn) =>
+                        {
+                            return Err(JsError::syntax(format!(
+                                "Private field '#{}' must be declared in an enclosing class",
+                                pn
+                            )));
                         }
                         _ => {}
                     }

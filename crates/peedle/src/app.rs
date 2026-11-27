@@ -2,7 +2,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 
 use peedle_engine::Page;
-use peedle_render::{ClipRect, FontSystem, Framebuffer};
+use peedle_render::{ClipRect, FontSystem, Framebuffer, RgbaColor};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -82,7 +82,7 @@ impl BrowserApp {
         }
     }
 
-    fn run_find(&mut self, advance: bool) {
+    fn run_find(&mut self, delta: i32) {
         let q = self.chrome.find_query.trim().to_ascii_lowercase();
         if q.is_empty() {
             self.chrome.find_match_count = 0;
@@ -106,8 +106,14 @@ impl BrowserApp {
             self.chrome.find_match_index = 0;
             return;
         }
-        if advance {
+        if delta > 0 {
             self.chrome.find_match_index = (self.chrome.find_match_index + 1) % ys.len();
+        } else if delta < 0 {
+            self.chrome.find_match_index = if self.chrome.find_match_index == 0 {
+                ys.len() - 1
+            } else {
+                self.chrome.find_match_index - 1
+            };
         } else if self.chrome.find_match_index >= ys.len() {
             self.chrome.find_match_index = 0;
         }
@@ -220,6 +226,35 @@ impl BrowserApp {
         let ph = (vh / z).ceil().max(1.0) as u32;
         let mut page_fb = Framebuffer::new(pw, ph);
         self.tabs[self.active_tab].render_to_framebuffer(&mut page_fb);
+
+        if self.chrome.find_open && !self.chrome.find_query.trim().is_empty() {
+            let q = self.chrome.find_query.trim().to_ascii_lowercase();
+            let page = &self.tabs[self.active_tab];
+            let sx = page.scroll_x;
+            let sy = page.scroll_y;
+            let st = page.js_env.dom.borrow();
+            let mut hit_idx = 0usize;
+            for b in &st.layout.boxes {
+                for frag in &b.text_fragments {
+                    if frag.text.to_ascii_lowercase().contains(&q) {
+                        let color = if hit_idx == self.chrome.find_match_index {
+                            RgbaColor::new(249, 115, 22, 130)
+                        } else {
+                            RgbaColor::new(250, 204, 21, 105)
+                        };
+                        page_fb.fill_rounded_rect(
+                            frag.x - sx - 1.0,
+                            frag.y - sy,
+                            frag.width + 2.0,
+                            frag.height,
+                            [2.0; 4],
+                            color,
+                        );
+                        hit_idx += 1;
+                    }
+                }
+            }
+        }
 
         let mut full_fb = Framebuffer::new(self.width, self.height);
         full_fb.push_clip(ClipRect {
@@ -562,11 +597,12 @@ impl ApplicationHandler for BrowserApp {
                             self.chrome.find_open = false;
                         }
                         Key::Named(NamedKey::Enter) => {
-                            self.run_find(true);
+                            let step = if self.modifiers.shift_key() { -1 } else { 1 };
+                            self.run_find(step);
                         }
                         Key::Named(NamedKey::Backspace) => {
                             self.chrome.find_query.pop();
-                            self.run_find(false);
+                            self.run_find(0);
                         }
                         _ => {
                             if let Some(txt) = &event.text {
@@ -575,7 +611,7 @@ impl ApplicationHandler for BrowserApp {
                                         self.chrome.find_query.push(c);
                                     }
                                 }
-                                self.run_find(false);
+                                self.run_find(0);
                             }
                         }
                     }

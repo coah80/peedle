@@ -62,6 +62,9 @@ pub struct Intrinsics {
     pub typed_array_proto: ObjectId,
     pub typed_array_protos: [ObjectId; 11],
     pub iterator_proto: ObjectId,
+    pub iterator_ctor: ObjectId,
+    pub iterator_helper_proto: ObjectId,
+    pub wrap_for_valid_iterator_proto: ObjectId,
     pub async_iterator_proto: ObjectId,
     pub array_iterator_proto: ObjectId,
     pub string_iterator_proto: ObjectId,
@@ -201,6 +204,10 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
     }
     let iterator_proto =
         heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
+    let iterator_helper_proto =
+        heap.alloc_object(JsObject::new(Some(iterator_proto), ObjectKind::Ordinary));
+    let wrap_for_valid_iterator_proto =
+        heap.alloc_object(JsObject::new(Some(iterator_proto), ObjectKind::Ordinary));
     let async_iterator_proto =
         heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
     let array_iterator_proto =
@@ -287,6 +294,9 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
         typed_array_proto,
         typed_array_protos,
         iterator_proto,
+        iterator_ctor: function_proto,
+        iterator_helper_proto,
+        wrap_for_valid_iterator_proto,
         async_iterator_proto,
         array_iterator_proto,
         string_iterator_proto,
@@ -548,11 +558,16 @@ impl JsRuntime {
             if rec.allow_private {
                 eval_ctx.allow_private = true;
             }
+            for pn in rec.private_bindings.keys() {
+                eval_ctx.declared_privates.insert(pn.clone());
+                eval_ctx.allow_private = true;
+            }
             if !found_this_env && rec.this_binding.is_some() {
                 found_this_env = true;
                 eval_ctx.allow_super_call = rec.allow_super_call;
                 eval_ctx.allow_super_prop = rec.allow_super_prop;
                 eval_ctx.allow_new_target = rec.allow_new_target;
+                eval_ctx.forbid_arguments = rec.forbid_arguments;
             }
             cur_e = rec.parent;
         }
@@ -1285,6 +1300,9 @@ impl JsRuntime {
             root_objs.push(r.intrinsics.function_ctor);
             root_objs.push(r.intrinsics.object_ctor);
             root_objs.push(r.intrinsics.array_ctor);
+            root_objs.push(r.intrinsics.iterator_ctor);
+            root_objs.push(r.intrinsics.iterator_helper_proto);
+            root_objs.push(r.intrinsics.wrap_for_valid_iterator_proto);
             root_objs.push(r.intrinsics.promise_ctor);
             root_objs.push(r.intrinsics.regexp_ctor);
             root_objs.push(r.intrinsics.array_buffer_ctor);
@@ -1832,6 +1850,9 @@ impl JsRuntime {
             };
             if kind_tag == 1 {
                 if k == "length" {
+                    if self.heap.non_writable_array_lengths.contains(&obj) {
+                        return Ok(false);
+                    }
                     let mut desc = PropertyDescriptor::empty();
                     desc.value = Some(val);
                     return self.array_set_length(obj, desc);
@@ -3237,6 +3258,19 @@ impl JsRuntime {
             }
             return self.prevent_extensions(target);
         }
+        if let ObjectKind::TypedArray(ref ta) = self.heap.get_obj(obj).kind {
+            let buf_id = ta.buffer;
+            let is_auto = self.heap.auto_length_views.contains(&obj);
+            let is_resizable_ab = self
+                .heap
+                .buffer_meta
+                .get(&buf_id)
+                .map(|m| m.max_byte_length.is_some() && !m.is_shared)
+                .unwrap_or(false);
+            if is_auto || is_resizable_ab {
+                return Ok(false);
+            }
+        }
         self.heap.get_obj_mut(obj).extensible = false;
         Ok(true)
     }
@@ -4140,6 +4174,8 @@ impl JsRuntime {
             BuiltinIteratorKind::RegExpMatchAll { .. } => {
                 self.intrinsics.regexp_string_iterator_proto
             }
+            BuiltinIteratorKind::Wrapped(_) => self.intrinsics.wrap_for_valid_iterator_proto,
+            BuiltinIteratorKind::Helper(_) => self.intrinsics.iterator_helper_proto,
             BuiltinIteratorKind::Keys(_) => self.intrinsics.iterator_proto,
         };
         self.heap.alloc_object(JsObject::new(

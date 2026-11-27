@@ -127,6 +127,17 @@ enum ClassAtom {
 }
 
 #[derive(Debug, Clone)]
+enum ClassSetExpr {
+    Union(Vec<ClassSetExpr>),
+    Intersection(Vec<ClassSetExpr>),
+    Difference(Vec<ClassSetExpr>),
+    Negated(Box<ClassSetExpr>),
+    Atom(ClassAtom),
+    StringLit(Vec<u32>),
+    StringProp(String),
+}
+
+#[derive(Debug, Clone)]
 enum Node {
     Seq(Vec<Node>),
     Alt(Vec<Node>),
@@ -136,6 +147,7 @@ enum Node {
         negated: bool,
         atoms: Vec<ClassAtom>,
     },
+    ClassSet(ClassSetExpr),
     Digit(bool),
     Word(bool),
     Space(bool),
@@ -837,6 +849,12 @@ impl<'a> RegexParser<'a> {
                             | '/'
                     )
                     && !(in_class && other == '-')
+                    && !(self.flags.unicode_sets
+                        && in_class
+                        && matches!(
+                            other,
+                            '&' | '!' | '#' | '%' | ',' | ':' | ';' | '<' | '=' | '>' | '@' | '`' | '~'
+                        ))
                 {
                     return Err(JsError::syntax(format!(
                         "Invalid escape '\\{}' in Unicode regex",
@@ -862,6 +880,10 @@ impl<'a> RegexParser<'a> {
     }
 
     fn parse_char_class(&mut self) -> Result<Node, JsError> {
+        if self.flags.unicode_sets {
+            let expr = self.parse_unicode_set_class()?;
+            return Ok(Node::ClassSet(expr));
+        }
         let negated = if self.peek() == Some('^') {
             self.pos += 1;
             true
@@ -874,48 +896,10 @@ impl<'a> RegexParser<'a> {
                 self.pos += 1;
                 return Ok(Node::CharClass { negated, atoms });
             }
-            if self.flags.unicode_sets && c != '\\' {
-                if matches!(c, '(' | ')' | '[' | '{' | '}' | '/' | '-' | '|') {
-                    return Err(JsError::syntax(
-                        "Invalid character in unicodeSets character class",
-                    ));
-                }
-                if matches!(
-                    c,
-                    '&' | '!'
-                        | '#'
-                        | '$'
-                        | '%'
-                        | '*'
-                        | '+'
-                        | ','
-                        | '.'
-                        | ':'
-                        | ';'
-                        | '<'
-                        | '='
-                        | '>'
-                        | '?'
-                        | '@'
-                        | '^'
-                        | '`'
-                        | '~'
-                ) && self.chars.get(self.pos + 1) == Some(&c)
-                {
-                    return Err(JsError::syntax(
-                        "Invalid double punctuator in unicodeSets character class",
-                    ));
-                }
-            }
             let first = self.parse_class_atom()?;
             if self.peek() == Some('-') && self.chars.get(self.pos + 1) != Some(&']') {
                 if let ClassAtom::Char(start) = first {
                     self.pos += 1;
-                    if self.flags.unicode_sets && self.peek() == Some('-') {
-                        return Err(JsError::syntax(
-                            "Invalid '-' in unicodeSets character class",
-                        ));
-                    }
                     let second = self.parse_class_atom()?;
                     if let ClassAtom::Char(end) = second {
                         if start > end {
@@ -937,6 +921,225 @@ impl<'a> RegexParser<'a> {
             atoms.push(first);
         }
         Err(JsError::syntax("Unterminated character class in regex"))
+    }
+
+    fn parse_unicode_set_class(&mut self) -> Result<ClassSetExpr, JsError> {
+        let negated = if self.peek() == Some('^') {
+            self.pos += 1;
+            true
+        } else {
+            false
+        };
+        if self.peek() == Some(']') {
+            self.pos += 1;
+            let empty = ClassSetExpr::Union(Vec::new());
+            return Ok(if negated {
+                ClassSetExpr::Negated(Box::new(empty))
+            } else {
+                empty
+            });
+        }
+
+        let first = self.parse_v_class_element(true)?;
+        let inner = if self.peek() == Some('-') && self.chars.get(self.pos + 1) == Some(&'-') {
+            let mut items = vec![first];
+            while self.peek() == Some('-') && self.chars.get(self.pos + 1) == Some(&'-') {
+                self.pos += 2;
+                items.push(self.parse_v_class_element(false)?);
+            }
+            if self.peek() != Some(']') {
+                return Err(JsError::syntax(
+                    "Invalid character in unicodeSets difference expression",
+                ));
+            }
+            self.pos += 1;
+            ClassSetExpr::Difference(items)
+        } else if self.peek() == Some('&') && self.chars.get(self.pos + 1) == Some(&'&') {
+            let mut items = vec![first];
+            while self.peek() == Some('&') && self.chars.get(self.pos + 1) == Some(&'&') {
+                self.pos += 2;
+                items.push(self.parse_v_class_element(false)?);
+            }
+            if self.peek() != Some(']') {
+                return Err(JsError::syntax(
+                    "Invalid character in unicodeSets intersection expression",
+                ));
+            }
+            self.pos += 1;
+            ClassSetExpr::Intersection(items)
+        } else {
+            let mut items = vec![first];
+            while let Some(c) = self.peek() {
+                if c == ']' {
+                    self.pos += 1;
+                    break;
+                }
+                if (c == '-' && self.chars.get(self.pos + 1) == Some(&'-'))
+                    || (c == '&' && self.chars.get(self.pos + 1) == Some(&'&'))
+                {
+                    return Err(JsError::syntax(
+                        "Cannot mix union and set operators in unicodeSets character class",
+                    ));
+                }
+                items.push(self.parse_v_class_element(true)?);
+            }
+            if self.pos == 0 || self.chars.get(self.pos - 1) != Some(&']') {
+                return Err(JsError::syntax("Unterminated character class in regex"));
+            }
+            if items.len() == 1 {
+                items.into_iter().next().unwrap()
+            } else {
+                ClassSetExpr::Union(items)
+            }
+        };
+
+        if negated {
+            if class_set_has_strings(&inner) {
+                return Err(JsError::syntax(
+                    "Cannot negate a unicodeSets character class that may contain strings",
+                ));
+            }
+            Ok(ClassSetExpr::Negated(Box::new(inner)))
+        } else {
+            Ok(inner)
+        }
+    }
+
+    fn parse_v_class_element(&mut self, allow_range: bool) -> Result<ClassSetExpr, JsError> {
+        let Some(c) = self.peek() else {
+            return Err(JsError::syntax("Unterminated character class in regex"));
+        };
+        if c == '[' {
+            self.pos += 1;
+            return self.parse_unicode_set_class();
+        }
+        if c == '\\' && self.chars.get(self.pos + 1) == Some(&'q') {
+            self.pos += 2;
+            if self.next() != Some('{') {
+                return Err(JsError::syntax("Expected '{' after \\q in unicodeSets"));
+            }
+            let mut alts = Vec::new();
+            let mut cur = Vec::new();
+            loop {
+                match self.peek() {
+                    None => return Err(JsError::syntax("Unterminated \\q{...} in unicodeSets")),
+                    Some('}') => {
+                        self.pos += 1;
+                        alts.push(ClassSetExpr::StringLit(cur));
+                        break;
+                    }
+                    Some('|') => {
+                        self.pos += 1;
+                        alts.push(ClassSetExpr::StringLit(cur));
+                        cur = Vec::new();
+                    }
+                    Some('\\') => {
+                        self.pos += 1;
+                        match self.parse_escape(true)? {
+                            Node::Literal(ch) => cur.push(ch),
+                            _ => {
+                                return Err(JsError::syntax(
+                                    "Invalid escape inside \\q{...} in unicodeSets",
+                                ));
+                            }
+                        }
+                    }
+                    Some(ch) => {
+                        if matches!(ch, '(' | ')' | '[' | ']' | '{' | '/' | '-') {
+                            return Err(JsError::syntax(
+                                "Invalid character inside \\q{...} in unicodeSets",
+                            ));
+                        }
+                        self.pos += 1;
+                        cur.push(ch as u32);
+                    }
+                }
+            }
+            return Ok(if alts.len() == 1 {
+                alts.into_iter().next().unwrap()
+            } else {
+                ClassSetExpr::Union(alts)
+            });
+        }
+        if c != '\\' {
+            if matches!(c, '(' | ')' | '{' | '}' | '/' | '-' | '|' | ']') {
+                return Err(JsError::syntax(
+                    "Invalid character in unicodeSets character class",
+                ));
+            }
+            if matches!(
+                c,
+                '&' | '!'
+                    | '#'
+                    | '$'
+                    | '%'
+                    | '*'
+                    | '+'
+                    | ','
+                    | '.'
+                    | ':'
+                    | ';'
+                    | '<'
+                    | '='
+                    | '>'
+                    | '?'
+                    | '@'
+                    | '^'
+                    | '`'
+                    | '~'
+            ) && self.chars.get(self.pos + 1) == Some(&c)
+            {
+                return Err(JsError::syntax(
+                    "Invalid double punctuator in unicodeSets character class",
+                ));
+            }
+        }
+        let atom = self.parse_class_atom()?;
+        if let ClassAtom::UnicodeProp(ref prop, neg) = atom {
+            if is_string_unicode_prop(prop) {
+                if neg {
+                    return Err(JsError::syntax(
+                        "Cannot negate property of strings with \\P in unicodeSets",
+                    ));
+                }
+                return Ok(ClassSetExpr::StringProp(prop.clone()));
+            }
+        }
+        if allow_range
+            && self.peek() == Some('-')
+            && self.chars.get(self.pos + 1) != Some(&'-')
+            && self.chars.get(self.pos + 1) != Some(&']')
+        {
+            if let ClassAtom::Char(start) = atom {
+                self.pos += 1;
+                let second = self.parse_v_class_char()?;
+                if start > second {
+                    return Err(JsError::syntax("Range out of order in character class"));
+                }
+                return Ok(ClassSetExpr::Atom(ClassAtom::Range(start, second)));
+            }
+            return Err(JsError::syntax(
+                "Invalid character class range in unicodeSets regex",
+            ));
+        }
+        Ok(ClassSetExpr::Atom(atom))
+    }
+
+    fn parse_v_class_char(&mut self) -> Result<u32, JsError> {
+        let Some(c) = self.peek() else {
+            return Err(JsError::syntax("Unterminated character class"));
+        };
+        if c != '\\' && matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '/' | '-' | '|') {
+            return Err(JsError::syntax(
+                "Invalid character in unicodeSets character class range",
+            ));
+        }
+        match self.parse_class_atom()? {
+            ClassAtom::Char(ch) => Ok(ch),
+            _ => Err(JsError::syntax(
+                "Invalid character class range in unicodeSets regex",
+            )),
+        }
     }
 
     fn parse_class_atom(&mut self) -> Result<ClassAtom, JsError> {
@@ -1197,10 +1400,15 @@ impl<'a> MatchState<'a> {
                 if m { cont(self, next_pos) } else { None }
             }
             Node::UnicodeProp(prop, neg) => {
+                if is_string_unicode_prop(prop) && !*neg {
+                    let expr = ClassSetExpr::StringProp(prop.clone());
+                    return self.match_class_set(&expr, pos, rev, cont);
+                }
                 let (next_pos, unit) = self.read_unit(pos, rev)?;
                 let m = match_unicode_prop(unit, prop) ^ *neg;
                 if m { cont(self, next_pos) } else { None }
             }
+            Node::ClassSet(expr) => self.match_class_set(expr, pos, rev, cont),
             Node::CharClass { negated, atoms } => {
                 let (next_pos, unit) = self.read_unit(pos, rev)?;
                 let mut matched = false;
@@ -1540,6 +1748,72 @@ impl<'a> MatchState<'a> {
         }
     }
 
+    fn match_class_set(
+        &mut self,
+        expr: &ClassSetExpr,
+        pos: usize,
+        rev: bool,
+        cont: &mut dyn FnMut(&mut Self, usize) -> Option<usize>,
+    ) -> Option<usize> {
+        let ic = self.flags.ignore_case;
+        let mut strings = collect_class_set_strings(expr, ic);
+        strings.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        strings.dedup();
+
+        let mut has_empty = false;
+        for s in &strings {
+            if s.is_empty() {
+                has_empty = true;
+                continue;
+            }
+            if s.len() < 2 {
+                continue;
+            }
+            if let Some(next_pos) = self.match_cp_seq(s, pos, rev, ic) {
+                let saved = self.captures.clone();
+                if let Some(res) = cont(self, next_pos) {
+                    return Some(res);
+                }
+                self.captures = saved;
+            }
+        }
+        if let Some((next_pos, unit)) = self.read_unit(pos, rev) {
+            if match_class_set_char(unit, expr, ic) {
+                let saved = self.captures.clone();
+                if let Some(res) = cont(self, next_pos) {
+                    return Some(res);
+                }
+                self.captures = saved;
+            }
+        }
+        if has_empty {
+            return cont(self, pos);
+        }
+        None
+    }
+
+    fn match_cp_seq(&self, seq: &[u32], pos: usize, rev: bool, ignore_case: bool) -> Option<usize> {
+        let mut cur = pos;
+        if rev {
+            for &expected in seq.iter().rev() {
+                let (next_pos, unit) = self.read_unit(cur, true)?;
+                if !chars_equal(unit, expected, ignore_case) {
+                    return None;
+                }
+                cur = next_pos;
+            }
+        } else {
+            for &expected in seq {
+                let (next_pos, unit) = self.read_unit(cur, false)?;
+                if !chars_equal(unit, expected, ignore_case) {
+                    return None;
+                }
+                cur = next_pos;
+            }
+        }
+        Some(cur)
+    }
+
     fn read_unit(&self, pos: usize, rev: bool) -> Option<(usize, u32)> {
         if rev {
             if pos == 0 {
@@ -1667,5 +1941,142 @@ fn match_unicode_prop(unit: u32, prop: &str) -> bool {
         "ASCII" => ch.is_ascii(),
         "ASCII_Hex_Digit" | "Hex_Digit" => ch.is_ascii_hexdigit(),
         _ => ch.is_alphabetic(),
+    }
+}
+
+fn is_string_unicode_prop(prop: &str) -> bool {
+    matches!(
+        prop,
+        "Emoji_Keycap_Sequence"
+            | "Basic_Emoji"
+            | "RGI_Emoji"
+            | "RGI_Emoji_Flag_Sequence"
+            | "RGI_Emoji_Modifier_Sequence"
+            | "RGI_Emoji_Tag_Sequence"
+            | "RGI_Emoji_ZWJ_Sequence"
+    )
+}
+
+fn string_prop_entries(prop: &str) -> Vec<Vec<u32>> {
+    match prop {
+        "Emoji_Keycap_Sequence" => {
+            let bases: [u32; 12] = [
+                '#' as u32, '*' as u32, '0' as u32, '1' as u32, '2' as u32, '3' as u32,
+                '4' as u32, '5' as u32, '6' as u32, '7' as u32, '8' as u32, '9' as u32,
+            ];
+            bases.iter().map(|&b| vec![b, 0xFE0F, 0x20E3]).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn class_set_has_strings(expr: &ClassSetExpr) -> bool {
+    match expr {
+        ClassSetExpr::Atom(_) | ClassSetExpr::Negated(_) => false,
+        ClassSetExpr::StringLit(cps) => cps.len() != 1,
+        ClassSetExpr::StringProp(_) => true,
+        ClassSetExpr::Union(es) => es.iter().any(class_set_has_strings),
+        ClassSetExpr::Intersection(es) => es.iter().all(class_set_has_strings),
+        ClassSetExpr::Difference(es) => es.first().is_some_and(class_set_has_strings),
+    }
+}
+
+fn match_class_set_char(unit: u32, expr: &ClassSetExpr, ignore_case: bool) -> bool {
+    match expr {
+        ClassSetExpr::Atom(a) => match_class_atom(unit, a, ignore_case),
+        ClassSetExpr::StringLit(cps) => cps.len() == 1 && chars_equal(unit, cps[0], ignore_case),
+        ClassSetExpr::StringProp(_) => false,
+        ClassSetExpr::Union(es) => es
+            .iter()
+            .any(|e| match_class_set_char(unit, e, ignore_case)),
+        ClassSetExpr::Intersection(es) => !es.is_empty()
+            && es
+                .iter()
+                .all(|e| match_class_set_char(unit, e, ignore_case)),
+        ClassSetExpr::Difference(es) => {
+            if let Some((first, rest)) = es.split_first() {
+                match_class_set_char(unit, first, ignore_case)
+                    && !rest
+                        .iter()
+                        .any(|e| match_class_set_char(unit, e, ignore_case))
+            } else {
+                false
+            }
+        }
+        ClassSetExpr::Negated(inner) => !match_class_set_char(unit, inner, ignore_case),
+    }
+}
+
+fn match_class_set_str(s: &[u32], expr: &ClassSetExpr, ignore_case: bool) -> bool {
+    if s.len() == 1 {
+        return match_class_set_char(s[0], expr, ignore_case);
+    }
+    match expr {
+        ClassSetExpr::Atom(_) | ClassSetExpr::Negated(_) => false,
+        ClassSetExpr::StringLit(cps) => {
+            cps.len() == s.len()
+                && cps
+                    .iter()
+                    .zip(s.iter())
+                    .all(|(&a, &b)| chars_equal(a, b, ignore_case))
+        }
+        ClassSetExpr::StringProp(prop) => string_prop_entries(prop).iter().any(|entry| {
+            entry.len() == s.len()
+                && entry
+                    .iter()
+                    .zip(s.iter())
+                    .all(|(&a, &b)| chars_equal(a, b, ignore_case))
+        }),
+        ClassSetExpr::Union(es) => es.iter().any(|e| match_class_set_str(s, e, ignore_case)),
+        ClassSetExpr::Intersection(es) => {
+            !es.is_empty() && es.iter().all(|e| match_class_set_str(s, e, ignore_case))
+        }
+        ClassSetExpr::Difference(es) => {
+            if let Some((first, rest)) = es.split_first() {
+                match_class_set_str(s, first, ignore_case)
+                    && !rest.iter().any(|e| match_class_set_str(s, e, ignore_case))
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn collect_class_set_strings(expr: &ClassSetExpr, ignore_case: bool) -> Vec<Vec<u32>> {
+    match expr {
+        ClassSetExpr::Atom(_) | ClassSetExpr::Negated(_) => Vec::new(),
+        ClassSetExpr::StringLit(cps) => {
+            if cps.len() != 1 {
+                vec![cps.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+        ClassSetExpr::StringProp(prop) => string_prop_entries(prop),
+        ClassSetExpr::Union(es) => {
+            let mut out = Vec::new();
+            for e in es {
+                out.extend(collect_class_set_strings(e, ignore_case));
+            }
+            out
+        }
+        ClassSetExpr::Intersection(es) => {
+            let Some((first, rest)) = es.split_first() else {
+                return Vec::new();
+            };
+            collect_class_set_strings(first, ignore_case)
+                .into_iter()
+                .filter(|s| rest.iter().all(|r| match_class_set_str(s, r, ignore_case)))
+                .collect()
+        }
+        ClassSetExpr::Difference(es) => {
+            let Some((first, rest)) = es.split_first() else {
+                return Vec::new();
+            };
+            collect_class_set_strings(first, ignore_case)
+                .into_iter()
+                .filter(|s| !rest.iter().any(|r| match_class_set_str(s, r, ignore_case)))
+                .collect()
+        }
     }
 }

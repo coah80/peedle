@@ -101,10 +101,14 @@ pub fn init(rt: &mut JsRuntime) {
             };
             match args.first() {
                 Some(JsValue::Object(p)) => {
-                    let _ = rt.set_prototype_of(oid, Some(*p))?;
+                    if !rt.set_prototype_of(oid, Some(*p))? {
+                        return Err(JsError::type_err("Cannot set prototype of object"));
+                    }
                 }
                 Some(JsValue::Null) => {
-                    let _ = rt.set_prototype_of(oid, None)?;
+                    if !rt.set_prototype_of(oid, None)? {
+                        return Err(JsError::type_err("Cannot set prototype of object"));
+                    }
                 }
                 _ => {}
             }
@@ -122,6 +126,103 @@ pub fn init(rt: &mut JsRuntime) {
             enumerable: Some(false),
             configurable: Some(true),
         },
+    );
+
+    set_method(
+        rt,
+        proto,
+        "__defineGetter__",
+        2,
+        Rc::new(|rt, this, args| {
+            let oid = rt.to_object(&this)?;
+            let getter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            if !rt.is_callable(&getter) {
+                return Err(JsError::type_err("Getter must be a function"));
+            }
+            let key = rt.to_property_key(args.first().unwrap_or(&JsValue::Undefined))?;
+            let desc = PropertyDescriptor {
+                value: None,
+                writable: None,
+                get: Some(getter),
+                set: None,
+                enumerable: Some(true),
+                configurable: Some(true),
+            };
+            if !rt.define_property(oid, key, desc)? {
+                return Err(JsError::type_err("Cannot define getter"));
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "__defineSetter__",
+        2,
+        Rc::new(|rt, this, args| {
+            let oid = rt.to_object(&this)?;
+            let setter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            if !rt.is_callable(&setter) {
+                return Err(JsError::type_err("Setter must be a function"));
+            }
+            let key = rt.to_property_key(args.first().unwrap_or(&JsValue::Undefined))?;
+            let desc = PropertyDescriptor {
+                value: None,
+                writable: None,
+                get: None,
+                set: Some(setter),
+                enumerable: Some(true),
+                configurable: Some(true),
+            };
+            if !rt.define_property(oid, key, desc)? {
+                return Err(JsError::type_err("Cannot define setter"));
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "__lookupGetter__",
+        1,
+        Rc::new(|rt, this, args| {
+            let mut cur = rt.to_object(&this)?;
+            let key = rt.to_property_key(args.first().unwrap_or(&JsValue::Undefined))?;
+            loop {
+                if let Some(d) = rt.get_own_property_descriptor(cur, &key)? {
+                    if d.is_accessor() {
+                        return Ok(d.get.unwrap_or(JsValue::Undefined));
+                    }
+                    return Ok(JsValue::Undefined);
+                }
+                match rt.get_prototype_of(cur)? {
+                    Some(p) => cur = p,
+                    None => return Ok(JsValue::Undefined),
+                }
+            }
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "__lookupSetter__",
+        1,
+        Rc::new(|rt, this, args| {
+            let mut cur = rt.to_object(&this)?;
+            let key = rt.to_property_key(args.first().unwrap_or(&JsValue::Undefined))?;
+            loop {
+                if let Some(d) = rt.get_own_property_descriptor(cur, &key)? {
+                    if d.is_accessor() {
+                        return Ok(d.set.unwrap_or(JsValue::Undefined));
+                    }
+                    return Ok(JsValue::Undefined);
+                }
+                match rt.get_prototype_of(cur)? {
+                    Some(p) => cur = p,
+                    None => return Ok(JsValue::Undefined),
+                }
+            }
+        }),
     );
 
     let ctor = rt.create_spec_constructor(
@@ -309,16 +410,38 @@ pub fn init(rt: &mut JsRuntime) {
         1,
         Rc::new(|rt, _, args| {
             let iterable = args.first().unwrap_or(&JsValue::Undefined);
-            let items = rt.collect_iterable(iterable)?;
+            if iterable.is_nullish() {
+                return Err(JsError::type_err("Object.fromEntries requires an iterable"));
+            }
             let out = rt.create_object();
-            for item in items {
-                let JsValue::Object(iid) = item else {
-                    return Err(JsError::type_err("Iterator value is not an entry object"));
+            let iter = rt.get_iterator(iterable, false)?;
+            let JsValue::Object(iter_id) = iter else {
+                return Err(JsError::type_err("Iterator must be an object"));
+            };
+            let next_fn = rt.get_property(iter_id, "next")?;
+            loop {
+                let res = rt.call_function(next_fn.clone(), iter.clone(), &[])?;
+                let JsValue::Object(res_id) = res else {
+                    return Err(JsError::type_err("Iterator result is not an object"));
                 };
-                let k = rt.get_property(iid, "0")?;
-                let v = rt.get_property(iid, "1")?;
-                let pk = rt.to_property_key(&k)?;
-                rt.define_property(out, pk, PropertyDescriptor::data(v, true, true, true))?;
+                if rt.get_property(res_id, "done")?.to_boolean() {
+                    break;
+                }
+                let item = rt.get_property(res_id, "value")?;
+                let step_res: Result<(), JsError> = (|| {
+                    let JsValue::Object(iid) = item else {
+                        return Err(JsError::type_err("Iterator value is not an entry object"));
+                    };
+                    let k = rt.get_property(iid, "0")?;
+                    let v = rt.get_property(iid, "1")?;
+                    let pk = rt.to_property_key(&k)?;
+                    rt.define_property(out, pk, PropertyDescriptor::data(v, true, true, true))?;
+                    Ok(())
+                })();
+                if let Err(e) = step_res {
+                    rt.iterator_close(&iter);
+                    return Err(e);
+                }
             }
             Ok(JsValue::Object(out))
         }),
@@ -604,7 +727,9 @@ fn set_integrity_level(rt: &mut JsRuntime, oid: ObjectId, freeze: bool) -> Resul
             if freeze && !d.is_accessor() {
                 next.writable = Some(false);
             }
-            let _ = rt.define_property(oid, k, next)?;
+            if !rt.define_property(oid, k, next)? {
+                return Err(JsError::type_err("Cannot define property"));
+            }
         }
     }
     Ok(())

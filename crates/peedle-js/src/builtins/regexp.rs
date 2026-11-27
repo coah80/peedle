@@ -563,7 +563,81 @@ pub fn init(rt: &mut JsRuntime) {
             configurable: Some(true),
         },
     );
+    set_method(
+        rt,
+        ctor,
+        "escape",
+        1,
+        Rc::new(|_, _, args| {
+            let Some(JsValue::String(s)) = args.first() else {
+                return Err(JsError::type_err("RegExp.escape argument must be a string"));
+            };
+            Ok(JsValue::String(regexp_escape_impl(s)))
+        }),
+    );
     set_global(rt, "RegExp", JsValue::Object(ctor));
+}
+
+fn regexp_escape_impl(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let mut i = 0;
+    let mut first = true;
+    while i < units.len() {
+        let u = units[i];
+        let cp: u32 = if (0xD800..=0xDBFF).contains(&u)
+            && i + 1 < units.len()
+            && (0xDC00..=0xDFFF).contains(&units[i + 1])
+        {
+            let hi = (u as u32) - 0xD800;
+            let lo = (units[i + 1] as u32) - 0xDC00;
+            i += 2;
+            0x10000 + (hi << 10) + lo
+        } else {
+            i += 1;
+            u as u32
+        };
+        if first {
+            first = false;
+            if matches!(cp, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A) {
+                out.push_str(&format!("\\x{:02x}", cp));
+                continue;
+            }
+        }
+        match cp {
+            0x09 => out.push_str("\\t"),
+            0x0A => out.push_str("\\n"),
+            0x0B => out.push_str("\\v"),
+            0x0C => out.push_str("\\f"),
+            0x0D => out.push_str("\\r"),
+            0x5E | 0x24 | 0x5C | 0x2E | 0x2A | 0x2B | 0x3F | 0x28 | 0x29 | 0x5B | 0x5D | 0x7B
+            | 0x7D | 0x7C | 0x2F => {
+                out.push('\\');
+                out.push(char::from_u32(cp).unwrap());
+            }
+            0x2C | 0x2D | 0x3D | 0x3C | 0x3E | 0x23 | 0x26 | 0x21 | 0x25 | 0x3A | 0x3B | 0x40
+            | 0x7E | 0x27 | 0x60 | 0x22 | 0x20 | 0xA0 => {
+                out.push_str(&format!("\\x{:02x}", cp));
+            }
+            0x1680
+            | 0x2000..=0x200A
+            | 0x2028
+            | 0x2029
+            | 0x202F
+            | 0x205F
+            | 0x3000
+            | 0xFEFF
+            | 0xD800..=0xDFFF => {
+                out.push_str(&format!("\\u{:04x}", cp));
+            }
+            _ => {
+                if let Some(ch) = char::from_u32(cp) {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn is_regexp_val(rt: &mut JsRuntime, val: &JsValue) -> Result<bool, JsError> {

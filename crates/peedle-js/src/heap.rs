@@ -318,6 +318,59 @@ pub struct ModuleNamespaceData {
 }
 
 #[derive(Clone)]
+pub struct IterRecord {
+    pub iterator: JsValue,
+    pub next_method: JsValue,
+}
+
+#[derive(Clone)]
+pub enum IteratorHelperKind {
+    Map {
+        iterated: IterRecord,
+        mapper: JsValue,
+        counter: usize,
+    },
+    Filter {
+        iterated: IterRecord,
+        predicate: JsValue,
+        counter: usize,
+    },
+    Take {
+        iterated: IterRecord,
+        remaining: f64,
+    },
+    Drop {
+        iterated: IterRecord,
+        remaining: f64,
+    },
+    FlatMap {
+        iterated: IterRecord,
+        mapper: JsValue,
+        counter: usize,
+        inner: Option<IterRecord>,
+    },
+    Concat {
+        iterables: Vec<(JsValue, JsValue)>,
+        pos: usize,
+        inner: Option<IterRecord>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum IteratorHelperState {
+    SuspendedStart,
+    SuspendedYield,
+    Executing,
+    Completed,
+}
+
+#[derive(Clone)]
+pub struct IteratorHelperData {
+    pub state: IteratorHelperState,
+    pub kind: IteratorHelperKind,
+}
+
+#[derive(Clone)]
 pub struct IteratorData {
     pub kind: BuiltinIteratorKind,
     pub index: usize,
@@ -336,6 +389,8 @@ pub enum BuiltinIteratorKind {
         global: bool,
         done: bool,
     },
+    Wrapped(IterRecord),
+    Helper(IteratorHelperData),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -652,6 +707,8 @@ pub struct EnvRecord {
     pub allow_super_prop: bool,
     pub allow_new_target: bool,
     pub allow_private: bool,
+    pub forbid_arguments: bool,
+    pub private_bindings: HashMap<String, (usize, bool, Option<ObjectId>)>,
 }
 
 impl EnvRecord {
@@ -675,6 +732,8 @@ impl EnvRecord {
             allow_super_prop: false,
             allow_new_target: false,
             allow_private: false,
+            forbid_arguments: false,
+            private_bindings: HashMap::new(),
         }
     }
 }
@@ -954,6 +1013,59 @@ impl Heap {
                         BuiltinIteratorKind::RegExpMatchAll { regexp, .. } => {
                             obj_stack.push(*regexp);
                         }
+                        BuiltinIteratorKind::Wrapped(rec) => {
+                            trace_value(&rec.iterator, &mut obj_stack);
+                            trace_value(&rec.next_method, &mut obj_stack);
+                        }
+                        BuiltinIteratorKind::Helper(hd) => match &hd.kind {
+                            IteratorHelperKind::Map {
+                                iterated, mapper, ..
+                            } => {
+                                trace_value(&iterated.iterator, &mut obj_stack);
+                                trace_value(&iterated.next_method, &mut obj_stack);
+                                trace_value(mapper, &mut obj_stack);
+                            }
+                            IteratorHelperKind::Filter {
+                                iterated,
+                                predicate,
+                                ..
+                            } => {
+                                trace_value(&iterated.iterator, &mut obj_stack);
+                                trace_value(&iterated.next_method, &mut obj_stack);
+                                trace_value(predicate, &mut obj_stack);
+                            }
+                            IteratorHelperKind::Take { iterated, .. }
+                            | IteratorHelperKind::Drop { iterated, .. } => {
+                                trace_value(&iterated.iterator, &mut obj_stack);
+                                trace_value(&iterated.next_method, &mut obj_stack);
+                            }
+                            IteratorHelperKind::FlatMap {
+                                iterated,
+                                mapper,
+                                inner,
+                                ..
+                            } => {
+                                trace_value(&iterated.iterator, &mut obj_stack);
+                                trace_value(&iterated.next_method, &mut obj_stack);
+                                trace_value(mapper, &mut obj_stack);
+                                if let Some(inn) = inner {
+                                    trace_value(&inn.iterator, &mut obj_stack);
+                                    trace_value(&inn.next_method, &mut obj_stack);
+                                }
+                            }
+                            IteratorHelperKind::Concat {
+                                iterables, inner, ..
+                            } => {
+                                for (it, m) in iterables {
+                                    trace_value(it, &mut obj_stack);
+                                    trace_value(m, &mut obj_stack);
+                                }
+                                if let Some(inn) = inner {
+                                    trace_value(&inn.iterator, &mut obj_stack);
+                                    trace_value(&inn.next_method, &mut obj_stack);
+                                }
+                            }
+                        },
                         BuiltinIteratorKind::String { .. } => {}
                     },
                     ObjectKind::FinalizationRegistry(fr) => {
@@ -999,6 +1111,11 @@ impl Heap {
                 }
                 for b in env.bindings.values() {
                     trace_value(&b.value, &mut obj_stack);
+                }
+                for (_, _, holder) in env.private_bindings.values() {
+                    if let Some(h) = holder {
+                        obj_stack.push(*h);
+                    }
                 }
             }
 

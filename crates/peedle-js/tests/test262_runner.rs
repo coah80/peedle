@@ -91,7 +91,7 @@ fn parse_inline_list(raw: &str, out: &mut Vec<String>) {
     }
 }
 
-fn collect_js_files(dir: &Path, limit: usize, out: &mut Vec<PathBuf>) {
+fn collect_js_files_opt(dir: &Path, limit: usize, recursive: bool, out: &mut Vec<PathBuf>) {
     if out.len() >= limit {
         return;
     }
@@ -105,7 +105,9 @@ fn collect_js_files(dir: &Path, limit: usize, out: &mut Vec<PathBuf>) {
             break;
         }
         if p.is_dir() {
-            collect_js_files(&p, limit, out);
+            if recursive {
+                collect_js_files_opt(&p, limit, true, out);
+            }
         } else if p.extension().and_then(|e| e.to_str()) == Some("js") {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !name.contains("_FIXTURE") {
@@ -348,11 +350,12 @@ fn test262_broad_suite() {
         ("language/future-reserved-words", 100),
         ("language/punctuators", 50),
         ("language/directive-prologue", 100),
+        ("language/source-text", 50),
         ("language/statementList", 100),
         ("language/global-code", 100),
-        ("language/function-code", 250),
-        ("language/arguments-object", 300),
-        ("language/eval-code", 350),
+        ("language/function-code", 300),
+        ("language/arguments-object", 350),
+        ("language/eval-code", 400),
         ("language/block-scope", 200),
         ("language/computed-property-names", 100),
         ("language/destructuring", 50),
@@ -360,18 +363,18 @@ fn test262_broad_suite() {
         ("language/expressions/addition", 60),
         ("language/expressions/array", 60),
         ("language/expressions/arrow-function", 400),
-        ("language/expressions/assignment", 500),
-        ("language/expressions/assignmenttargettype", 350),
+        ("language/expressions/assignment", 550),
+        ("language/expressions/assignmenttargettype", 400),
         ("language/expressions/async-arrow-function", 100),
-        ("language/expressions/async-function", 100),
-        ("language/expressions/async-generator", 300),
+        ("language/expressions/async-function", 150),
+        ("language/expressions/async-generator", 1000),
         ("language/expressions/await", 50),
         ("language/expressions/bitwise-and", 50),
         ("language/expressions/bitwise-not", 50),
         ("language/expressions/bitwise-or", 50),
         ("language/expressions/bitwise-xor", 50),
-        ("language/expressions/call", 100),
-        ("language/expressions/class", 400),
+        ("language/expressions/call", 150),
+        ("language/expressions/class", 5000),
         ("language/expressions/coalesce", 50),
         ("language/expressions/comma", 20),
         ("language/expressions/compound-assignment", 500),
@@ -382,8 +385,8 @@ fn test262_broad_suite() {
         ("language/expressions/does-not-equals", 50),
         ("language/expressions/equals", 60),
         ("language/expressions/exponentiation", 60),
-        ("language/expressions/function", 300),
-        ("language/expressions/generators", 300),
+        ("language/expressions/function", 350),
+        ("language/expressions/generators", 350),
         ("language/expressions/greater-than", 60),
         ("language/expressions/greater-than-or-equal", 60),
         ("language/expressions/grouping", 20),
@@ -396,22 +399,24 @@ fn test262_broad_suite() {
         ("language/expressions/logical-assignment", 100),
         ("language/expressions/logical-not", 30),
         ("language/expressions/logical-or", 30),
+        ("language/expressions/member-expression", 20),
         ("language/expressions/modulus", 50),
         ("language/expressions/multiplication", 50),
         ("language/expressions/new", 100),
         ("language/expressions/new.target", 30),
-        ("language/expressions/object", 500),
+        ("language/expressions/object", 1500),
         ("language/expressions/optional-chaining", 50),
         ("language/expressions/postfix-decrement", 50),
         ("language/expressions/postfix-increment", 50),
         ("language/expressions/prefix-decrement", 50),
         ("language/expressions/prefix-increment", 50),
         ("language/expressions/property-accessors", 30),
+        ("language/expressions/relational", 20),
         ("language/expressions/right-shift", 50),
         ("language/expressions/strict-does-not-equals", 50),
         ("language/expressions/strict-equals", 50),
         ("language/expressions/subtraction", 50),
-        ("language/expressions/super", 100),
+        ("language/expressions/super", 150),
         ("language/expressions/tagged-template", 50),
         ("language/expressions/template-literal", 100),
         ("language/expressions/this", 20),
@@ -422,32 +427,32 @@ fn test262_broad_suite() {
         ("language/expressions/void", 20),
         ("language/expressions/yield", 100),
         ("language/statements/async-function", 100),
-        ("language/statements/async-generator", 350),
+        ("language/statements/async-generator", 400),
         ("language/statements/block", 50),
         ("language/statements/break", 50),
-        ("language/statements/class", 400),
-        ("language/statements/const", 150),
+        ("language/statements/class", 5000),
+        ("language/statements/const", 200),
         ("language/statements/continue", 50),
         ("language/statements/debugger", 10),
         ("language/statements/do-while", 50),
         ("language/statements/empty", 10),
         ("language/statements/expression", 10),
-        ("language/statements/for", 400),
-        ("language/statements/for-await-of", 300),
+        ("language/statements/for", 450),
+        ("language/statements/for-await-of", 1500),
         ("language/statements/for-in", 150),
-        ("language/statements/for-of", 400),
+        ("language/statements/for-of", 1000),
         ("language/statements/function", 500),
-        ("language/statements/generators", 300),
+        ("language/statements/generators", 350),
         ("language/statements/if", 100),
         ("language/statements/labeled", 50),
-        ("language/statements/let", 150),
+        ("language/statements/let", 200),
         ("language/statements/return", 50),
         ("language/statements/switch", 150),
         ("language/statements/throw", 50),
         ("language/statements/try", 250),
-        ("language/statements/variable", 200),
+        ("language/statements/variable", 250),
         ("language/statements/while", 50),
-        ("language/statements/with", 200),
+        ("language/statements/with", 250),
         ("built-ins/global", 50),
         ("built-ins/Infinity", 20),
         ("built-ins/NaN", 20),
@@ -461,21 +466,50 @@ fn test262_broad_suite() {
         ("built-ins/encodeURI", 50),
         ("built-ins/encodeURIComponent", 50),
         ("built-ins/eval", 50),
-        ("built-ins/Object", 1000),
-        ("built-ins/Array", 1000),
-        ("built-ins/String", 800),
-        ("built-ins/Number", 350),
-        ("built-ins/Math", 350),
+        ("built-ins/Object", 4000),
+        ("built-ins/Array", 4000),
+        ("built-ins/String", 1500),
+        ("built-ins/Number", 400),
+        ("built-ins/Math", 400),
         ("built-ins/JSON", 200),
         ("built-ins/Map", 250),
-        ("built-ins/Set", 400),
-        ("built-ins/Promise", 750),
+        ("built-ins/Set", 450),
+        ("built-ins/Iterator@flat", 50),
+        ("built-ins/Iterator/from", 50),
+        ("built-ins/Iterator/concat", 100),
+        ("built-ins/Iterator/prototype@flat", 20),
+        ("built-ins/Iterator/prototype/Symbol.dispose", 20),
+        ("built-ins/Iterator/prototype/Symbol.iterator", 20),
+        ("built-ins/Iterator/prototype/Symbol.toStringTag", 20),
+        ("built-ins/Iterator/prototype/constructor", 20),
+        ("built-ins/Iterator/prototype/drop", 100),
+        ("built-ins/Iterator/prototype/every", 100),
+        ("built-ins/Iterator/prototype/filter", 100),
+        ("built-ins/Iterator/prototype/find", 100),
+        ("built-ins/Iterator/prototype/flatMap", 100),
+        ("built-ins/Iterator/prototype/forEach", 100),
+        ("built-ins/Iterator/prototype/map", 100),
+        ("built-ins/Iterator/prototype/reduce", 100),
+        ("built-ins/Iterator/prototype/some", 100),
+        ("built-ins/Iterator/prototype/take", 100),
+        ("built-ins/Iterator/prototype/toArray", 100),
+        ("built-ins/Promise", 800),
         ("built-ins/Proxy", 350),
         ("built-ins/Reflect", 200),
-        ("built-ins/RegExp", 400),
-        ("built-ins/RegExp/prototype", 500),
-        ("built-ins/TypedArray", 800),
-        ("built-ins/TypedArrayConstructors", 750),
+        ("built-ins/RegExp@flat", 600),
+        ("built-ins/RegExp/prototype", 600),
+        ("built-ins/RegExp/CharacterClassEscapes", 50),
+        ("built-ins/RegExp/Symbol.species", 20),
+        ("built-ins/RegExp/dotall", 20),
+        ("built-ins/RegExp/escape", 50),
+        ("built-ins/RegExp/lookBehind", 50),
+        ("built-ins/RegExp/match-indices", 50),
+        ("built-ins/RegExp/named-groups", 100),
+        ("built-ins/RegExp/regexp-modifiers", 100),
+        ("built-ins/RegExp/unicodeSets", 200),
+        ("built-ins/TypedArray", 2000),
+        ("built-ins/TypedArrayConstructors", 800),
+        ("built-ins/Uint8Array", 100),
         ("built-ins/Function", 550),
         ("built-ins/GeneratorFunction", 50),
         ("built-ins/GeneratorPrototype", 100),
@@ -494,8 +528,21 @@ fn test262_broad_suite() {
         ("built-ins/NativeErrors", 150),
         ("built-ins/AggregateError", 50),
         ("built-ins/ThrowTypeError", 30),
-        ("built-ins/ArrayBuffer", 250),
-        ("built-ins/DataView", 600),
+        ("built-ins/ArrayBuffer", 300),
+        ("built-ins/SharedArrayBuffer", 150),
+        ("built-ins/Atomics@flat", 20),
+        ("built-ins/Atomics/add", 50),
+        ("built-ins/Atomics/and", 50),
+        ("built-ins/Atomics/compareExchange", 50),
+        ("built-ins/Atomics/exchange", 50),
+        ("built-ins/Atomics/isLockFree", 50),
+        ("built-ins/Atomics/load", 50),
+        ("built-ins/Atomics/or", 50),
+        ("built-ins/Atomics/pause", 50),
+        ("built-ins/Atomics/store", 50),
+        ("built-ins/Atomics/sub", 50),
+        ("built-ins/Atomics/xor", 50),
+        ("built-ins/DataView", 650),
         ("built-ins/Date", 650),
         ("built-ins/BigInt", 100),
         ("built-ins/Boolean", 100),
@@ -514,9 +561,14 @@ fn test262_broad_suite() {
                 continue;
             }
         }
-        let dir = root.join("test").join(suite);
+        let (rel_dir, recursive) = if let Some(base) = suite.strip_suffix("@flat") {
+            (base, false)
+        } else {
+            (suite, true)
+        };
+        let dir = root.join("test").join(rel_dir);
         let mut files = Vec::new();
-        collect_js_files(&dir, limit, &mut files);
+        collect_js_files_opt(&dir, limit, recursive, &mut files);
         suite_files.push((suite, files));
     }
 
@@ -638,8 +690,8 @@ fn test262_broad_suite() {
     }
     if filter.is_none() {
         assert!(
-            grand >= 20_000,
-            "Expected at least 20000 Test262 tests run, got {}",
+            grand >= 30_000,
+            "Expected at least 30000 Test262 tests run, got {}",
             grand
         );
         assert!(

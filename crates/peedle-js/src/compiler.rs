@@ -1791,7 +1791,11 @@ impl Compiler {
                             ..
                         } => match key {
                             PropKey::Ident(s) | PropKey::String(s) => {
-                                self.compile_expr(value)?;
+                                if !*shorthand && s != "__proto__" {
+                                    self.compile_expr_with_name(value, s)?;
+                                } else {
+                                    self.compile_expr(value)?;
+                                }
                                 let idx = self.str_const(s);
                                 if *shorthand {
                                     self.emit(Op::ObjectSetOwnProp(idx));
@@ -1801,8 +1805,8 @@ impl Compiler {
                                 self.stack_depth -= 1;
                             }
                             PropKey::Number(n) => {
-                                self.compile_expr(value)?;
                                 let s = crate::value::number_to_string(*n);
+                                self.compile_expr_with_name(value, &s)?;
                                 let idx = self.str_const(&s);
                                 self.emit(Op::ObjectSetProp(idx));
                                 self.stack_depth -= 1;
