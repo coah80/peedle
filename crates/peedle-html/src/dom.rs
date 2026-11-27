@@ -378,6 +378,19 @@ impl Document {
         self.alloc(NodeData::DocumentFragment)
     }
 
+    pub fn create_sub_document(&mut self) -> NodeId {
+        let doc = self.alloc(NodeData::Document {
+            quirks_mode: QuirksMode::NoQuirks,
+        });
+        let html = self.create_element("html");
+        let head = self.create_element("head");
+        let body = self.create_element("body");
+        self.append_child(doc, html);
+        self.append_child(html, head);
+        self.append_child(html, body);
+        doc
+    }
+
     pub fn create_shadow_root(&mut self, host: NodeId, mode: ShadowRootMode) -> NodeId {
         let sr = self.alloc(NodeData::ShadowRoot { mode, host });
         if let Some(el) = self.element_mut(host) {
@@ -678,18 +691,30 @@ impl Document {
     }
 
     pub fn document_element(&self) -> Option<NodeId> {
-        self.element_children(self.root).into_iter().next()
+        self.document_element_of(self.root)
+    }
+
+    pub fn document_element_of(&self, doc_root: NodeId) -> Option<NodeId> {
+        self.element_children(doc_root).into_iter().next()
     }
 
     pub fn head(&self) -> Option<NodeId> {
-        let html = self.document_element()?;
+        self.head_of(self.root)
+    }
+
+    pub fn head_of(&self, doc_root: NodeId) -> Option<NodeId> {
+        let html = self.document_element_of(doc_root)?;
         self.element_children(html)
             .into_iter()
             .find(|&id| self.element(id).map_or(false, |e| e.tag_is("head")))
     }
 
     pub fn body(&self) -> Option<NodeId> {
-        let html = self.document_element()?;
+        self.body_of(self.root)
+    }
+
+    pub fn body_of(&self, doc_root: NodeId) -> Option<NodeId> {
+        let html = self.document_element_of(doc_root)?;
         self.element_children(html)
             .into_iter()
             .find(|&id| {
@@ -717,10 +742,14 @@ impl Document {
     }
 
     pub fn get_element_by_id(&self, target_id: &str) -> Option<NodeId> {
+        self.get_element_by_id_in(self.root, target_id)
+    }
+
+    pub fn get_element_by_id_in(&self, root: NodeId, target_id: &str) -> Option<NodeId> {
         if target_id.is_empty() {
             return None;
         }
-        for id in self.descendants(self.root) {
+        for id in self.descendants(root) {
             if let Some(el) = self.element(id) {
                 if el.id() == Some(target_id) {
                     return Some(id);

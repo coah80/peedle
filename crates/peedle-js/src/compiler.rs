@@ -6,6 +6,7 @@ use std::rc::Rc;
 struct LoopContext {
     label: Option<String>,
     is_loop: bool,
+    is_breakable: bool,
     break_jumps: Vec<usize>,
     continue_jumps: Vec<usize>,
     break_env_depth: u32,
@@ -166,6 +167,7 @@ impl Compiler {
                     self.loops.push(LoopContext {
                         label: Some(lbl),
                         is_loop: false,
+                        is_breakable: false,
                         break_jumps: Vec::new(),
                         continue_jumps: Vec::new(),
                         break_env_depth: break_env,
@@ -233,6 +235,7 @@ impl Compiler {
                 self.loops.push(LoopContext {
                     label,
                     is_loop: true,
+                    is_breakable: true,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
                     break_env_depth: break_env,
@@ -266,6 +269,7 @@ impl Compiler {
                 self.loops.push(LoopContext {
                     label,
                     is_loop: true,
+                    is_breakable: true,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
                     break_env_depth: break_env,
@@ -352,6 +356,7 @@ impl Compiler {
                     self.loops.push(LoopContext {
                         label: Some(lbl.clone()),
                         is_loop: false,
+                        is_breakable: false,
                         break_jumps: Vec::new(),
                         continue_jumps: Vec::new(),
                         break_env_depth: break_env,
@@ -519,6 +524,7 @@ impl Compiler {
         self.loops.push(LoopContext {
             label,
             is_loop: true,
+            is_breakable: true,
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             break_env_depth: break_env,
@@ -593,6 +599,7 @@ impl Compiler {
         self.loops.push(LoopContext {
             label,
             is_loop: true,
+            is_breakable: true,
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             break_env_depth: break_env,
@@ -673,6 +680,7 @@ impl Compiler {
         self.loops.push(LoopContext {
             label,
             is_loop: true,
+            is_breakable: true,
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             break_env_depth: break_env,
@@ -754,6 +762,7 @@ impl Compiler {
         self.loops.push(LoopContext {
             label,
             is_loop: false,
+            is_breakable: true,
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             break_env_depth: break_env,
@@ -900,7 +909,7 @@ impl Compiler {
         } else {
             self.loops
                 .iter()
-                .rposition(|c| c.is_loop || c.label.is_none())
+                .rposition(|c| c.is_breakable)
                 .ok_or_else(|| JsError::syntax("Illegal break statement"))?
         };
         let env_depth = self.loops[idx].break_env_depth;

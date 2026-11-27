@@ -24,8 +24,8 @@ for p in sorted(pathlib.Path("crates").rglob("*.rs")):
         if in_raw is not None:
             hashes = '#' * in_raw
             if c == '"' and text[i+1:i+1+in_raw] == hashes:
-                in_raw = None
                 i += 1 + in_raw
+                in_raw = None
                 continue
             i += 1
             continue
