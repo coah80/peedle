@@ -253,7 +253,7 @@ fn stringify_prop(
             ObjectKind::NumberObj(_) => val = JsValue::Number(rt.to_number(&val)?),
             ObjectKind::StringObj(_) => val = JsValue::String(rt.to_string(&val)?),
             ObjectKind::BooleanObj(b) => val = JsValue::Boolean(*b),
-            ObjectKind::BigIntObj(b) => val = JsValue::BigInt(*b),
+            ObjectKind::BigIntObj(b) => val = JsValue::BigInt(b.clone()),
             _ => {}
         }
     }

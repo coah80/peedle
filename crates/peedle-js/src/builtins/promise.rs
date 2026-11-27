@@ -287,22 +287,32 @@ pub fn init(rt: &mut JsRuntime) {
         "try",
         1,
         Rc::new(|rt, this, args| {
-            if !this.is_object() {
+            let JsValue::Object(cid) = this else {
                 return Err(JsError::type_err("Promise.try called on non-object"));
-            }
-            let cap = new_promise_capability(rt, this)?;
+            };
             let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
             let rest = if args.len() > 1 { &args[1..] } else { &[] };
             match rt.call_function(cb, JsValue::Undefined, rest) {
                 Ok(v) => {
+                    if let JsValue::Object(vid) = v {
+                        if matches!(rt.heap.get_obj(vid).kind, ObjectKind::Promise(_)) {
+                            let vctor = rt.get_property(vid, "constructor")?;
+                            if vctor == JsValue::Object(cid) {
+                                return Ok(v);
+                            }
+                        }
+                    }
+                    let cap = new_promise_capability(rt, this)?;
                     rt.call_function(cap.resolve, JsValue::Undefined, &[v])?;
+                    Ok(cap.promise)
                 }
                 Err(e) => {
+                    let cap = new_promise_capability(rt, this)?;
                     let ev = rt.error_to_js_value(e);
                     rt.call_function(cap.reject, JsValue::Undefined, &[ev])?;
+                    Ok(cap.promise)
                 }
             }
-            Ok(cap.promise)
         }),
     );
 

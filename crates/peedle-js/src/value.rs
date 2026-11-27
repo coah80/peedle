@@ -1,3 +1,4 @@
+use crate::bigint::JsBigInt;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -12,7 +13,7 @@ pub enum JsValue {
     Null,
     Boolean(bool),
     Number(f64),
-    BigInt(i128),
+    BigInt(JsBigInt),
     String(String),
     Symbol(u64),
     Object(ObjectId),
@@ -68,7 +69,7 @@ impl JsValue {
             JsValue::Undefined | JsValue::Null => false,
             JsValue::Boolean(b) => *b,
             JsValue::Number(n) => *n != 0.0 && !n.is_nan(),
-            JsValue::BigInt(n) => *n != 0,
+            JsValue::BigInt(n) => !n.is_zero(),
             JsValue::String(s) => !s.is_empty(),
             JsValue::Symbol(_) | JsValue::Object(_) => true,
         }

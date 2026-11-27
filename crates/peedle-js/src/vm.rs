@@ -53,6 +53,9 @@ pub struct Intrinsics {
     pub suppressed_error_proto: ObjectId,
     pub disposable_stack_proto: ObjectId,
     pub async_disposable_stack_proto: ObjectId,
+    pub shadow_realm_proto: ObjectId,
+    pub abstract_module_source_proto: ObjectId,
+    pub abstract_module_source_ctor: ObjectId,
     pub map_proto: ObjectId,
     pub set_proto: ObjectId,
     pub weak_map_proto: ObjectId,
@@ -165,10 +168,18 @@ pub struct JsRuntime {
     pub max_call_depth: usize,
     pub max_steps: Option<usize>,
     pub step_count: usize,
+    pub can_block: bool,
     pub native_new_target: Option<JsValue>,
     pub call_stack_callees: Vec<ObjectId>,
     pub template_cache: HashMap<(usize, u64), ObjectId>,
     pub host_root_tracers: Vec<Box<dyn Fn(&mut Vec<ObjectId>)>>,
+    pub async_waiters: Vec<(
+        std::sync::Arc<SharedBufferBacking>,
+        usize,
+        std::sync::Arc<WaiterEntry>,
+        ObjectId,
+        Option<std::time::Instant>,
+    )>,
 }
 
 fn alloc_realm_parts(heap: &mut Heap) -> Realm {
@@ -223,6 +234,10 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
     let disposable_stack_proto =
         heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
     let async_disposable_stack_proto =
+        heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
+    let shadow_realm_proto =
+        heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
+    let abstract_module_source_proto =
         heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
     let map_proto = heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
     let set_proto = heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
@@ -330,6 +345,9 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
         suppressed_error_proto,
         disposable_stack_proto,
         async_disposable_stack_proto,
+        shadow_realm_proto,
+        abstract_module_source_proto,
+        abstract_module_source_ctor: function_proto,
         map_proto,
         set_proto,
         weak_map_proto,
@@ -432,6 +450,8 @@ impl JsRuntime {
             call_stack_callees: Vec::new(),
             template_cache: HashMap::new(),
             host_root_tracers: Vec::new(),
+            async_waiters: Vec::new(),
+            can_block: true,
         };
 
         crate::builtins::init_builtins(&mut rt);
@@ -513,6 +533,9 @@ impl JsRuntime {
                             .unwrap_or(self.current_realm_id));
                     }
                 }
+                ObjectKind::WrappedFunction { caller_realm, .. } => {
+                    return Ok(*caller_realm);
+                }
                 _ => {
                     return Ok(self
                         .heap
@@ -553,6 +576,8 @@ impl JsRuntime {
         if default_proto == cur.suppressed_error_proto { return tgt.suppressed_error_proto; }
         if default_proto == cur.disposable_stack_proto { return tgt.disposable_stack_proto; }
         if default_proto == cur.async_disposable_stack_proto { return tgt.async_disposable_stack_proto; }
+        if default_proto == cur.shadow_realm_proto { return tgt.shadow_realm_proto; }
+        if default_proto == cur.abstract_module_source_proto { return tgt.abstract_module_source_proto; }
         if default_proto == cur.map_proto { return tgt.map_proto; }
         if default_proto == cur.set_proto { return tgt.set_proto; }
         if default_proto == cur.weak_map_proto { return tgt.weak_map_proto; }
@@ -864,6 +889,27 @@ impl JsRuntime {
         Ok(ns)
     }
 
+    pub fn abstract_module_source_ctor(&self) -> ObjectId {
+        self.intrinsics.abstract_module_source_ctor
+    }
+
+    pub fn load_module_in_realm(
+        &mut self,
+        realm_id: usize,
+        specifier: &str,
+    ) -> Result<(ObjectId, Option<ObjectId>), JsError> {
+        let (raw_key, path) = self.resolve_module_key_and_path(specifier, &[]);
+        let key = format!("\0sr:{}:{}", realm_id, raw_key);
+        let prev = self.switch_realm(realm_id);
+        let res = (|| -> Result<(ObjectId, Option<ObjectId>), JsError> {
+            let ns = self.link_module_by_key(&key, &path, &[])?;
+            let eval_p = self.evaluate_module(&key)?;
+            Ok((ns, eval_p))
+        })();
+        self.switch_realm(prev);
+        res
+    }
+
     pub fn load_module_async(
         &mut self,
         specifier: &str,
@@ -906,7 +952,7 @@ impl JsRuntime {
         } else {
             specifier.to_string()
         };
-        let mut key = resolved.clone();
+        let mut key = normalize_module_path(&resolved);
         if let Some((_, ty)) = attrs.iter().find(|(k, _)| k == "type") {
             key.push_str("\0type=");
             key.push_str(ty);
@@ -992,6 +1038,7 @@ impl JsRuntime {
                     max_byte_length: None,
                     is_shared: false,
                     immutable: true,
+                    shared: None,
                 },
             );
             let ta_proto = self.intrinsics.typed_array_protos[1];
@@ -1072,6 +1119,7 @@ impl JsRuntime {
                             max_byte_length: None,
                             is_shared: false,
                             immutable: true,
+                            shared: None,
                         },
                     );
                     let ta_proto = self.intrinsics.typed_array_protos[1];
@@ -1444,7 +1492,7 @@ impl JsRuntime {
             let checks = std::mem::take(&mut self.pending_link_checks);
             let keys = std::mem::take(&mut self.pending_link_keys);
 
-            let rounds = stars.len().max(1);
+            let rounds = stars.len() + 2;
             for _ in 0..rounds {
                 for (target_ns, star_sources) in &stars {
                     let direct_names: std::collections::HashSet<String> =
@@ -1460,16 +1508,23 @@ impl JsRuntime {
                         let mut vis = std::collections::HashSet::new();
                         vis.insert(*target_ns);
                         self.collect_star_exports(*src_ns, &mut vis, &mut collected);
-                        for (name, target) in collected {
+                        for (name, _raw_target) in collected {
                             if name == "default" || direct_names.contains(&name) {
                                 continue;
                             }
+                            let mut rvis = std::collections::HashSet::new();
+                            rvis.insert((*target_ns, name.clone()));
+                            let resolved = match self.resolve_export_canonical(*src_ns, &name, &mut rvis) {
+                                ExportResolution::NotFound => continue,
+                                ExportResolution::Ambiguous => ExportTarget::Ambiguous,
+                                ExportResolution::Found(t) => t,
+                            };
                             if let Some(prev) = star_map.get(&name) {
-                                if !self.same_export_target(prev, &target) {
+                                if !self.same_export_target(prev, &resolved) {
                                     star_map.insert(name, ExportTarget::Ambiguous);
                                 }
                             } else {
-                                star_map.insert(name, target);
+                                star_map.insert(name, resolved);
                             }
                         }
                     }
@@ -1884,12 +1939,23 @@ impl JsRuntime {
                 }
                 Ok(None)
             }
-            Ok(crate::exec::FrameOutcome::Await(awaited)) => {
+            Ok(crate::exec::FrameOutcome::Await(awaited, _)) => {
                 let mod_p = self.create_promise();
                 if let Some(r) = self.module_records.get_mut(key) {
                     r.eval_promise = Some(mod_p);
                 }
-                let awaited_p = self.promise_resolve_value(awaited);
+                let awaited_p = match self.promise_resolve_value_checked(awaited) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let ev = self.error_to_js_value(e);
+                        if let Some(r) = self.module_records.get_mut(key) {
+                            r.eval_state = ModuleEvalState::Evaluated;
+                            r.eval_error = Some(ev.clone());
+                        }
+                        self.reject_promise(mod_p, ev);
+                        return Ok(Some(mod_p));
+                    }
+                };
                 let holder = self.heap.alloc_object(JsObject::new(
                     None,
                     ObjectKind::Generator(GeneratorData {
@@ -1898,6 +1964,7 @@ impl JsRuntime {
                         is_async: true,
                         delegating: None,
                         result_promise: Some(mod_p),
+                        queue: Vec::new(),
                     }),
                 ));
                 let key_ok = key.to_string();
@@ -2311,6 +2378,7 @@ impl JsRuntime {
             Some(proto),
             ObjectKind::Function(JsFunction {
                 name: name.clone(),
+                has_self_name: tmpl.has_self_name,
                 chunk: tmpl.chunk.clone(),
                 params: tmpl.params.clone(),
                 env,
@@ -2340,7 +2408,10 @@ impl JsRuntime {
             PropertyKey::from("name"),
             PropEntry::data(JsValue::String(name), false, false, true),
         );
-        if !tmpl.is_arrow && (!tmpl.is_async || tmpl.is_generator) {
+        if !tmpl.is_arrow
+            && (!tmpl.is_method || tmpl.is_generator)
+            && (!tmpl.is_async || tmpl.is_generator)
+        {
             let fn_proto = if tmpl.is_async && tmpl.is_generator {
                 self.create_object_with_proto(Some(self.intrinsics.async_generator_proto))
             } else if tmpl.is_generator {
@@ -2429,6 +2500,9 @@ impl JsRuntime {
             self.intrinsics.suppressed_error_proto,
             self.intrinsics.disposable_stack_proto,
             self.intrinsics.async_disposable_stack_proto,
+            self.intrinsics.shadow_realm_proto,
+            self.intrinsics.abstract_module_source_proto,
+            self.intrinsics.abstract_module_source_ctor,
             self.intrinsics.map_proto,
             self.intrinsics.set_proto,
             self.intrinsics.weak_map_proto,
@@ -2485,6 +2559,9 @@ impl JsRuntime {
         for &t in self.template_cache.values() {
             root_objs.push(t);
         }
+        for (_, _, _, p, _) in &self.async_waiters {
+            root_objs.push(*p);
+        }
         root_objs.extend_from_slice(&self.current_module_exports);
         for mt in &self.microtasks {
             if let Microtask::Callback { func, this, args } = mt {
@@ -2522,6 +2599,9 @@ impl JsRuntime {
             root_objs.push(r.intrinsics.suppressed_error_proto);
             root_objs.push(r.intrinsics.disposable_stack_proto);
             root_objs.push(r.intrinsics.async_disposable_stack_proto);
+            root_objs.push(r.intrinsics.shadow_realm_proto);
+            root_objs.push(r.intrinsics.abstract_module_source_proto);
+            root_objs.push(r.intrinsics.abstract_module_source_ctor);
             root_objs.push(r.intrinsics.map_proto);
             root_objs.push(r.intrinsics.set_proto);
             root_objs.push(r.intrinsics.weak_map_proto);
@@ -2641,27 +2721,17 @@ impl JsRuntime {
         }
     }
 
-    pub fn to_bigint(&mut self, val: &JsValue) -> Result<i128, JsError> {
+    pub fn to_bigint(&mut self, val: &JsValue) -> Result<crate::bigint::JsBigInt, JsError> {
         let prim = self.to_primitive(val, "number")?;
         match prim {
             JsValue::BigInt(n) => Ok(n),
-            JsValue::Boolean(b) => Ok(if b { 1 } else { 0 }),
-            JsValue::String(s) => {
-                let t = trim_js_whitespace(&s);
-                if t.is_empty() {
-                    return Ok(0);
-                }
-                if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-                    i128::from_str_radix(hex, 16)
-                } else if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
-                    i128::from_str_radix(oct, 8)
-                } else if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-                    i128::from_str_radix(bin, 2)
-                } else {
-                    t.parse::<i128>()
-                }
-                .map_err(|_| JsError::syntax(format!("Cannot convert {} to a BigInt", s)))
-            }
+            JsValue::Boolean(b) => Ok(if b {
+                crate::bigint::JsBigInt::one()
+            } else {
+                crate::bigint::JsBigInt::zero()
+            }),
+            JsValue::String(s) => crate::bigint::JsBigInt::parse_string(&s)
+                .ok_or_else(|| JsError::syntax(format!("Cannot convert {} to a BigInt", s))),
             _ => Err(JsError::type_err("Cannot convert value to a BigInt")),
         }
     }
@@ -2735,7 +2805,7 @@ impl JsRuntime {
             ))),
             JsValue::BigInt(n) => Ok(self.heap.alloc_object(JsObject::new(
                 Some(self.intrinsics.bigint_proto),
-                ObjectKind::BigIntObj(*n),
+                ObjectKind::BigIntObj(n.clone()),
             ))),
         }
     }
@@ -2746,7 +2816,9 @@ impl JsRuntime {
         };
         let obj = self.heap.get_obj(*id);
         match &obj.kind {
-            ObjectKind::Function(_) | ObjectKind::NativeFunction(_) => true,
+            ObjectKind::Function(_)
+            | ObjectKind::NativeFunction(_)
+            | ObjectKind::WrappedFunction { .. } => true,
             ObjectKind::Proxy(p) => self.is_callable(&JsValue::Object(p.target)),
             _ => false,
         }
@@ -2761,7 +2833,7 @@ impl JsRuntime {
                 if let Some(bt) = f.bound_target {
                     return self.is_constructor(&JsValue::Object(bt));
                 }
-                !f.is_arrow && !f.is_async && !f.is_generator
+                !f.is_arrow && !f.is_async && !f.is_generator && !f.is_method
             }
             ObjectKind::NativeFunction(nf) => nf.is_constructor,
             ObjectKind::Proxy(p) => self.is_constructor(&JsValue::Object(p.target)),
@@ -3074,10 +3146,10 @@ impl JsRuntime {
                             .buffer_meta
                             .get(&ta_clone.buffer)
                             .is_some_and(|m| m.immutable);
+                        if is_imm {
+                            return Ok(false);
+                        }
                         if receiver == JsValue::Object(obj) {
-                            if is_imm {
-                                return Ok(false);
-                            }
                             self.typed_array_set_checked(obj, &ta_clone, num_idx, &val)?;
                             return Ok(true);
                         }
@@ -3086,9 +3158,6 @@ impl JsRuntime {
                         };
                         if valid_integer_index(num_idx, eff_len).is_none() {
                             return Ok(true);
-                        }
-                        if is_imm {
-                            return Ok(false);
                         }
                         let JsValue::Object(recv_id) = receiver else {
                             return Ok(false);
@@ -3116,6 +3185,24 @@ impl JsRuntime {
                 if k == "length" {
                     if self.heap.non_writable_array_lengths.contains(&obj) {
                         return Ok(false);
+                    }
+                    if receiver != JsValue::Object(obj) {
+                        let JsValue::Object(recv_id) = receiver else {
+                            return Ok(false);
+                        };
+                        if let Some(existing) = self.get_own_property_descriptor(recv_id, &key)? {
+                            if existing.is_accessor() || existing.writable == Some(false) {
+                                return Ok(false);
+                            }
+                            let mut value_desc = PropertyDescriptor::empty();
+                            value_desc.value = Some(val);
+                            return self.define_property(recv_id, key, value_desc);
+                        }
+                        return self.define_property(
+                            recv_id,
+                            key,
+                            PropertyDescriptor::data(val, true, true, true),
+                        );
                     }
                     let mut desc = PropertyDescriptor::empty();
                     desc.value = Some(val);
@@ -3147,7 +3234,7 @@ impl JsRuntime {
                             let mut hit = false;
                             while let Some(pid) = p {
                                 let po = self.heap.get_obj(pid);
-                                if matches!(po.kind, ObjectKind::Proxy(_))
+                                if matches!(po.kind, ObjectKind::Proxy(_) | ObjectKind::TypedArray(_))
                                     || po.get_own_prop(&key).is_some()
                                 {
                                     hit = true;
@@ -3484,16 +3571,29 @@ impl JsRuntime {
                     let Some(eff_len) = self.typed_array_effective_length(obj) else {
                         return Ok(false);
                     };
-                    if valid_integer_index(num_idx, eff_len).is_none() {
+                    let Some(idx) = valid_integer_index(num_idx, eff_len) else {
                         return Ok(false);
-                    }
+                    };
                     if self
                         .heap
                         .buffer_meta
                         .get(&ta.buffer)
                         .is_some_and(|m| m.immutable)
                     {
-                        return Ok(false);
+                        if desc.is_accessor()
+                            || desc.configurable == Some(true)
+                            || desc.enumerable == Some(false)
+                            || desc.writable == Some(true)
+                        {
+                            return Ok(false);
+                        }
+                        if let Some(ref v) = desc.value {
+                            let cur = self.typed_array_get(&ta, idx)?;
+                            if !v.same_value(&cur) {
+                                return Ok(false);
+                            }
+                        }
+                        return Ok(true);
                     }
                     if desc.configurable == Some(false)
                         || desc.is_accessor()
@@ -4649,17 +4749,13 @@ impl JsRuntime {
             }
             (JsValue::BigInt(n), JsValue::Number(f))
             | (JsValue::Number(f), JsValue::BigInt(n)) => {
-                if !f.is_finite() || f.fract() != 0.0 {
-                    Ok(false)
-                } else {
-                    Ok((*n as f64) == *f)
-                }
+                Ok(n.cmp_f64(*f) == Some(std::cmp::Ordering::Equal))
             }
             (JsValue::BigInt(n), JsValue::String(s))
             | (JsValue::String(s), JsValue::BigInt(n)) => {
-                match self.to_bigint(&JsValue::String(s.clone())) {
-                    Ok(m) => Ok(*n == m),
-                    Err(_) => Ok(false),
+                match crate::bigint::JsBigInt::parse_string(s) {
+                    Some(m) => Ok(*n == m),
+                    None => Ok(false),
                 }
             }
             (JsValue::Object(_), JsValue::String(_) | JsValue::Number(_) | JsValue::Symbol(_) | JsValue::BigInt(_)) => {
@@ -4704,16 +4800,16 @@ impl JsRuntime {
             return Ok(Some(ux < uy));
         }
         if let (JsValue::BigInt(x), JsValue::String(sy)) = (&px, &py) {
-            let Some(ny) = parse_string_to_bigint(sy) else {
+            let Some(ny) = crate::bigint::JsBigInt::parse_string(sy) else {
                 return Ok(None);
             };
-            return Ok(Some(*x < ny));
+            return Ok(Some(x < &ny));
         }
         if let (JsValue::String(sx), JsValue::BigInt(y)) = (&px, &py) {
-            let Some(nx) = parse_string_to_bigint(sx) else {
+            let Some(nx) = crate::bigint::JsBigInt::parse_string(sx) else {
                 return Ok(None);
             };
-            return Ok(Some(nx < *y));
+            return Ok(Some(&nx < y));
         }
         let nx = self.to_numeric(&px)?;
         let ny = self.to_numeric(&py)?;
@@ -4726,8 +4822,8 @@ impl JsRuntime {
                     Ok(Some(x < y))
                 }
             }
-            (JsValue::BigInt(x), JsValue::Number(y)) => Ok(cmp_bigint_f64(*x, *y).map(|o| o.is_lt())),
-            (JsValue::Number(x), JsValue::BigInt(y)) => Ok(cmp_bigint_f64(*y, *x).map(|o| o.is_gt())),
+            (JsValue::BigInt(x), JsValue::Number(y)) => Ok(x.cmp_f64(*y).map(|o| o.is_lt())),
+            (JsValue::Number(x), JsValue::BigInt(y)) => Ok(y.cmp_f64(*x).map(|o| o.is_gt())),
             _ => Ok(None),
         }
     }
@@ -4783,17 +4879,114 @@ impl JsRuntime {
         }
     }
 
+    pub fn buffer_byte_len(&self, buf_id: ObjectId) -> Option<usize> {
+        if let Some(sb) = self
+            .heap
+            .buffer_meta
+            .get(&buf_id)
+            .and_then(|m| m.shared.as_ref())
+        {
+            return Some(sb.data.lock().unwrap().len());
+        }
+        match &self.heap.get_obj(buf_id).kind {
+            ObjectKind::ArrayBuffer(ab) if !ab.detached => Some(ab.bytes.len()),
+            _ => None,
+        }
+    }
+
+    pub fn shared_buffer_backing(
+        &self,
+        buf_id: ObjectId,
+    ) -> Option<std::sync::Arc<SharedBufferBacking>> {
+        self.heap
+            .buffer_meta
+            .get(&buf_id)
+            .and_then(|m| m.shared.clone())
+    }
+
+    pub fn create_shared_array_buffer_from_backing(
+        &mut self,
+        backing: std::sync::Arc<SharedBufferBacking>,
+    ) -> ObjectId {
+        let max_len = backing.max_byte_length;
+        let obj = self.heap.alloc_object(JsObject::new(
+            Some(self.intrinsics.shared_array_buffer_proto),
+            ObjectKind::ArrayBuffer(ArrayBufferData {
+                bytes: Vec::new(),
+                detached: false,
+            }),
+        ));
+        self.heap.buffer_meta.insert(
+            obj,
+            BufferMeta {
+                max_byte_length: max_len,
+                is_shared: true,
+                immutable: false,
+                shared: Some(backing),
+            },
+        );
+        obj
+    }
+
+    pub fn has_pending_async_waiters(&self) -> bool {
+        !self.async_waiters.is_empty()
+    }
+
+    pub fn next_async_waiter_deadline(&self) -> Option<std::time::Instant> {
+        self.async_waiters.iter().filter_map(|w| w.4).min()
+    }
+
+    pub fn tick_async_waiters(&mut self) -> bool {
+        if self.async_waiters.is_empty() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let mut remaining = Vec::with_capacity(self.async_waiters.len());
+        let mut resolved: Vec<(ObjectId, &'static str)> = Vec::new();
+        let current = std::mem::take(&mut self.async_waiters);
+        for (backing, byte_idx, entry, promise, deadline) in current {
+            let mut st = entry.state.lock().unwrap();
+            match *st {
+                WaiterState::Notified => {
+                    drop(st);
+                    resolved.push((promise, "ok"));
+                }
+                WaiterState::TimedOut => {
+                    drop(st);
+                    resolved.push((promise, "timed-out"));
+                }
+                WaiterState::Waiting => {
+                    if deadline.is_some_and(|d| now >= d) {
+                        *st = WaiterState::TimedOut;
+                        drop(st);
+                        let mut map = backing.waiters.lock().unwrap();
+                        if let Some(q) = map.get_mut(&byte_idx) {
+                            q.retain(|e| !std::sync::Arc::ptr_eq(e, &entry));
+                        }
+                        resolved.push((promise, "timed-out"));
+                    } else {
+                        drop(st);
+                        remaining.push((backing, byte_idx, entry, promise, deadline));
+                    }
+                }
+            }
+        }
+        self.async_waiters = remaining;
+        if resolved.is_empty() {
+            return false;
+        }
+        for (p, status) in resolved {
+            self.resolve_promise(p, JsValue::String(status.into()));
+        }
+        self.drain_microtasks();
+        true
+    }
+
     pub fn typed_array_effective_length(&self, oid: ObjectId) -> Option<usize> {
         let ObjectKind::TypedArray(ref ta) = self.heap.get_obj(oid).kind else {
             return None;
         };
-        let ObjectKind::ArrayBuffer(ref ab) = self.heap.get_obj(ta.buffer).kind else {
-            return None;
-        };
-        if ab.detached {
-            return None;
-        }
-        let buf_len = ab.bytes.len();
+        let buf_len = self.buffer_byte_len(ta.buffer)?;
         let es = ta.kind.element_size();
         if self.heap.auto_length_views.contains(&oid) {
             if ta.byte_offset > buf_len {
@@ -4813,13 +5006,7 @@ impl JsRuntime {
         let ObjectKind::DataView(ref dv) = self.heap.get_obj(oid).kind else {
             return None;
         };
-        let ObjectKind::ArrayBuffer(ref ab) = self.heap.get_obj(dv.buffer).kind else {
-            return None;
-        };
-        if ab.detached {
-            return None;
-        }
-        let buf_len = ab.bytes.len();
+        let buf_len = self.buffer_byte_len(dv.buffer)?;
         if self.heap.auto_length_views.contains(&oid) {
             if dv.byte_offset > buf_len {
                 return None;
@@ -4870,85 +5057,103 @@ impl JsRuntime {
         }
         let es = ta.kind.element_size();
         let off = ta.byte_offset + index * es;
+        let write_into = |buf: &mut [u8]| {
+            if off + es > buf.len() {
+                return;
+            }
+            match converted {
+                JsValue::BigInt(bi) => {
+                    let bytes = match ta.kind {
+                        TypedArrayKind::BigInt64 => bi.to_i64_wrapping().to_le_bytes(),
+                        TypedArrayKind::BigUint64 => bi.to_u64_wrapping().to_le_bytes(),
+                        _ => return,
+                    };
+                    buf[off..off + 8].copy_from_slice(&bytes);
+                }
+                JsValue::Number(n) => {
+                    let n = *n;
+                    match ta.kind {
+                        TypedArrayKind::Int8 => buf[off] = to_int32(n) as i8 as u8,
+                        TypedArrayKind::Uint8 => buf[off] = to_uint32(n) as u8,
+                        TypedArrayKind::Uint8Clamped => {
+                            let clamped = if n.is_nan() || n <= 0.0 {
+                                0u8
+                            } else if n >= 255.0 {
+                                255u8
+                            } else {
+                                let f = n.floor();
+                                let frac = n - f;
+                                if frac < 0.5 {
+                                    f as u8
+                                } else if frac > 0.5 {
+                                    (f + 1.0) as u8
+                                } else if (f as u32) % 2 == 1 {
+                                    (f + 1.0) as u8
+                                } else {
+                                    f as u8
+                                }
+                            };
+                            buf[off] = clamped;
+                        }
+                        TypedArrayKind::Int16 => {
+                            buf[off..off + 2].copy_from_slice(&(to_int32(n) as i16).to_le_bytes());
+                        }
+                        TypedArrayKind::Uint16 => {
+                            buf[off..off + 2].copy_from_slice(&(to_uint32(n) as u16).to_le_bytes());
+                        }
+                        TypedArrayKind::Int32 => {
+                            buf[off..off + 4].copy_from_slice(&to_int32(n).to_le_bytes());
+                        }
+                        TypedArrayKind::Uint32 => {
+                            buf[off..off + 4].copy_from_slice(&to_uint32(n).to_le_bytes());
+                        }
+                        TypedArrayKind::Float32 => {
+                            buf[off..off + 4].copy_from_slice(&(n as f32).to_le_bytes());
+                        }
+                        TypedArrayKind::Float64 => {
+                            buf[off..off + 8].copy_from_slice(&n.to_le_bytes());
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        };
+        if let Some(sb) = self.shared_buffer_backing(ta.buffer) {
+            let mut guard = sb.data.lock().unwrap();
+            write_into(&mut guard);
+            return Ok(());
+        }
         let ObjectKind::ArrayBuffer(ref mut ab) = self.heap.get_obj_mut(ta.buffer).kind else {
             return Err(JsError::type_err("Invalid ArrayBuffer"));
         };
-        if ab.detached || off + es > ab.bytes.len() {
+        if ab.detached {
             return Ok(());
         }
-        match converted {
-            JsValue::BigInt(bi) => {
-                let bytes = match ta.kind {
-                    TypedArrayKind::BigInt64 => (*bi as i64).to_le_bytes(),
-                    TypedArrayKind::BigUint64 => (*bi as u64).to_le_bytes(),
-                    _ => return Ok(()),
-                };
-                ab.bytes[off..off + 8].copy_from_slice(&bytes);
-            }
-            JsValue::Number(n) => {
-                let n = *n;
-                match ta.kind {
-                    TypedArrayKind::Int8 => ab.bytes[off] = to_int32(n) as i8 as u8,
-                    TypedArrayKind::Uint8 => ab.bytes[off] = to_uint32(n) as u8,
-                    TypedArrayKind::Uint8Clamped => {
-                        let clamped = if n.is_nan() || n <= 0.0 {
-                            0u8
-                        } else if n >= 255.0 {
-                            255u8
-                        } else {
-                            let f = n.floor();
-                            let frac = n - f;
-                            if frac < 0.5 {
-                                f as u8
-                            } else if frac > 0.5 {
-                                (f + 1.0) as u8
-                            } else if (f as u32) % 2 == 1 {
-                                (f + 1.0) as u8
-                            } else {
-                                f as u8
-                            }
-                        };
-                        ab.bytes[off] = clamped;
-                    }
-                    TypedArrayKind::Int16 => {
-                        ab.bytes[off..off + 2].copy_from_slice(&(to_int32(n) as i16).to_le_bytes());
-                    }
-                    TypedArrayKind::Uint16 => {
-                        ab.bytes[off..off + 2].copy_from_slice(&(to_uint32(n) as u16).to_le_bytes());
-                    }
-                    TypedArrayKind::Int32 => {
-                        ab.bytes[off..off + 4].copy_from_slice(&to_int32(n).to_le_bytes());
-                    }
-                    TypedArrayKind::Uint32 => {
-                        ab.bytes[off..off + 4].copy_from_slice(&to_uint32(n).to_le_bytes());
-                    }
-                    TypedArrayKind::Float32 => {
-                        ab.bytes[off..off + 4].copy_from_slice(&(n as f32).to_le_bytes());
-                    }
-                    TypedArrayKind::Float64 => {
-                        ab.bytes[off..off + 8].copy_from_slice(&n.to_le_bytes());
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
+        write_into(&mut ab.bytes);
         Ok(())
     }
 
     pub fn typed_array_get(&self, ta: &TypedArrayData, index: usize) -> Result<JsValue, JsError> {
-        let ObjectKind::ArrayBuffer(ref ab) = self.heap.get_obj(ta.buffer).kind else {
-            return Err(JsError::type_err("Invalid ArrayBuffer"));
-        };
-        if ab.detached {
-            return Ok(JsValue::Undefined);
-        }
         let es = ta.kind.element_size();
         let off = ta.byte_offset + index * es;
-        if off + es > ab.bytes.len() {
-            return Ok(JsValue::Undefined);
+        let mut raw = [0u8; 8];
+        if let Some(sb) = self.shared_buffer_backing(ta.buffer) {
+            let guard = sb.data.lock().unwrap();
+            if off + es > guard.len() {
+                return Ok(JsValue::Undefined);
+            }
+            raw[..es].copy_from_slice(&guard[off..off + es]);
+        } else {
+            let ObjectKind::ArrayBuffer(ref ab) = self.heap.get_obj(ta.buffer).kind else {
+                return Err(JsError::type_err("Invalid ArrayBuffer"));
+            };
+            if ab.detached || off + es > ab.bytes.len() {
+                return Ok(JsValue::Undefined);
+            }
+            raw[..es].copy_from_slice(&ab.bytes[off..off + es]);
         }
-        let slice = &ab.bytes[off..off + es];
+        let slice = &raw[..es];
         Ok(match ta.kind {
             TypedArrayKind::Int8 => JsValue::Number(slice[0] as i8 as f64),
             TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped => {
@@ -4972,12 +5177,12 @@ impl JsRuntime {
             TypedArrayKind::Float64 => {
                 JsValue::Number(f64::from_le_bytes(slice.try_into().unwrap()))
             }
-            TypedArrayKind::BigInt64 => {
-                JsValue::BigInt(i64::from_le_bytes(slice.try_into().unwrap()) as i128)
-            }
-            TypedArrayKind::BigUint64 => {
-                JsValue::BigInt(u64::from_le_bytes(slice.try_into().unwrap()) as i128)
-            }
+            TypedArrayKind::BigInt64 => JsValue::BigInt(crate::bigint::JsBigInt::from_i64(
+                i64::from_le_bytes(slice.try_into().unwrap()),
+            )),
+            TypedArrayKind::BigUint64 => JsValue::BigInt(crate::bigint::JsBigInt::from_u64(
+                u64::from_le_bytes(slice.try_into().unwrap()),
+            )),
         })
     }
 
@@ -5204,8 +5409,21 @@ impl JsRuntime {
         let JsValue::Object(oid) = iter else {
             return Err(JsError::type_err("Iterator must be an object"));
         };
-        let next_fn = self.get_property(*oid, "next")?;
-        let res = self.call_function(next_fn, iter.clone(), &[])?;
+        let cached = match &self.heap.get_obj(*oid).kind {
+            ObjectKind::Iterator(it) => match &it.kind {
+                BuiltinIteratorKind::CachedIter(rec) => {
+                    Some((rec.iterator.clone(), rec.next_method.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let (target_iter, next_fn) = if let Some((ti, nf)) = cached {
+            (ti, nf)
+        } else {
+            (iter.clone(), self.get_property(*oid, "next")?)
+        };
+        let res = self.call_function(next_fn, target_iter, &[])?;
         let JsValue::Object(res_id) = res else {
             return Err(JsError::type_err("Iterator result is not an object"));
         };
@@ -5226,10 +5444,20 @@ impl JsRuntime {
         iter: &JsValue,
         suppress_err: bool,
     ) -> Result<(), JsError> {
-        let JsValue::Object(oid) = iter else {
+        let JsValue::Object(raw_oid) = iter else {
             return Ok(());
         };
-        let ret_fn = match self.get_property(*oid, "return") {
+        let real_iter = match &self.heap.get_obj(*raw_oid).kind {
+            ObjectKind::Iterator(it) => match &it.kind {
+                BuiltinIteratorKind::CachedIter(rec) => rec.iterator.clone(),
+                _ => iter.clone(),
+            },
+            _ => iter.clone(),
+        };
+        let JsValue::Object(oid) = real_iter else {
+            return Ok(());
+        };
+        let ret_fn = match self.get_property(oid, "return") {
             Ok(v) => v,
             Err(e) => {
                 if suppress_err {
@@ -5247,7 +5475,7 @@ impl JsRuntime {
             }
             return Err(JsError::type_err("Iterator return is not callable"));
         }
-        let res = match self.call_function(ret_fn, iter.clone(), &[]) {
+        let res = match self.call_function(ret_fn, real_iter, &[]) {
             Ok(v) => v,
             Err(e) => {
                 if suppress_err {
@@ -5528,7 +5756,9 @@ impl JsRuntime {
             }
             BuiltinIteratorKind::Wrapped(_) => self.intrinsics.wrap_for_valid_iterator_proto,
             BuiltinIteratorKind::Helper(_) => self.intrinsics.iterator_helper_proto,
-            BuiltinIteratorKind::Keys(_) => self.intrinsics.iterator_proto,
+            BuiltinIteratorKind::Keys { .. } | BuiltinIteratorKind::CachedIter(_) => {
+                self.intrinsics.iterator_proto
+            }
         };
         self.heap.alloc_object(JsObject::new(
             Some(proto),
@@ -5605,77 +5835,6 @@ fn compute_func_length(params: &[crate::ast::Param]) -> usize {
         len += 1;
     }
     len
-}
-
-fn parse_string_to_bigint(s: &str) -> Option<i128> {
-    let t = s.trim();
-    if t.is_empty() {
-        return Some(0);
-    }
-    let (neg, rest) = if let Some(r) = t.strip_prefix('-') {
-        (true, r)
-    } else if let Some(r) = t.strip_prefix('+') {
-        (false, r)
-    } else {
-        (false, t)
-    };
-    if rest.is_empty() {
-        return None;
-    }
-    let (radix, digits) = if !neg && !t.starts_with('+') {
-        if let Some(d) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
-            (16, d)
-        } else if let Some(d) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
-            (8, d)
-        } else if let Some(d) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
-            (2, d)
-        } else {
-            (10, rest)
-        }
-    } else {
-        (10, rest)
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| (b as char).is_digit(radix)) {
-        return None;
-    }
-    let u = u128::from_str_radix(digits, radix).ok()?;
-    if neg {
-        if u == (i128::MAX as u128) + 1 {
-            Some(i128::MIN)
-        } else {
-            i128::try_from(u).ok().map(|v| -v)
-        }
-    } else {
-        i128::try_from(u).ok()
-    }
-}
-
-fn cmp_bigint_f64(b: i128, n: f64) -> Option<std::cmp::Ordering> {
-    if n.is_nan() {
-        return None;
-    }
-    if n.is_infinite() {
-        return Some(if n.is_sign_positive() {
-            std::cmp::Ordering::Less
-        } else {
-            std::cmp::Ordering::Greater
-        });
-    }
-    if n >= 170141183460469231731687303715884105728.0 {
-        return Some(std::cmp::Ordering::Less);
-    }
-    if n < -170141183460469231731687303715884105728.0 {
-        return Some(std::cmp::Ordering::Greater);
-    }
-    let fl = n.floor();
-    let fi = fl as i128;
-    if fl == n {
-        Some(b.cmp(&fi))
-    } else if b <= fi {
-        Some(std::cmp::Ordering::Less)
-    } else {
-        Some(std::cmp::Ordering::Greater)
-    }
 }
 
 pub fn canonical_numeric_index_string(s: &str) -> Option<f64> {

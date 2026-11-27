@@ -12,7 +12,36 @@ pub enum FrameOutcome {
     Return(JsValue),
     Yield(JsValue),
     YieldDelegate(JsValue),
-    Await(JsValue),
+    Await(JsValue, bool),
+    TailCall {
+        callee: JsValue,
+        this_arg: JsValue,
+        args: Vec<JsValue>,
+    },
+}
+
+enum CallStep {
+    Done(JsValue),
+    Tail {
+        callee: JsValue,
+        this_arg: JsValue,
+        args: Vec<JsValue>,
+    },
+}
+
+fn can_tail_call_frame(frame: &CallFrame) -> bool {
+    if frame.is_constructor || frame.is_async || frame.is_generator || !frame.chunk.strict {
+        return false;
+    }
+    for h in &frame.handlers {
+        if !h.in_catch && !h.in_finally && h.catch_ip.is_some() {
+            return false;
+        }
+        if !h.in_finally && h.finally_ip.is_some() {
+            return false;
+        }
+    }
+    true
 }
 
 fn pattern_has_expr(pat: &Pattern) -> bool {
@@ -344,10 +373,17 @@ impl JsRuntime {
             let has_private_methods = home_object
                 .map(|ho| self.heap.get_obj(ho).private_fields.keys().any(|(kb, _)| *kb == b))
                 .unwrap_or(false);
-            if has_private_methods && self.heap.get_obj(inst).class_brands.contains(&b) {
-                return Err(JsError::type_err(
-                    "Cannot initialize private methods twice on the same object",
-                ));
+            if has_private_methods {
+                if !self.heap.get_obj(inst).extensible {
+                    return Err(JsError::type_err(
+                        "Cannot define private methods on a non-extensible object",
+                    ));
+                }
+                if self.heap.get_obj(inst).class_brands.contains(&b) {
+                    return Err(JsError::type_err(
+                        "Cannot initialize private methods twice on the same object",
+                    ));
+                }
             }
             if !self.heap.get_obj(inst).class_brands.contains(&b) {
                 self.heap.get_obj_mut(inst).class_brands.push(b);
@@ -390,6 +426,11 @@ impl JsRuntime {
                     }
                 }
                 FieldKeySpec::Private(name) => {
+                    if !self.heap.get_obj(inst).extensible {
+                        return Err(JsError::type_err(
+                            "Cannot define private field on a non-extensible object",
+                        ));
+                    }
                     let b = brand.unwrap_or(0);
                     let pf = &mut self.heap.get_obj_mut(inst).private_fields;
                     if pf.contains_key(&(b, name.clone())) {
@@ -412,84 +453,146 @@ impl JsRuntime {
         args: &[JsValue],
         new_target: Option<JsValue>,
     ) -> Result<JsValue, JsError> {
-        if self.call_depth >= self.max_call_depth {
-            return Err(JsError::range("Maximum call stack size exceeded"));
-        }
-        let JsValue::Object(oid) = callee else {
-            return Err(JsError::type_err(format!(
-                "{} is not a function",
-                self.to_display_string(&callee)
-            )));
-        };
-
-        let proxy_info = match &self.heap.get_obj(oid).kind {
-            ObjectKind::Proxy(p) => Some((p.target, p.handler, p.revoked)),
-            _ => None,
-        };
-        if let Some((target, handler, revoked)) = proxy_info {
-            if revoked {
-                return Err(JsError::type_err("Cannot perform 'apply' on a revoked Proxy"));
+        let mut cur_callee = callee;
+        let mut cur_this = this_arg;
+        let mut cur_args_owned: Option<Vec<JsValue>> = None;
+        let mut cur_new_target = new_target;
+        loop {
+            if self.call_depth >= self.max_call_depth {
+                return Err(JsError::range("Maximum call stack size exceeded"));
             }
-            if !self.is_callable(&JsValue::Object(target)) {
-                return Err(JsError::type_err("Proxy target is not callable"));
-            }
-            let trap = self.get_property(handler, "apply")?;
-            if !trap.is_nullish() {
-                if !self.is_callable(&trap) {
-                    return Err(JsError::type_err("Proxy apply trap is not callable"));
-                }
-                let arg_arr = self.create_array(args.to_vec());
-                return self.call_function(
-                    trap,
-                    JsValue::Object(handler),
-                    &[JsValue::Object(target), this_arg, JsValue::Object(arg_arr)],
-                );
-            }
-            return self.call_internal(JsValue::Object(target), this_arg, args, new_target);
-        }
-
-        let native_cb = match &self.heap.get_obj(oid).kind {
-            ObjectKind::NativeFunction(nf) => Some(nf.callback.clone()),
-            _ => None,
-        };
-        if let Some(cb) = native_cb {
-            let fn_realm = self
-                .heap
-                .object_realms
-                .get(&oid)
-                .copied()
-                .unwrap_or(self.current_realm_id);
-            let prev_realm = self.switch_realm(fn_realm);
-            self.call_depth += 1;
-            let prev_nt = self.native_new_target.replace(new_target.unwrap_or(JsValue::Undefined));
-            let res = cb(self, this_arg, args);
-            let res = match res {
-                Err(e @ JsError::Native { object: None, .. }) if prev_realm != fn_realm => {
-                    Err(JsError::Thrown(self.error_to_js_value(e)))
-                }
-                other => other,
+            let JsValue::Object(oid) = cur_callee else {
+                return Err(JsError::type_err(format!(
+                    "{} is not a function",
+                    self.to_display_string(&cur_callee)
+                )));
             };
-            self.native_new_target = prev_nt;
-            self.call_depth -= 1;
-            self.switch_realm(prev_realm);
-            return res;
-        }
 
-        let bound_info = match &self.heap.get_obj(oid).kind {
-            ObjectKind::Function(f) => f.bound_target.map(|bt| (bt, f.bound_this.clone(), f.bound_args.clone())),
-            _ => None,
-        };
-        if let Some((bt, bthis, mut bargs)) = bound_info {
-            bargs.extend_from_slice(args);
-            let actual_this = bthis.unwrap_or(this_arg);
-            return self.call_internal(JsValue::Object(bt), actual_this, &bargs, new_target);
-        }
+            let proxy_info = match &self.heap.get_obj(oid).kind {
+                ObjectKind::Proxy(p) => Some((p.target, p.handler, p.revoked)),
+                _ => None,
+            };
+            if let Some((target, handler, revoked)) = proxy_info {
+                if revoked {
+                    return Err(JsError::type_err("Cannot perform 'apply' on a revoked Proxy"));
+                }
+                if !self.is_callable(&JsValue::Object(target)) {
+                    return Err(JsError::type_err("Proxy target is not callable"));
+                }
+                let trap = self.get_property(handler, "apply")?;
+                if !trap.is_nullish() {
+                    if !self.is_callable(&trap) {
+                        return Err(JsError::type_err("Proxy apply trap is not callable"));
+                    }
+                    let slice = cur_args_owned.as_deref().unwrap_or(args);
+                    let arg_arr = self.create_array(slice.to_vec());
+                    cur_callee = trap;
+                    cur_args_owned = Some(vec![
+                        JsValue::Object(target),
+                        cur_this,
+                        JsValue::Object(arg_arr),
+                    ]);
+                    cur_this = JsValue::Object(handler);
+                    cur_new_target = None;
+                    continue;
+                }
+                cur_callee = JsValue::Object(target);
+                continue;
+            }
 
-        if matches!(self.heap.get_obj(oid).kind, ObjectKind::Function(_)) {
-            return self.call_js_function_internal(oid, this_arg, args, new_target, false, None);
-        }
+            let wrapped_info = match &self.heap.get_obj(oid).kind {
+                ObjectKind::WrappedFunction {
+                    target,
+                    caller_realm,
+                } => Some((*target, *caller_realm)),
+                _ => None,
+            };
+            if let Some((target, caller_realm)) = wrapped_info {
+                let slice = cur_args_owned.as_deref().unwrap_or(args);
+                self.call_depth += 1;
+                let res = crate::builtins::shadow_realm::call_wrapped_function(
+                    self,
+                    target,
+                    caller_realm,
+                    slice,
+                );
+                self.call_depth -= 1;
+                return res;
+            }
 
-        Err(JsError::type_err("Value is not a function"))
+            let native_cb = match &self.heap.get_obj(oid).kind {
+                ObjectKind::NativeFunction(nf) => Some(nf.callback.clone()),
+                _ => None,
+            };
+            if let Some(cb) = native_cb {
+                let slice = cur_args_owned.as_deref().unwrap_or(args);
+                let fn_realm = self
+                    .heap
+                    .object_realms
+                    .get(&oid)
+                    .copied()
+                    .unwrap_or(self.current_realm_id);
+                let prev_realm = self.switch_realm(fn_realm);
+                self.call_depth += 1;
+                let prev_nt = self
+                    .native_new_target
+                    .replace(cur_new_target.unwrap_or(JsValue::Undefined));
+                let res = cb(self, cur_this, slice);
+                let res = match res {
+                    Err(e @ JsError::Native { object: None, .. }) if prev_realm != fn_realm => {
+                        Err(JsError::Thrown(self.error_to_js_value(e)))
+                    }
+                    other => other,
+                };
+                self.native_new_target = prev_nt;
+                self.call_depth -= 1;
+                self.switch_realm(prev_realm);
+                return res;
+            }
+
+            let bound_info = match &self.heap.get_obj(oid).kind {
+                ObjectKind::Function(f) => {
+                    f.bound_target
+                        .map(|bt| (bt, f.bound_this.clone(), f.bound_args.clone()))
+                }
+                _ => None,
+            };
+            if let Some((bt, bthis, mut bargs)) = bound_info {
+                let slice = cur_args_owned.as_deref().unwrap_or(args);
+                bargs.extend_from_slice(slice);
+                cur_this = bthis.unwrap_or(cur_this);
+                cur_callee = JsValue::Object(bt);
+                cur_args_owned = Some(bargs);
+                continue;
+            }
+
+            if matches!(self.heap.get_obj(oid).kind, ObjectKind::Function(_)) {
+                let slice = cur_args_owned.as_deref().unwrap_or(args);
+                match self.call_js_function_internal_trampoline(
+                    oid,
+                    cur_this,
+                    slice,
+                    cur_new_target,
+                    false,
+                    None,
+                )? {
+                    CallStep::Done(v) => return Ok(v),
+                    CallStep::Tail {
+                        callee,
+                        this_arg,
+                        args: next_args,
+                    } => {
+                        cur_callee = callee;
+                        cur_this = this_arg;
+                        cur_args_owned = Some(next_args);
+                        cur_new_target = None;
+                        continue;
+                    }
+                }
+            }
+
+            return Err(JsError::type_err("Value is not a function"));
+        }
     }
 
     fn call_js_function_internal(
@@ -501,6 +604,32 @@ impl JsRuntime {
         is_constructor: bool,
         this_for_ctor: Option<ObjectId>,
     ) -> Result<JsValue, JsError> {
+        match self.call_js_function_internal_trampoline(
+            fn_id,
+            this_arg,
+            args,
+            new_target,
+            is_constructor,
+            this_for_ctor,
+        )? {
+            CallStep::Done(v) => Ok(v),
+            CallStep::Tail {
+                callee,
+                this_arg,
+                args,
+            } => self.call_internal(callee, this_arg, &args, None),
+        }
+    }
+
+    fn call_js_function_internal_trampoline(
+        &mut self,
+        fn_id: ObjectId,
+        this_arg: JsValue,
+        args: &[JsValue],
+        new_target: Option<JsValue>,
+        is_constructor: bool,
+        this_for_ctor: Option<ObjectId>,
+    ) -> Result<CallStep, JsError> {
         let fn_realm = self
             .heap
             .object_realms
@@ -536,7 +665,7 @@ impl JsRuntime {
         is_constructor: bool,
         this_for_ctor: Option<ObjectId>,
         caller_realm: usize,
-    ) -> Result<JsValue, JsError> {
+    ) -> Result<CallStep, JsError> {
         let func = match &self.heap.get_obj(fn_id).kind {
             ObjectKind::Function(f) => f.clone(),
             _ => return Err(JsError::type_err("Not a JS function")),
@@ -548,9 +677,12 @@ impl JsRuntime {
             ));
         }
 
-        let parent_env =
-            if !func.name.is_empty() && !func.is_arrow && !func.is_decl && func.home_object.is_none()
-            {
+        let parent_env = if func.has_self_name
+            && !func.name.is_empty()
+            && !func.is_arrow
+            && !func.is_decl
+            && func.home_object.is_none()
+        {
             let mut name_env = EnvRecord::new(Some(func.env), false, func.strict);
             name_env.bindings.insert(
                 func.name.clone(),
@@ -606,7 +738,7 @@ impl JsRuntime {
         let has_param_exprs = func.params.iter().any(|p| pattern_has_expr(&p.pattern));
         let param_has_arguments = all_param_names.iter().any(|(n, _)| n == "arguments");
 
-        if !func.is_arrow && !param_has_arguments {
+        if !func.is_arrow && !param_has_arguments && (func.chunk.needs_arguments || has_param_exprs) {
             let is_simple_params = func
                 .params
                 .iter()
@@ -691,7 +823,7 @@ impl JsRuntime {
                 let promise = self.create_promise();
                 let ev = self.error_to_js_value(e);
                 self.reject_promise(promise, ev);
-                return Ok(JsValue::Object(promise));
+                return Ok(CallStep::Done(JsValue::Object(promise)));
             }
             return Err(e);
         }
@@ -750,16 +882,17 @@ impl JsRuntime {
                     is_async: func.is_async,
                     delegating: None,
                     result_promise: None,
+                    queue: Vec::new(),
                 }),
             ));
-            return Ok(JsValue::Object(gen_obj));
+            return Ok(CallStep::Done(JsValue::Object(gen_obj)));
         }
 
         if func.is_async {
             let promise = self.create_promise();
             frame.async_promise = Some(promise);
             self.run_async_frame(frame, promise);
-            return Ok(JsValue::Object(promise));
+            return Ok(CallStep::Done(JsValue::Object(promise)));
         }
 
         self.call_depth += 1;
@@ -771,6 +904,15 @@ impl JsRuntime {
         self.call_depth -= 1;
 
         match res? {
+            FrameOutcome::TailCall {
+                callee,
+                this_arg,
+                args,
+            } => Ok(CallStep::Tail {
+                callee,
+                this_arg,
+                args,
+            }),
             FrameOutcome::Return(v) => {
                 if is_constructor && func.is_derived_ctor && !v.is_object() {
                     if !v.is_undefined() {
@@ -782,11 +924,11 @@ impl JsRuntime {
                         return Err(JsError::Thrown(JsValue::Object(err)));
                     }
                     if let Some(inst) = frame.this_for_ctor {
-                        return Ok(JsValue::Object(inst));
+                        return Ok(CallStep::Done(JsValue::Object(inst)));
                     }
                     if !self.heap.get_env(fn_env).this_uninitialized {
                         if let Some(ref tb) = self.heap.get_env(fn_env).this_binding {
-                            return Ok(tb.clone());
+                            return Ok(CallStep::Done(tb.clone()));
                         }
                     }
                     let err = self.create_realm_error_object(
@@ -796,9 +938,9 @@ impl JsRuntime {
                     );
                     return Err(JsError::Thrown(JsValue::Object(err)));
                 }
-                Ok(v)
+                Ok(CallStep::Done(v))
             }
-            _ => Ok(JsValue::Undefined),
+            _ => Ok(CallStep::Done(JsValue::Undefined)),
         }
     }
 
@@ -810,8 +952,24 @@ impl JsRuntime {
             Ok(FrameOutcome::Return(v)) => {
                 self.resolve_promise(promise, v);
             }
-            Ok(FrameOutcome::Await(awaited)) => {
-                let awaited_p = self.promise_resolve_value(awaited);
+            Ok(FrameOutcome::Await(awaited, clear_iter_on_reject)) => {
+                let awaited_p = match self.promise_resolve_value_checked(awaited) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if clear_iter_on_reject {
+                            if let Some(slot) = frame.stack.last_mut() {
+                                *slot = JsValue::Undefined;
+                            }
+                        }
+                        if let Err(uncaught) = self.unwind_throw(&mut frame, e) {
+                            let ev = self.error_to_js_value(uncaught);
+                            self.reject_promise(promise, ev);
+                        } else {
+                            self.run_async_frame(frame, promise);
+                        }
+                        return;
+                    }
+                };
                 let holder = self.heap.alloc_object(JsObject::new(
                     None,
                     ObjectKind::Generator(GeneratorData {
@@ -820,6 +978,7 @@ impl JsRuntime {
                         is_async: true,
                         delegating: None,
                         result_promise: Some(promise),
+                        queue: Vec::new(),
                     }),
                 ));
                 let on_ok = self.create_native_function(
@@ -848,6 +1007,11 @@ impl JsRuntime {
                             _ => None,
                         };
                         if let Some(mut fr) = opt_frame {
+                            if clear_iter_on_reject {
+                                if let Some(slot) = fr.stack.last_mut() {
+                                    *slot = JsValue::Undefined;
+                                }
+                            }
                             if let Err(e) = rt.unwind_throw(&mut fr, JsError::thrown(err)) {
                                 let ev = rt.error_to_js_value(e);
                                 rt.reject_promise(promise, ev);
@@ -879,6 +1043,687 @@ impl JsRuntime {
         let p = self.create_promise();
         self.resolve_promise(p, val);
         p
+    }
+
+    pub fn promise_resolve_value_checked(&mut self, val: JsValue) -> Result<ObjectId, JsError> {
+        if let JsValue::Object(oid) = val {
+            if matches!(self.heap.get_obj(oid).kind, ObjectKind::Promise(_)) {
+                let ctor = self.get_property(oid, "constructor")?;
+                if ctor == JsValue::Object(self.intrinsics.promise_ctor) {
+                    return Ok(oid);
+                }
+            }
+        }
+        let p = self.create_promise();
+        self.resolve_promise(p, val);
+        Ok(p)
+    }
+
+    pub fn enqueue_async_generator(
+        &mut self,
+        gen_id: ObjectId,
+        mode: u8,
+        arg: JsValue,
+    ) -> ObjectId {
+        let out_p = self.create_promise();
+        let should_resume = if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind
+        {
+            g.queue.push(AsyncGenRequest {
+                mode,
+                arg,
+                promise: out_p,
+            });
+            g.state != GeneratorState::Executing
+                && g.state != GeneratorState::AwaitingReturn
+                && g.queue.len() == 1
+        } else {
+            false
+        };
+        if should_resume {
+            self.async_generator_resume_next(gen_id);
+        }
+        out_p
+    }
+
+    fn async_gen_pop_request(&mut self, gen_id: ObjectId) -> Option<AsyncGenRequest> {
+        if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+            if !g.queue.is_empty() {
+                return Some(g.queue.remove(0));
+            }
+        }
+        None
+    }
+
+    fn async_gen_resolve_front(&mut self, gen_id: ObjectId, val: JsValue, done: bool) {
+        if let Some(req) = self.async_gen_pop_request(gen_id) {
+            let ir = self.create_iter_result(val, done);
+            self.resolve_promise(req.promise, ir);
+        }
+    }
+
+    fn async_gen_reject_front(&mut self, gen_id: ObjectId, err: JsValue) {
+        if let Some(req) = self.async_gen_pop_request(gen_id) {
+            self.reject_promise(req.promise, err);
+        }
+    }
+
+    fn async_gen_await_return_closed(&mut self, gen_id: ObjectId, arg: JsValue) {
+        if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+            g.state = GeneratorState::AwaitingReturn;
+        }
+        match self.promise_resolve_value_checked(arg) {
+            Err(e) => {
+                let ev = self.error_to_js_value(e);
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.state = GeneratorState::Completed;
+                }
+                self.async_gen_reject_front(gen_id, ev);
+                self.async_generator_resume_next(gen_id);
+            }
+            Ok(p) => {
+                let on_ok = self.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, a| {
+                        let v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        if let ObjectKind::Generator(ref mut g) = rt.heap.get_obj_mut(gen_id).kind {
+                            g.state = GeneratorState::Completed;
+                        }
+                        rt.async_gen_resolve_front(gen_id, v, true);
+                        rt.async_generator_resume_next(gen_id);
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+                let on_err = self.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, a| {
+                        let err = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        if let ObjectKind::Generator(ref mut g) = rt.heap.get_obj_mut(gen_id).kind {
+                            g.state = GeneratorState::Completed;
+                        }
+                        rt.async_gen_reject_front(gen_id, err);
+                        rt.async_generator_resume_next(gen_id);
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+                self.promise_then(
+                    p,
+                    Some(JsValue::Object(on_ok)),
+                    Some(JsValue::Object(on_err)),
+                );
+            }
+        }
+    }
+
+    fn async_generator_resume_next(&mut self, gen_id: ObjectId) {
+        loop {
+            let (state, front, delegating) = match &self.heap.get_obj(gen_id).kind {
+                ObjectKind::Generator(g) => (
+                    g.state,
+                    g.queue.first().cloned(),
+                    g.delegating.clone(),
+                ),
+                _ => return,
+            };
+            if state == GeneratorState::Executing || state == GeneratorState::AwaitingReturn {
+                return;
+            }
+            let Some(req) = front else {
+                return;
+            };
+
+            if state == GeneratorState::Completed {
+                match req.mode {
+                    0 => {
+                        self.async_gen_resolve_front(gen_id, JsValue::Undefined, true);
+                        continue;
+                    }
+                    1 => {
+                        self.async_gen_reject_front(gen_id, req.arg);
+                        continue;
+                    }
+                    _ => {
+                        self.async_gen_await_return_closed(gen_id, req.arg);
+                        return;
+                    }
+                }
+            }
+
+            if state == GeneratorState::SuspendedStart {
+                match req.mode {
+                    1 => {
+                        if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind
+                        {
+                            g.state = GeneratorState::Completed;
+                            g.frame = None;
+                        }
+                        self.async_gen_reject_front(gen_id, req.arg);
+                        continue;
+                    }
+                    2 => {
+                        if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind
+                        {
+                            g.frame = None;
+                        }
+                        self.async_gen_await_return_closed(gen_id, req.arg);
+                        return;
+                    }
+                    _ => {
+                        let frame = match &mut self.heap.get_obj_mut(gen_id).kind {
+                            ObjectKind::Generator(g) => {
+                                g.state = GeneratorState::Executing;
+                                *g.frame.take().unwrap()
+                            }
+                            _ => return,
+                        };
+                        self.async_generator_run_frame(gen_id, frame);
+                        return;
+                    }
+                }
+            }
+
+            if req.mode == 2 {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.state = GeneratorState::Executing;
+                }
+                match self.promise_resolve_value_checked(req.arg) {
+                    Err(e) => {
+                        let ev = self.error_to_js_value(e);
+                        if let Some((del_iter, next_method)) = delegating {
+                            self.step_async_delegate_queued(gen_id, del_iter, next_method, 1, ev);
+                        } else {
+                            self.async_gen_resume_frame_throw(gen_id, ev);
+                        }
+                    }
+                    Ok(p) => {
+                        let del_ok = delegating.clone();
+                        let del_err = delegating;
+                        let on_ok = self.create_native_function(
+                            "",
+                            1,
+                            Rc::new(move |rt, _, a| {
+                                let v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                                if let Some((ref di, ref nm)) = del_ok {
+                                    rt.step_async_delegate_queued(
+                                        gen_id,
+                                        di.clone(),
+                                        nm.clone(),
+                                        2,
+                                        v,
+                                    );
+                                } else {
+                                    rt.async_gen_resume_frame_return(gen_id, v);
+                                }
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        let on_err = self.create_native_function(
+                            "",
+                            1,
+                            Rc::new(move |rt, _, a| {
+                                let err = a.first().cloned().unwrap_or(JsValue::Undefined);
+                                if let Some((ref di, ref nm)) = del_err {
+                                    rt.step_async_delegate_queued(
+                                        gen_id,
+                                        di.clone(),
+                                        nm.clone(),
+                                        1,
+                                        err,
+                                    );
+                                } else {
+                                    rt.async_gen_resume_frame_throw(gen_id, err);
+                                }
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        self.promise_then(
+                            p,
+                            Some(JsValue::Object(on_ok)),
+                            Some(JsValue::Object(on_err)),
+                        );
+                    }
+                }
+                return;
+            }
+
+            if let Some((del_iter, next_method)) = delegating {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.state = GeneratorState::Executing;
+                }
+                self.step_async_delegate_queued(gen_id, del_iter, next_method, req.mode, req.arg);
+                return;
+            }
+
+            if req.mode == 1 {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.state = GeneratorState::Executing;
+                }
+                self.async_gen_resume_frame_throw(gen_id, req.arg);
+                return;
+            }
+
+            let mut frame = match &mut self.heap.get_obj_mut(gen_id).kind {
+                ObjectKind::Generator(g) => {
+                    g.state = GeneratorState::Executing;
+                    *g.frame.take().unwrap()
+                }
+                _ => return,
+            };
+            frame.stack.push(req.arg);
+            self.async_generator_run_frame(gen_id, frame);
+            return;
+        }
+    }
+
+    fn async_gen_resume_frame_throw(&mut self, gen_id: ObjectId, err: JsValue) {
+        let Some(mut frame) = (match &mut self.heap.get_obj_mut(gen_id).kind {
+            ObjectKind::Generator(g) => g.frame.take().map(|b| *b),
+            _ => None,
+        }) else {
+            if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                g.state = GeneratorState::Completed;
+            }
+            self.async_gen_reject_front(gen_id, err);
+            self.async_generator_resume_next(gen_id);
+            return;
+        };
+        if let Err(e) = self.unwind_throw(&mut frame, JsError::thrown(err)) {
+            let ev = self.error_to_js_value(e);
+            if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                g.state = GeneratorState::Completed;
+            }
+            self.async_gen_reject_front(gen_id, ev);
+            self.async_generator_resume_next(gen_id);
+        } else {
+            self.async_generator_run_frame(gen_id, frame);
+        }
+    }
+
+    fn async_gen_resume_frame_return(&mut self, gen_id: ObjectId, val: JsValue) {
+        let Some(mut frame) = (match &mut self.heap.get_obj_mut(gen_id).kind {
+            ObjectKind::Generator(g) => g.frame.take().map(|b| *b),
+            _ => None,
+        }) else {
+            if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                g.state = GeneratorState::Completed;
+            }
+            self.async_gen_resolve_front(gen_id, val, true);
+            self.async_generator_resume_next(gen_id);
+            return;
+        };
+        match self.unwind_return(&mut frame, val) {
+            Ok(Some(ret_val)) => {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.state = GeneratorState::Completed;
+                }
+                self.async_gen_resolve_front(gen_id, ret_val, true);
+                self.async_generator_resume_next(gen_id);
+            }
+            Ok(None) => {
+                self.async_generator_run_frame(gen_id, frame);
+            }
+            Err(e) => {
+                let ev = self.error_to_js_value(e);
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.state = GeneratorState::Completed;
+                }
+                self.async_gen_reject_front(gen_id, ev);
+                self.async_generator_resume_next(gen_id);
+            }
+        }
+    }
+
+    fn async_generator_run_frame(&mut self, gen_id: ObjectId, mut frame: CallFrame) {
+        self.active_frames.push(frame.env);
+        let outcome = self.run_frame(&mut frame);
+        self.active_frames.pop();
+
+        match outcome {
+            Ok(FrameOutcome::Return(v)) => {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.state = GeneratorState::Completed;
+                }
+                self.async_gen_resolve_front(gen_id, v, true);
+                self.async_generator_resume_next(gen_id);
+            }
+            Ok(FrameOutcome::Yield(v)) => {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.frame = Some(Box::new(frame));
+                }
+                match self.promise_resolve_value_checked(v) {
+                    Err(e) => {
+                        let ev = self.error_to_js_value(e);
+                        self.async_gen_resume_frame_throw(gen_id, ev);
+                    }
+                    Ok(p) => {
+                        let on_ok = self.create_native_function(
+                            "",
+                            1,
+                            Rc::new(move |rt, _, a| {
+                                let av = a.first().cloned().unwrap_or(JsValue::Undefined);
+                                if let ObjectKind::Generator(ref mut g) =
+                                    rt.heap.get_obj_mut(gen_id).kind
+                                {
+                                    g.state = GeneratorState::SuspendedYield;
+                                }
+                                rt.async_gen_resolve_front(gen_id, av, false);
+                                rt.async_generator_resume_next(gen_id);
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        let on_err = self.create_native_function(
+                            "",
+                            1,
+                            Rc::new(move |rt, _, a| {
+                                let err_v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                                rt.async_gen_resume_frame_throw(gen_id, err_v);
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        self.promise_then(
+                            p,
+                            Some(JsValue::Object(on_ok)),
+                            Some(JsValue::Object(on_err)),
+                        );
+                    }
+                }
+            }
+            Ok(FrameOutcome::YieldDelegate(iterable)) => {
+                let iter_res = (|| -> Result<(JsValue, JsValue), JsError> {
+                    let iter = self.get_iterator(&iterable, true)?;
+                    let JsValue::Object(iter_oid) = iter else {
+                        return Err(JsError::type_err("Iterator must be an object"));
+                    };
+                    let next_fn = self.get_property(iter_oid, "next")?;
+                    Ok((iter, next_fn))
+                })();
+                match iter_res {
+                    Ok((iter, next_fn)) => {
+                        if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind
+                        {
+                            g.frame = Some(Box::new(frame));
+                            g.delegating = Some((iter.clone(), next_fn.clone()));
+                        }
+                        self.step_async_delegate_queued(gen_id, iter, next_fn, 0, JsValue::Undefined);
+                    }
+                    Err(e) => {
+                        if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind
+                        {
+                            g.frame = Some(Box::new(frame));
+                        }
+                        let ev = self.error_to_js_value(e);
+                        self.async_gen_resume_frame_throw(gen_id, ev);
+                    }
+                }
+            }
+            Ok(FrameOutcome::Await(awaited, clear_iter_on_reject)) => {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.frame = Some(Box::new(frame));
+                }
+                match self.promise_resolve_value_checked(awaited) {
+                    Err(e) => {
+                        if clear_iter_on_reject {
+                            if let ObjectKind::Generator(ref mut g) =
+                                self.heap.get_obj_mut(gen_id).kind
+                            {
+                                if let Some(ref mut fr) = g.frame {
+                                    if let Some(slot) = fr.stack.last_mut() {
+                                        *slot = JsValue::Undefined;
+                                    }
+                                }
+                            }
+                        }
+                        let ev = self.error_to_js_value(e);
+                        self.async_gen_resume_frame_throw(gen_id, ev);
+                    }
+                    Ok(p) => {
+                        let on_ok = self.create_native_function(
+                            "",
+                            1,
+                            Rc::new(move |rt, _, a| {
+                                let v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                                let opt_fr = match &mut rt.heap.get_obj_mut(gen_id).kind {
+                                    ObjectKind::Generator(g) => g.frame.take().map(|b| *b),
+                                    _ => None,
+                                };
+                                if let Some(mut fr) = opt_fr {
+                                    fr.stack.push(v);
+                                    rt.async_generator_run_frame(gen_id, fr);
+                                }
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        let on_err = self.create_native_function(
+                            "",
+                            1,
+                            Rc::new(move |rt, _, a| {
+                                let err_v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                                if clear_iter_on_reject {
+                                    if let ObjectKind::Generator(ref mut g) =
+                                        rt.heap.get_obj_mut(gen_id).kind
+                                    {
+                                        if let Some(ref mut fr) = g.frame {
+                                            if let Some(slot) = fr.stack.last_mut() {
+                                                *slot = JsValue::Undefined;
+                                            }
+                                        }
+                                    }
+                                }
+                                rt.async_gen_resume_frame_throw(gen_id, err_v);
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        self.promise_then(
+                            p,
+                            Some(JsValue::Object(on_ok)),
+                            Some(JsValue::Object(on_err)),
+                        );
+                    }
+                }
+            }
+            Ok(FrameOutcome::TailCall { .. }) => unreachable!(),
+            Err(e) => {
+                let ev = self.error_to_js_value(e);
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.state = GeneratorState::Completed;
+                }
+                self.async_gen_reject_front(gen_id, ev);
+                self.async_generator_resume_next(gen_id);
+            }
+        }
+    }
+
+    fn step_async_delegate_queued(
+        &mut self,
+        gen_id: ObjectId,
+        del_iter: JsValue,
+        next_method: JsValue,
+        mode: u8,
+        arg: JsValue,
+    ) {
+        let JsValue::Object(d_oid) = del_iter else {
+            if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                g.delegating = None;
+            }
+            let ev = self.error_to_js_value(JsError::type_err("Delegated iterator is not an object"));
+            self.async_gen_resume_frame_throw(gen_id, ev);
+            return;
+        };
+
+        let call_res: Result<Option<JsValue>, JsError> = (|| match mode {
+            0 => {
+                if !self.is_callable(&next_method) {
+                    return Err(JsError::type_err("Delegated iterator next is not callable"));
+                }
+                let r = self.call_function(next_method.clone(), del_iter.clone(), &[arg.clone()])?;
+                Ok(Some(r))
+            }
+            1 => {
+                let throw_fn = self.get_property(d_oid, "throw")?;
+                if throw_fn.is_nullish() {
+                    return Ok(None);
+                }
+                if !self.is_callable(&throw_fn) {
+                    return Err(JsError::type_err("Delegated iterator throw is not callable"));
+                }
+                let r = self.call_function(throw_fn, del_iter.clone(), &[arg.clone()])?;
+                Ok(Some(r))
+            }
+            2 => {
+                let ret_fn = self.get_property(d_oid, "return")?;
+                if ret_fn.is_nullish() {
+                    return Ok(None);
+                }
+                if !self.is_callable(&ret_fn) {
+                    return Err(JsError::type_err("Delegated iterator return is not callable"));
+                }
+                let r = self.call_function(ret_fn, del_iter.clone(), &[arg.clone()])?;
+                Ok(Some(r))
+            }
+            _ => Ok(None),
+        })();
+
+        match call_res {
+            Err(e) => {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.delegating = None;
+                }
+                let ev = self.error_to_js_value(e);
+                self.async_gen_resume_frame_throw(gen_id, ev);
+            }
+            Ok(None) => {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.delegating = None;
+                }
+                if mode == 1 {
+                    self.iterator_close(&del_iter);
+                    let err = self.error_to_js_value(JsError::type_err(
+                        "The iterator does not provide a 'throw' method",
+                    ));
+                    self.async_gen_resume_frame_throw(gen_id, err);
+                } else {
+                    match self.promise_resolve_value_checked(arg) {
+                        Err(e) => {
+                            let ev = self.error_to_js_value(e);
+                            self.async_gen_resume_frame_throw(gen_id, ev);
+                        }
+                        Ok(ap) => {
+                            let on_ok = self.create_native_function(
+                                "",
+                                1,
+                                Rc::new(move |rt, _, a| {
+                                    let v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                                    rt.async_gen_resume_frame_return(gen_id, v);
+                                    Ok(JsValue::Undefined)
+                                }),
+                            );
+                            let on_err = self.create_native_function(
+                                "",
+                                1,
+                                Rc::new(move |rt, _, a| {
+                                    let err = a.first().cloned().unwrap_or(JsValue::Undefined);
+                                    rt.async_gen_resume_frame_throw(gen_id, err);
+                                    Ok(JsValue::Undefined)
+                                }),
+                            );
+                            self.promise_then(
+                                ap,
+                                Some(JsValue::Object(on_ok)),
+                                Some(JsValue::Object(on_err)),
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(Some(inner_val)) => match self.promise_resolve_value_checked(inner_val) {
+                Err(e) => {
+                    if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                        g.delegating = None;
+                    }
+                    let ev = self.error_to_js_value(e);
+                    self.async_gen_resume_frame_throw(gen_id, ev);
+                }
+                Ok(inner_p) => {
+                    let on_ok = self.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, a| {
+                            let resolved = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let step: Result<(bool, JsValue), JsError> = (|| {
+                                let JsValue::Object(r_oid) = resolved else {
+                                    return Err(JsError::type_err(
+                                        "Iterator result is not an object",
+                                    ));
+                                };
+                                let done = rt.get_property(r_oid, "done")?.to_boolean();
+                                let val = rt.get_property(r_oid, "value")?;
+                                Ok((done, val))
+                            })();
+                            match step {
+                                Err(e) => {
+                                    if let ObjectKind::Generator(ref mut g) =
+                                        rt.heap.get_obj_mut(gen_id).kind
+                                    {
+                                        g.delegating = None;
+                                    }
+                                    let ev = rt.error_to_js_value(e);
+                                    rt.async_gen_resume_frame_throw(gen_id, ev);
+                                }
+                                Ok((true, val)) => {
+                                    if let ObjectKind::Generator(ref mut g) =
+                                        rt.heap.get_obj_mut(gen_id).kind
+                                    {
+                                        g.delegating = None;
+                                    }
+                                    if mode == 2 {
+                                        rt.async_gen_resume_frame_return(gen_id, val);
+                                    } else {
+                                        let opt_fr = match &mut rt.heap.get_obj_mut(gen_id).kind {
+                                            ObjectKind::Generator(g) => g.frame.take().map(|b| *b),
+                                            _ => None,
+                                        };
+                                        if let Some(mut fr) = opt_fr {
+                                            fr.stack.push(val);
+                                            rt.async_generator_run_frame(gen_id, fr);
+                                        }
+                                    }
+                                }
+                                Ok((false, val)) => {
+                                    if let ObjectKind::Generator(ref mut g) =
+                                        rt.heap.get_obj_mut(gen_id).kind
+                                    {
+                                        g.state = GeneratorState::SuspendedYield;
+                                    }
+                                    rt.async_gen_resolve_front(gen_id, val, false);
+                                    rt.async_generator_resume_next(gen_id);
+                                }
+                            }
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    let on_err = self.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, a| {
+                            let err = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            if let ObjectKind::Generator(ref mut g) =
+                                rt.heap.get_obj_mut(gen_id).kind
+                            {
+                                g.delegating = None;
+                            }
+                            rt.async_gen_resume_frame_throw(gen_id, err);
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    self.promise_then(
+                        inner_p,
+                        Some(JsValue::Object(on_ok)),
+                        Some(JsValue::Object(on_err)),
+                    );
+                }
+            },
+        }
     }
 
     fn pipe_async_gen_result(&mut self, res: Result<JsValue, JsError>, out_p: ObjectId) {
@@ -1421,7 +2266,7 @@ impl JsRuntime {
                     }
                 }
             }
-            Ok(FrameOutcome::Await(awaited)) => {
+            Ok(FrameOutcome::Await(awaited, _)) => {
                 let p = self.promise_resolve_value(awaited);
                 let out_p = self.create_promise();
                 if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
@@ -1451,6 +2296,7 @@ impl JsRuntime {
                 self.promise_then(p, Some(JsValue::Object(on_ok)), Some(JsValue::Object(on_err)));
                 Ok(JsValue::Object(out_p))
             }
+            Ok(FrameOutcome::TailCall { .. }) => unreachable!(),
             Err(e) => {
                 if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
                     g.state = GeneratorState::Completed;
@@ -1797,6 +2643,11 @@ impl JsRuntime {
                 frame.stack.push(a);
                 frame.stack.push(b);
             }
+            Op::DupAt(depth) => {
+                let idx = frame.stack.len() - 1 - (depth as usize);
+                let v = frame.stack[idx].clone();
+                frame.stack.push(v);
+            }
             Op::Swap => {
                 let len = frame.stack.len();
                 frame.stack.swap(len - 1, len - 2);
@@ -1929,8 +2780,15 @@ impl JsRuntime {
             }
             Op::GetVar(idx) => {
                 let name = get_const_str(&frame.chunk, idx).to_string();
-                let val = self.get_var(frame.env, &name)?;
+                let val = self.get_var_strict(frame.env, &name, frame.chunk.strict)?;
                 frame.stack.push(val);
+            }
+            Op::GetVarWithThis(idx) => {
+                let name = get_const_str(&frame.chunk, idx).to_string();
+                let (val, this_val) =
+                    self.get_var_with_this(frame.env, &name, frame.chunk.strict)?;
+                frame.stack.push(val);
+                frame.stack.push(this_val);
             }
             Op::GetVarTypeof(idx) => {
                 let name = get_const_str(&frame.chunk, idx).to_string();
@@ -2109,6 +2967,36 @@ impl JsRuntime {
                 let this_val = self.resolve_this(frame.env)?;
                 let super_proto = self.resolve_super_base(frame.env)?;
                 let key = self.to_property_key(&key_val)?;
+                let ok = self.set_property_key_receiver(super_proto, key, val.clone(), this_val)?;
+                if !ok && frame.chunk.strict {
+                    return Err(JsError::type_err("Cannot set super property"));
+                }
+                frame.stack.push(val);
+            }
+            Op::PushSuperBase => {
+                let super_proto = self.resolve_super_base(frame.env)?;
+                frame.stack.push(JsValue::Object(super_proto));
+            }
+            Op::GetSuperElemWithBase => {
+                let key_val = frame.stack.pop().unwrap();
+                let base_val = frame.stack.pop().unwrap();
+                let this_val = self.resolve_this(frame.env)?;
+                let key = self.to_property_key(&key_val)?;
+                let JsValue::Object(super_proto) = base_val else {
+                    return Err(JsError::type_err("Super property base is not an object"));
+                };
+                let val = self.get_property_key_receiver(super_proto, &key, this_val)?;
+                frame.stack.push(val);
+            }
+            Op::SetSuperElemWithBase => {
+                let val = frame.stack.pop().unwrap();
+                let key_val = frame.stack.pop().unwrap();
+                let base_val = frame.stack.pop().unwrap();
+                let this_val = self.resolve_this(frame.env)?;
+                let key = self.to_property_key(&key_val)?;
+                let JsValue::Object(super_proto) = base_val else {
+                    return Err(JsError::type_err("Super property base is not an object"));
+                };
                 let ok = self.set_property_key_receiver(super_proto, key, val.clone(), this_val)?;
                 if !ok && frame.chunk.strict {
                     return Err(JsError::type_err("Cannot set super property"));
@@ -2566,7 +3454,9 @@ impl JsRuntime {
             Op::Inc => {
                 let v = frame.stack.pop().unwrap();
                 match v {
-                    JsValue::BigInt(n) => frame.stack.push(JsValue::BigInt(n.wrapping_add(1))),
+                    JsValue::BigInt(n) => {
+                        frame.stack.push(JsValue::BigInt(n.add(&crate::bigint::JsBigInt::one())));
+                    }
                     JsValue::Number(n) => frame.stack.push(JsValue::Number(n + 1.0)),
                     other => {
                         let n = self.to_number(&other)?;
@@ -2577,7 +3467,9 @@ impl JsRuntime {
             Op::Dec => {
                 let v = frame.stack.pop().unwrap();
                 match v {
-                    JsValue::BigInt(n) => frame.stack.push(JsValue::BigInt(n.wrapping_sub(1))),
+                    JsValue::BigInt(n) => {
+                        frame.stack.push(JsValue::BigInt(n.sub(&crate::bigint::JsBigInt::one())));
+                    }
                     JsValue::Number(n) => frame.stack.push(JsValue::Number(n - 1.0)),
                     other => {
                         let n = self.to_number(&other)?;
@@ -2676,6 +3568,124 @@ impl JsRuntime {
                 } else {
                     let res = self.call_function(callee, JsValue::Undefined, &args)?;
                     frame.stack.push(res);
+                }
+            }
+            Op::TailCall(argc) => {
+                let start = frame.stack.len() - argc as usize;
+                let args: Vec<JsValue> = frame.stack.drain(start..).collect();
+                let callee = frame.stack.pop().unwrap();
+                if can_tail_call_frame(frame) {
+                    return Ok(Some(FrameOutcome::TailCall {
+                        callee,
+                        this_arg: JsValue::Undefined,
+                        args,
+                    }));
+                }
+                let res = self.call_function(callee, JsValue::Undefined, &args)?;
+                if let Some(final_val) = self.unwind_return(frame, res)? {
+                    return Ok(Some(FrameOutcome::Return(final_val)));
+                }
+            }
+            Op::TailCallMethod(argc) => {
+                let start = frame.stack.len() - argc as usize;
+                let args: Vec<JsValue> = frame.stack.drain(start..).collect();
+                let this_val = frame.stack.pop().unwrap();
+                let callee = frame.stack.pop().unwrap();
+                if can_tail_call_frame(frame) {
+                    return Ok(Some(FrameOutcome::TailCall {
+                        callee,
+                        this_arg: this_val,
+                        args,
+                    }));
+                }
+                let res = self.call_function(callee, this_val, &args)?;
+                if let Some(final_val) = self.unwind_return(frame, res)? {
+                    return Ok(Some(FrameOutcome::Return(final_val)));
+                }
+            }
+            Op::TailCallSpread => {
+                let arr = frame.stack.pop().unwrap();
+                let callee = frame.stack.pop().unwrap();
+                let args = self.extract_args_array(arr);
+                if can_tail_call_frame(frame) {
+                    return Ok(Some(FrameOutcome::TailCall {
+                        callee,
+                        this_arg: JsValue::Undefined,
+                        args,
+                    }));
+                }
+                let res = self.call_function(callee, JsValue::Undefined, &args)?;
+                if let Some(final_val) = self.unwind_return(frame, res)? {
+                    return Ok(Some(FrameOutcome::Return(final_val)));
+                }
+            }
+            Op::TailCallMethodSpread => {
+                let arr = frame.stack.pop().unwrap();
+                let this_val = frame.stack.pop().unwrap();
+                let callee = frame.stack.pop().unwrap();
+                let args = self.extract_args_array(arr);
+                if can_tail_call_frame(frame) {
+                    return Ok(Some(FrameOutcome::TailCall {
+                        callee,
+                        this_arg: this_val,
+                        args,
+                    }));
+                }
+                let res = self.call_function(callee, this_val, &args)?;
+                if let Some(final_val) = self.unwind_return(frame, res)? {
+                    return Ok(Some(FrameOutcome::Return(final_val)));
+                }
+            }
+            Op::TailCallDirectEval(argc) => {
+                let start = frame.stack.len() - argc as usize;
+                let args: Vec<JsValue> = frame.stack.drain(start..).collect();
+                let callee = frame.stack.pop().unwrap();
+                if callee == JsValue::Object(self.intrinsics.eval_fn) {
+                    let arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let res = match arg {
+                        JsValue::String(s) => self.eval_in_env(&s, frame.env, frame.chunk.strict)?,
+                        other => other,
+                    };
+                    if let Some(final_val) = self.unwind_return(frame, res)? {
+                        return Ok(Some(FrameOutcome::Return(final_val)));
+                    }
+                } else if can_tail_call_frame(frame) {
+                    return Ok(Some(FrameOutcome::TailCall {
+                        callee,
+                        this_arg: JsValue::Undefined,
+                        args,
+                    }));
+                } else {
+                    let res = self.call_function(callee, JsValue::Undefined, &args)?;
+                    if let Some(final_val) = self.unwind_return(frame, res)? {
+                        return Ok(Some(FrameOutcome::Return(final_val)));
+                    }
+                }
+            }
+            Op::TailCallDirectEvalSpread => {
+                let arr = frame.stack.pop().unwrap();
+                let callee = frame.stack.pop().unwrap();
+                let args = self.extract_args_array(arr);
+                if callee == JsValue::Object(self.intrinsics.eval_fn) {
+                    let arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let res = match arg {
+                        JsValue::String(s) => self.eval_in_env(&s, frame.env, frame.chunk.strict)?,
+                        other => other,
+                    };
+                    if let Some(final_val) = self.unwind_return(frame, res)? {
+                        return Ok(Some(FrameOutcome::Return(final_val)));
+                    }
+                } else if can_tail_call_frame(frame) {
+                    return Ok(Some(FrameOutcome::TailCall {
+                        callee,
+                        this_arg: JsValue::Undefined,
+                        args,
+                    }));
+                } else {
+                    let res = self.call_function(callee, JsValue::Undefined, &args)?;
+                    if let Some(final_val) = self.unwind_return(frame, res)? {
+                        return Ok(Some(FrameOutcome::Return(final_val)));
+                    }
                 }
             }
             Op::New(argc) => {
@@ -2782,31 +3792,54 @@ impl JsRuntime {
             }
             Op::ForInInit => {
                 let val = frame.stack.pop().unwrap();
+                let target = if val.is_nullish() {
+                    None
+                } else {
+                    Some(self.to_object(&val)?)
+                };
                 let keys = self.collect_for_in_keys(&val)?;
-                let iter_obj = self.create_builtin_iterator(BuiltinIteratorKind::Keys(keys));
+                let iter_obj =
+                    self.create_builtin_iterator(BuiltinIteratorKind::Keys { target, keys });
                 frame.stack.push(JsValue::Object(iter_obj));
             }
             Op::ForInNext(done_target) => {
                 let JsValue::Object(iter_id) = frame.stack.last().copied_or_ref() else {
                     unreachable!();
                 };
-                let next_key = match &mut self.heap.get_obj_mut(iter_id).kind {
-                    ObjectKind::Iterator(it) => {
-                        if let BuiltinIteratorKind::Keys(ref ks) = it.kind {
-                            if it.index < ks.len() {
-                                let k = ks[it.index].clone();
-                                it.index += 1;
-                                Some(k)
+                let mut chosen = None;
+                loop {
+                    let next_item = match &mut self.heap.get_obj_mut(iter_id).kind {
+                        ObjectKind::Iterator(it) => {
+                            if let BuiltinIteratorKind::Keys {
+                                target,
+                                keys: ref ks,
+                            } = it.kind
+                            {
+                                if it.index < ks.len() {
+                                    let k = ks[it.index].clone();
+                                    it.index += 1;
+                                    Some((target, k))
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
                             }
-                        } else {
-                            None
+                        }
+                        _ => None,
+                    };
+                    let Some((target, k)) = next_item else {
+                        break;
+                    };
+                    if let (Some(tid), JsValue::String(ref ks)) = (target, &k) {
+                        if !self.has_property(tid, &PropertyKey::String(ks.clone()))? {
+                            continue;
                         }
                     }
-                    _ => None,
-                };
-                if let Some(k) = next_key {
+                    chosen = Some(k);
+                    break;
+                }
+                if let Some(k) = chosen {
                     frame.stack.push(k);
                 } else {
                     frame.ip = done_target as usize;
@@ -2815,7 +3848,22 @@ impl JsRuntime {
             Op::GetIterator(is_async) => {
                 let val = frame.stack.pop().unwrap();
                 let iter = self.get_iterator(&val, is_async)?;
-                frame.stack.push(iter);
+                if !is_async {
+                    if let JsValue::Object(iter_oid) = iter {
+                        let next_method = self.get_property(iter_oid, "next")?;
+                        let rec = self.create_builtin_iterator(BuiltinIteratorKind::CachedIter(
+                            IterRecord {
+                                iterator: JsValue::Object(iter_oid),
+                                next_method,
+                            },
+                        ));
+                        frame.stack.push(JsValue::Object(rec));
+                    } else {
+                        frame.stack.push(iter);
+                    }
+                } else {
+                    frame.stack.push(iter);
+                }
             }
             Op::AsyncIteratorNextCall => {
                 let iter = frame.stack.last().cloned().unwrap();
@@ -2978,7 +4026,11 @@ impl JsRuntime {
             }
             Op::Await => {
                 let val = frame.stack.pop().unwrap_or(JsValue::Undefined);
-                return Ok(Some(FrameOutcome::Await(val)));
+                return Ok(Some(FrameOutcome::Await(val, false)));
+            }
+            Op::AwaitIterNext => {
+                let val = frame.stack.pop().unwrap_or(JsValue::Undefined);
+                return Ok(Some(FrameOutcome::Await(val, true)));
             }
             Op::CreateTemplateObject(idx) => {
                 let ConstValue::TemplateStrings {
@@ -3424,9 +4476,15 @@ impl JsRuntime {
                 computed_count += 1;
             }
         }
+        for si in &tmpl.static_inits {
+            if let StaticInitTemplate::Field(f) = si {
+                if f.is_computed {
+                    computed_count += 1;
+                }
+            }
+        }
         let comp_start = frame.stack.len() - computed_count;
         let computed_vals: Vec<JsValue> = frame.stack.drain(comp_start..).collect();
-        let mut comp_iter = computed_vals.into_iter();
 
         let super_class = if tmpl.has_super {
             let sv = frame.stack.pop().unwrap();
@@ -3468,13 +4526,16 @@ impl JsRuntime {
             .alloc_env(EnvRecord::new(Some(frame.env), false, true));
 
         let mut instance_fields = Vec::new();
-        let mut static_fields = Vec::new();
+        enum ResolvedStaticInit {
+            Field(ClassFieldInit),
+            Block(Rc<Chunk>),
+        }
+        let mut static_inits = Vec::new();
 
         let mut method_keys = Vec::with_capacity(tmpl.methods.len());
         for m in &tmpl.methods {
-            let key = if m.is_computed {
-                let kv = comp_iter.next().unwrap();
-                self.to_property_key(&kv)?
+            let key = if let Some(cidx) = m.computed_idx {
+                self.to_property_key(&computed_vals[cidx])?
             } else {
                 PropertyKey::String(m.name.clone().unwrap_or_default())
             };
@@ -3484,30 +4545,49 @@ impl JsRuntime {
         for f in &tmpl.fields {
             let spec = if f.is_private {
                 FieldKeySpec::Private(f.name.clone().unwrap_or_default())
-            } else if f.is_computed {
-                let kv = comp_iter.next().unwrap();
-                let pk = self.to_property_key(&kv)?;
+            } else if let Some(cidx) = f.computed_idx {
+                let pk = self.to_property_key(&computed_vals[cidx])?;
                 let box_obj = self.create_object();
                 let _ = self.set_property(box_obj, "k", pk.to_value());
                 FieldKeySpec::Computed(box_obj)
             } else {
                 FieldKeySpec::Name(f.name.clone().unwrap_or_default())
             };
-            let fi = ClassFieldInit {
+            instance_fields.push(ClassFieldInit {
                 key: spec,
                 init_chunk: f.init.clone(),
                 is_private: f.is_private,
-            };
-            if f.is_static {
-                static_fields.push(fi);
-            } else {
-                instance_fields.push(fi);
+            });
+        }
+
+        for si in &tmpl.static_inits {
+            match si {
+                StaticInitTemplate::Field(f) => {
+                    let spec = if f.is_private {
+                        FieldKeySpec::Private(f.name.clone().unwrap_or_default())
+                    } else if let Some(cidx) = f.computed_idx {
+                        let pk = self.to_property_key(&computed_vals[cidx])?;
+                        let box_obj = self.create_object();
+                        let _ = self.set_property(box_obj, "k", pk.to_value());
+                        FieldKeySpec::Computed(box_obj)
+                    } else {
+                        FieldKeySpec::Name(f.name.clone().unwrap_or_default())
+                    };
+                    static_inits.push(ResolvedStaticInit::Field(ClassFieldInit {
+                        key: spec,
+                        init_chunk: f.init.clone(),
+                        is_private: f.is_private,
+                    }));
+                }
+                StaticInitTemplate::Block(b) => {
+                    static_inits.push(ResolvedStaticInit::Block(b.clone()));
+                }
             }
         }
 
         let ctor_tmpl = if let Some(ref ct) = tmpl.constructor {
             ct.clone()
-        } else if super_class.is_some() {
+        } else if tmpl.has_super {
             let mut c = Chunk::new(true, false);
             let args_idx = c.add_string("arguments".into());
             c.emit(Op::GetVar(args_idx));
@@ -3515,6 +4595,7 @@ impl JsRuntime {
             c.emit(Op::Return);
             Rc::new(FuncTemplate {
                 name: tmpl.name.clone(),
+                has_self_name: false,
                 chunk: Rc::new(c),
                 params: Rc::new(Vec::new()),
                 is_async: false,
@@ -3527,10 +4608,12 @@ impl JsRuntime {
             })
         } else {
             let mut c = Chunk::new(true, false);
+            c.needs_arguments = false;
             c.emit(Op::PushUndefined);
             c.emit(Op::Return);
             Rc::new(FuncTemplate {
                 name: tmpl.name.clone(),
+                has_self_name: false,
                 chunk: Rc::new(c),
                 params: Rc::new(Vec::new()),
                 is_async: false,
@@ -3548,7 +4631,7 @@ impl JsRuntime {
         self.heap.get_obj_mut(ctor_id).prototype = Some(ctor_proto);
         if let ObjectKind::Function(ref mut f) = self.heap.get_obj_mut(ctor_id).kind {
             f.is_class_ctor = true;
-            f.is_derived_ctor = super_class.is_some();
+            f.is_derived_ctor = tmpl.has_super;
             f.super_ctor = super_class;
             f.home_object = Some(proto);
             f.class_brand = Some(brand);
@@ -3556,12 +4639,19 @@ impl JsRuntime {
             if let Some(ref n) = tmpl.name {
                 f.name = n.clone();
             }
+            if !tmpl.source.is_empty() {
+                f.source = tmpl.source.clone();
+            }
         }
         if let Some(ref n) = tmpl.name {
             self.heap.get_obj_mut(ctor_id).set_own_prop(
                 PropertyKey::from("name"),
                 PropEntry::data(JsValue::String(n.clone()), false, false, true),
             );
+            if let Some(b) = self.heap.get_env_mut(frame.env).bindings.get_mut(n) {
+                b.value = JsValue::Object(ctor_id);
+                b.initialized = true;
+            }
             self.heap.get_env_mut(class_env).bindings.insert(
                 n.clone(),
                 Binding {
@@ -3585,11 +4675,21 @@ impl JsRuntime {
         for f in &tmpl.fields {
             if f.is_private {
                 let pname = f.name.clone().unwrap_or_default();
-                let holder = if f.is_static { Some(ctor_id) } else { None };
                 self.heap
                     .get_env_mut(class_env)
                     .private_bindings
-                    .insert(pname, (brand, f.is_static, holder));
+                    .insert(pname, (brand, false, None));
+            }
+        }
+        for si in &tmpl.static_inits {
+            if let StaticInitTemplate::Field(f) = si {
+                if f.is_private {
+                    let pname = f.name.clone().unwrap_or_default();
+                    self.heap
+                        .get_env_mut(class_env)
+                        .private_bindings
+                        .insert(pname, (brand, true, Some(ctor_id)));
+                }
             }
         }
 
@@ -3717,62 +4817,70 @@ impl JsRuntime {
             }
         }
 
-        for sf in static_fields {
-            let val = if let Some(ref chunk) = sf.init_chunk {
-                let mut fenv = EnvRecord::new(Some(class_env), true, true);
-                fenv.this_binding = Some(JsValue::Object(ctor_id));
-                fenv.new_target = Some(JsValue::Undefined);
-                fenv.home_object = Some(ctor_id);
-                fenv.allow_super_prop = true;
-                fenv.allow_new_target = true;
-                fenv.allow_private = true;
-                fenv.forbid_arguments = true;
-                let eid = self.heap.alloc_env(fenv);
-                self.exec_script_chunk(chunk.clone(), eid, true)?
-            } else {
-                JsValue::Undefined
-            };
-            match sf.key {
-                FieldKeySpec::Name(name) => {
-                    if !self.define_property(
-                        ctor_id,
-                        PropertyKey::String(name),
-                        PropertyDescriptor::data(val, true, true, true),
-                    )? {
-                        return Err(JsError::type_err("Cannot define static class field"));
+        for si in static_inits {
+            match si {
+                ResolvedStaticInit::Field(sf) => {
+                    let val = if let Some(ref chunk) = sf.init_chunk {
+                        let mut fenv = EnvRecord::new(Some(class_env), true, true);
+                        fenv.this_binding = Some(JsValue::Object(ctor_id));
+                        fenv.new_target = Some(JsValue::Undefined);
+                        fenv.home_object = Some(ctor_id);
+                        fenv.allow_super_prop = true;
+                        fenv.allow_new_target = true;
+                        fenv.allow_private = true;
+                        fenv.forbid_arguments = true;
+                        let eid = self.heap.alloc_env(fenv);
+                        self.exec_script_chunk(chunk.clone(), eid, true)?
+                    } else {
+                        JsValue::Undefined
+                    };
+                    match sf.key {
+                        FieldKeySpec::Name(name) => {
+                            if !self.define_property(
+                                ctor_id,
+                                PropertyKey::String(name),
+                                PropertyDescriptor::data(val, true, true, true),
+                            )? {
+                                return Err(JsError::type_err("Cannot define static class field"));
+                            }
+                        }
+                        FieldKeySpec::Computed(key_box) => {
+                            let kv = self.get_property(key_box, "k")?;
+                            let pk = self.to_property_key(&kv)?;
+                            if !self.define_property(
+                                ctor_id,
+                                pk,
+                                PropertyDescriptor::data(val, true, true, true),
+                            )? {
+                                return Err(JsError::type_err("Cannot define static class field"));
+                            }
+                        }
+                        FieldKeySpec::Private(name) => {
+                            if !self.heap.get_obj(ctor_id).extensible {
+                                return Err(JsError::type_err(
+                                    "Cannot define static private field on non-extensible object",
+                                ));
+                            }
+                            self.heap
+                                .get_obj_mut(ctor_id)
+                                .private_fields
+                                .insert((brand, name), PropEntry::data(val, true, false, false));
+                        }
                     }
                 }
-                FieldKeySpec::Computed(key_box) => {
-                    let kv = self.get_property(key_box, "k")?;
-                    let pk = self.to_property_key(&kv)?;
-                    if !self.define_property(
-                        ctor_id,
-                        pk,
-                        PropertyDescriptor::data(val, true, true, true),
-                    )? {
-                        return Err(JsError::type_err("Cannot define static class field"));
-                    }
-                }
-                FieldKeySpec::Private(name) => {
-                    self.heap
-                        .get_obj_mut(ctor_id)
-                        .private_fields
-                        .insert((brand, name), PropEntry::data(val, true, false, false));
+                ResolvedStaticInit::Block(sb) => {
+                    let mut senv = EnvRecord::new(Some(class_env), true, true);
+                    senv.this_binding = Some(JsValue::Object(ctor_id));
+                    senv.new_target = Some(JsValue::Undefined);
+                    senv.home_object = Some(ctor_id);
+                    senv.allow_super_prop = true;
+                    senv.allow_new_target = true;
+                    senv.allow_private = true;
+                    senv.forbid_arguments = true;
+                    let eid = self.heap.alloc_env(senv);
+                    self.exec_script_chunk(sb, eid, true)?;
                 }
             }
-        }
-
-        for sb in &tmpl.static_blocks {
-            let mut senv = EnvRecord::new(Some(class_env), true, true);
-            senv.this_binding = Some(JsValue::Object(ctor_id));
-            senv.new_target = Some(JsValue::Undefined);
-            senv.home_object = Some(ctor_id);
-            senv.allow_super_prop = true;
-            senv.allow_new_target = true;
-            senv.allow_private = true;
-            senv.forbid_arguments = true;
-            let eid = self.heap.alloc_env(senv);
-            self.exec_script_chunk(sb.clone(), eid, true)?;
         }
 
         Ok(ctor_id)
@@ -4012,7 +5120,16 @@ impl JsRuntime {
                 Ok(())
             }
             _ => {
-                if strict {
+                let proto = match val {
+                    JsValue::Number(_) => self.intrinsics.number_proto,
+                    JsValue::String(_) => self.intrinsics.string_proto,
+                    JsValue::Boolean(_) => self.intrinsics.boolean_proto,
+                    JsValue::Symbol(_) => self.intrinsics.symbol_proto,
+                    JsValue::BigInt(_) => self.intrinsics.bigint_proto,
+                    _ => unreachable!(),
+                };
+                let ok = self.set_property_key_receiver(proto, key.clone(), new_val, val.clone())?;
+                if !ok && strict {
                     Err(JsError::type_err(format!(
                         "Cannot create property '{}' on primitive",
                         key
@@ -4086,7 +5203,25 @@ impl JsRuntime {
         }
     }
 
-    pub fn get_var(&mut self, mut env: EnvId, name: &str) -> Result<JsValue, JsError> {
+    pub fn get_var(&mut self, env: EnvId, name: &str) -> Result<JsValue, JsError> {
+        self.get_var_strict(env, name, false)
+    }
+
+    pub fn get_var_strict(
+        &mut self,
+        env: EnvId,
+        name: &str,
+        strict: bool,
+    ) -> Result<JsValue, JsError> {
+        self.get_var_with_this(env, name, strict).map(|(v, _)| v)
+    }
+
+    pub fn get_var_with_this(
+        &mut self,
+        mut env: EnvId,
+        name: &str,
+        strict: bool,
+    ) -> Result<(JsValue, JsValue), JsError> {
         loop {
             let (binding, import_ref, obj_env, parent) = {
                 let rec = self.heap.get_env(env);
@@ -4098,7 +5233,7 @@ impl JsRuntime {
                 )
             };
             if let Some((ns, exp_name)) = import_ref {
-                return self.get_module_export_value(ns, &exp_name);
+                return Ok((self.get_module_export_value(ns, &exp_name)?, JsValue::Undefined));
             }
             if let Some(b) = binding {
                 if !b.initialized {
@@ -4107,12 +5242,13 @@ impl JsRuntime {
                         name
                     )));
                 }
-                return Ok(b.value);
+                return Ok((b.value, JsValue::Undefined));
             }
             if let Some(oid) = obj_env {
                 let key = PropertyKey::String(name.to_string());
                 if self.has_property(oid, &key)? {
-                    if parent.is_some() {
+                    let is_with = parent.is_some();
+                    if is_with {
                         let unscop = PropertyKey::Symbol(self.symbols.unscopables);
                         let u = self.get_property_key(oid, &unscop)?;
                         if let JsValue::Object(uid) = u {
@@ -4123,8 +5259,20 @@ impl JsRuntime {
                                 }
                             }
                         }
+                        if !self.has_property(oid, &key)? {
+                            if strict {
+                                return Err(JsError::reference(format!("{} is not defined", name)));
+                            }
+                            return Ok((JsValue::Undefined, JsValue::Object(oid)));
+                        }
                     }
-                    return self.get_property(oid, name);
+                    let val = self.get_property(oid, name)?;
+                    let this_val = if is_with {
+                        JsValue::Object(oid)
+                    } else {
+                        JsValue::Undefined
+                    };
+                    return Ok((val, this_val));
                 }
             }
             let Some(p) = parent else {
@@ -4340,12 +5488,13 @@ impl JsRuntime {
             )?;
             return Ok(());
         };
-        let (has_binding, has_import, obj_env) = {
+        let (has_binding, has_import, obj_env, is_with) = {
             let rec = self.heap.get_env(env);
             (
                 rec.bindings.contains_key(name),
                 rec.import_bindings.contains_key(name),
                 rec.object_env,
+                rec.object_env.is_some() && rec.parent.is_some(),
             )
         };
         if has_import {
@@ -4376,8 +5525,10 @@ impl JsRuntime {
         }
         if let Some(oid) = obj_env {
             let key = PropertyKey::String(name.to_string());
-            if strict && !self.has_property(oid, &key)? {
-                return Err(JsError::reference(format!("{} is not defined", name)));
+            if is_with || strict {
+                if !self.has_property(oid, &key)? && strict {
+                    return Err(JsError::reference(format!("{} is not defined", name)));
+                }
             }
             self.set_property_key_strict(oid, key, val, strict)?;
             return Ok(());
@@ -4398,13 +5549,13 @@ impl JsRuntime {
         match op {
             UnaryOp::Plus => Ok(JsValue::Number(self.to_number(&val)?)),
             UnaryOp::Minus => match self.to_numeric(&val)? {
-                JsValue::BigInt(n) => Ok(JsValue::BigInt(n.wrapping_neg())),
+                JsValue::BigInt(n) => Ok(JsValue::BigInt(n.neg())),
                 JsValue::Number(n) => Ok(JsValue::Number(-n)),
                 _ => unreachable!(),
             },
             UnaryOp::Not => Ok(JsValue::Boolean(!val.to_boolean())),
             UnaryOp::BitNot => match self.to_numeric(&val)? {
-                JsValue::BigInt(n) => Ok(JsValue::BigInt(!n)),
+                JsValue::BigInt(n) => Ok(JsValue::BigInt(n.bitnot())),
                 JsValue::Number(n) => Ok(JsValue::Number((!to_int32(n)) as f64)),
                 _ => unreachable!(),
             },
@@ -4430,7 +5581,7 @@ impl JsRuntime {
                     return Ok(JsValue::String(format!("{}{}", ls, rs)));
                 }
                 if let (JsValue::BigInt(a), JsValue::BigInt(b)) = (&l, &r) {
-                    return Ok(JsValue::BigInt(a.wrapping_add(*b)));
+                    return Ok(JsValue::BigInt(a.add(b)));
                 }
                 if matches!(l, JsValue::BigInt(_)) || matches!(r, JsValue::BigInt(_)) {
                     return Err(JsError::type_err(
@@ -4441,31 +5592,19 @@ impl JsRuntime {
                 let b = self.to_number(&r)?;
                 Ok(JsValue::Number(a + b))
             }
-            BinaryOp::Sub => self.numeric_binop(left, right, |a, b| a - b, |a, b| Ok(a.wrapping_sub(b))),
-            BinaryOp::Mul => self.numeric_binop(left, right, |a, b| a * b, |a, b| Ok(a.wrapping_mul(b))),
+            BinaryOp::Sub => self.numeric_binop(left, right, |a, b| a - b, |a, b| Ok(a.sub(&b))),
+            BinaryOp::Mul => self.numeric_binop(left, right, |a, b| a * b, |a, b| Ok(a.mul(&b))),
             BinaryOp::Div => self.numeric_binop(
                 left,
                 right,
                 |a, b| a / b,
-                |a, b| {
-                    if b == 0 {
-                        Err(JsError::range("Division by zero"))
-                    } else {
-                        Ok(a.wrapping_div(b))
-                    }
-                },
+                |a, b| a.div_rem(&b).map(|(q, _)| q),
             ),
             BinaryOp::Rem => self.numeric_binop(
                 left,
                 right,
                 |a, b| a % b,
-                |a, b| {
-                    if b == 0 {
-                        Err(JsError::range("Division by zero"))
-                    } else {
-                        Ok(a.wrapping_rem(b))
-                    }
-                },
+                |a, b| a.div_rem(&b).map(|(_, r)| r),
             ),
             BinaryOp::Exp => self.numeric_binop(
                 left,
@@ -4481,25 +5620,19 @@ impl JsRuntime {
                         a.powf(b)
                     }
                 },
-                |a, b| {
-                    if b < 0 {
-                        Err(JsError::range("Exponent must be positive"))
-                    } else {
-                        Ok(a.wrapping_pow(b as u32))
-                    }
-                },
+                |a, b| a.pow(&b),
             ),
-            BinaryOp::Shl => self.bitwise_binop(
+            BinaryOp::Shl => self.bitwise_binop_res(
                 left,
                 right,
                 |a, b| (a.wrapping_shl((b as u32) & 0x1f)) as f64,
-                |a, b| a.wrapping_shl(b as u32),
+                |a, b| a.shl(&b),
             ),
-            BinaryOp::Shr => self.bitwise_binop(
+            BinaryOp::Shr => self.bitwise_binop_res(
                 left,
                 right,
                 |a, b| (a.wrapping_shr((b as u32) & 0x1f)) as f64,
-                |a, b| a.wrapping_shr(b as u32),
+                |a, b| a.shr(&b),
             ),
             BinaryOp::UShr => {
                 let ln = self.to_numeric(&left)?;
@@ -4515,13 +5648,13 @@ impl JsRuntime {
                 Ok(JsValue::Number((a >> b) as f64))
             }
             BinaryOp::BitAnd => {
-                self.bitwise_binop(left, right, |a, b| (a & b) as f64, |a, b| a & b)
+                self.bitwise_binop(left, right, |a, b| (a & b) as f64, |a, b| a.bitand(&b))
             }
             BinaryOp::BitOr => {
-                self.bitwise_binop(left, right, |a, b| (a | b) as f64, |a, b| a | b)
+                self.bitwise_binop(left, right, |a, b| (a | b) as f64, |a, b| a.bitor(&b))
             }
             BinaryOp::BitXor => {
-                self.bitwise_binop(left, right, |a, b| (a ^ b) as f64, |a, b| a ^ b)
+                self.bitwise_binop(left, right, |a, b| (a ^ b) as f64, |a, b| a.bitxor(&b))
             }
             BinaryOp::Eq => Ok(JsValue::Boolean(self.abstract_eq(&left, &right)?)),
             BinaryOp::Neq => Ok(JsValue::Boolean(!self.abstract_eq(&left, &right)?)),
@@ -4565,7 +5698,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError>
     where
         F: Fn(f64, f64) -> f64,
-        B: Fn(i128, i128) -> Result<i128, JsError>,
+        B: Fn(crate::bigint::JsBigInt, crate::bigint::JsBigInt) -> Result<crate::bigint::JsBigInt, JsError>,
     {
         let lp = self.to_numeric(&left)?;
         let rp = self.to_numeric(&right)?;
@@ -4585,12 +5718,34 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError>
     where
         F: Fn(i32, i32) -> f64,
-        B: Fn(i128, i128) -> i128,
+        B: Fn(crate::bigint::JsBigInt, crate::bigint::JsBigInt) -> crate::bigint::JsBigInt,
     {
         let lp = self.to_numeric(&left)?;
         let rp = self.to_numeric(&right)?;
         match (lp, rp) {
             (JsValue::BigInt(a), JsValue::BigInt(b)) => Ok(JsValue::BigInt(bop(a, b))),
+            (JsValue::Number(a), JsValue::Number(b)) => {
+                Ok(JsValue::Number(iop(to_int32(a), to_int32(b))))
+            }
+            _ => Err(JsError::type_err("Cannot mix BigInt and other types")),
+        }
+    }
+
+    fn bitwise_binop_res<F, B>(
+        &mut self,
+        left: JsValue,
+        right: JsValue,
+        iop: F,
+        bop: B,
+    ) -> Result<JsValue, JsError>
+    where
+        F: Fn(i32, i32) -> f64,
+        B: Fn(crate::bigint::JsBigInt, crate::bigint::JsBigInt) -> Result<crate::bigint::JsBigInt, JsError>,
+    {
+        let lp = self.to_numeric(&left)?;
+        let rp = self.to_numeric(&right)?;
+        match (lp, rp) {
+            (JsValue::BigInt(a), JsValue::BigInt(b)) => Ok(JsValue::BigInt(bop(a, b)?)),
             (JsValue::Number(a), JsValue::Number(b)) => {
                 Ok(JsValue::Number(iop(to_int32(a), to_int32(b))))
             }

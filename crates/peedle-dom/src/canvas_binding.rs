@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use peedle_css::{parse_color, Color};
 use peedle_html::NodeId;
 use peedle_js::{JsRuntime, JsValue, ObjectId};
-use peedle_render::{Canvas2D, FontSystem, RgbaColor};
+use peedle_render::{Canvas2D, CanvasTextAlign, CanvasTextBaseline, FontSystem, RgbaColor};
 
 use crate::events::define_getter_setter;
 use crate::state::{Canvas2DHandle, SharedDom};
@@ -217,6 +217,82 @@ pub fn define_canvas2d_proto(rt: &mut JsRuntime, dom: SharedDom, proto: ObjectId
         }),
     );
     define_getter_setter(rt, proto, "font", Some(get_font), Some(set_font));
+
+    let d = dom.clone();
+    let set_ta = rt.create_native_function(
+        "set textAlign",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = this.as_object().and_then(|o| rt.get_host_data::<Canvas2DHandle>(o)).map(|h| h.0) else {
+                return Ok(JsValue::Undefined);
+            };
+            let s = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            if let Some(cv) = d.borrow_mut().canvases.get_mut(&nid) {
+                cv.state.text_align = match s.as_str() {
+                    "center" => CanvasTextAlign::Center,
+                    "right" | "end" => CanvasTextAlign::Right,
+                    _ => CanvasTextAlign::Left,
+                };
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let d_tag = dom.clone();
+    let get_ta = rt.create_native_function(
+        "get textAlign",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = this.as_object().and_then(|o| rt.get_host_data::<Canvas2DHandle>(o)).map(|h| h.0) else {
+                return Ok(JsValue::String("start".into()));
+            };
+            let s = d_tag.borrow().canvases.get(&nid).map_or("start", |cv| match cv.state.text_align {
+                CanvasTextAlign::Left => "start",
+                CanvasTextAlign::Center => "center",
+                CanvasTextAlign::Right => "right",
+            });
+            Ok(JsValue::String(s.into()))
+        }),
+    );
+    define_getter_setter(rt, proto, "textAlign", Some(get_ta), Some(set_ta));
+
+    let d = dom.clone();
+    let set_tb = rt.create_native_function(
+        "set textBaseline",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = this.as_object().and_then(|o| rt.get_host_data::<Canvas2DHandle>(o)).map(|h| h.0) else {
+                return Ok(JsValue::Undefined);
+            };
+            let s = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            if let Some(cv) = d.borrow_mut().canvases.get_mut(&nid) {
+                cv.state.text_baseline = match s.as_str() {
+                    "top" | "hanging" => CanvasTextBaseline::Top,
+                    "middle" => CanvasTextBaseline::Middle,
+                    "bottom" | "ideographic" => CanvasTextBaseline::Bottom,
+                    _ => CanvasTextBaseline::Alphabetic,
+                };
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let d_tbg = dom.clone();
+    let get_tb = rt.create_native_function(
+        "get textBaseline",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = this.as_object().and_then(|o| rt.get_host_data::<Canvas2DHandle>(o)).map(|h| h.0) else {
+                return Ok(JsValue::String("alphabetic".into()));
+            };
+            let s = d_tbg.borrow().canvases.get(&nid).map_or("alphabetic", |cv| match cv.state.text_baseline {
+                CanvasTextBaseline::Alphabetic => "alphabetic",
+                CanvasTextBaseline::Top => "top",
+                CanvasTextBaseline::Middle => "middle",
+                CanvasTextBaseline::Bottom => "bottom",
+            });
+            Ok(JsValue::String(s.into()))
+        }),
+    );
+    define_getter_setter(rt, proto, "textBaseline", Some(get_tb), Some(set_tb));
 
     macro_rules! cv_method {
         ($name:expr, $arity:expr, $body:expr) => {{

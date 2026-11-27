@@ -1,4 +1,5 @@
 use crate::ast::{BinaryOp, Param, UnaryOp};
+use crate::bigint::JsBigInt;
 use crate::error::JsError;
 use crate::value::{EnvId, JsValue, ObjectId};
 use std::rc::Rc;
@@ -6,6 +7,7 @@ use std::rc::Rc;
 #[derive(Debug, Clone)]
 pub struct FuncTemplate {
     pub name: Option<String>,
+    pub has_self_name: bool,
     pub chunk: Rc<Chunk>,
     pub params: Rc<Vec<Param>>,
     pub is_async: bool,
@@ -21,6 +23,7 @@ pub struct FuncTemplate {
 pub struct ClassFieldTemplate {
     pub name: Option<String>,
     pub is_computed: bool,
+    pub computed_idx: Option<usize>,
     pub is_static: bool,
     pub is_private: bool,
     pub init: Option<Rc<Chunk>>,
@@ -30,10 +33,17 @@ pub struct ClassFieldTemplate {
 pub struct ClassMethodTemplate {
     pub name: Option<String>,
     pub is_computed: bool,
+    pub computed_idx: Option<usize>,
     pub is_static: bool,
     pub is_private: bool,
     pub kind: crate::ast::MethodKind,
     pub func: Rc<FuncTemplate>,
+}
+
+#[derive(Debug, Clone)]
+pub enum StaticInitTemplate {
+    Field(ClassFieldTemplate),
+    Block(Rc<Chunk>),
 }
 
 #[derive(Debug, Clone)]
@@ -43,13 +53,14 @@ pub struct ClassTemplate {
     pub constructor: Option<Rc<FuncTemplate>>,
     pub methods: Vec<ClassMethodTemplate>,
     pub fields: Vec<ClassFieldTemplate>,
-    pub static_blocks: Vec<Rc<Chunk>>,
+    pub static_inits: Vec<StaticInitTemplate>,
+    pub source: String,
 }
 
 #[derive(Debug, Clone)]
 pub enum ConstValue {
     Number(f64),
-    BigInt(i128),
+    BigInt(JsBigInt),
     String(String),
     RegExp(String, String),
     Func(Rc<FuncTemplate>),
@@ -72,6 +83,7 @@ pub enum Op {
     Pop,
     Dup,
     Dup2,
+    DupAt(u8),
     Swap,
     Rot3,
 
@@ -89,6 +101,7 @@ pub enum Op {
     DeclareConst(u32),
     InitBinding(u32),
     GetVar(u32),
+    GetVarWithThis(u32),
     GetVarTypeof(u32),
     SetVar(u32),
     DeleteVar(u32),
@@ -107,6 +120,9 @@ pub enum Op {
     SetSuperProp(u32),
     GetSuperElem,
     SetSuperElem,
+    PushSuperBase,
+    GetSuperElemWithBase,
+    SetSuperElemWithBase,
     CallSuper(u32),
     CallSuperSpread,
 
@@ -151,6 +167,12 @@ pub enum Op {
     CallMethodSpread,
     CallDirectEval(u32),
     CallDirectEvalSpread,
+    TailCall(u32),
+    TailCallMethod(u32),
+    TailCallSpread,
+    TailCallMethodSpread,
+    TailCallDirectEval(u32),
+    TailCallDirectEvalSpread,
     New(u32),
     NewSpread,
 
@@ -183,6 +205,7 @@ pub enum Op {
     Yield,
     YieldDelegate,
     Await,
+    AwaitIterNext,
 
     CreateTemplateObject(u32),
     DynamicImport {
@@ -228,6 +251,7 @@ pub struct Chunk {
     pub lex_names: Vec<(String, bool)>,
     pub strict: bool,
     pub is_eval_or_script: bool,
+    pub needs_arguments: bool,
 }
 
 impl Chunk {
@@ -240,6 +264,7 @@ impl Chunk {
             lex_names: Vec::new(),
             strict,
             is_eval_or_script,
+            needs_arguments: true,
         }
     }
 

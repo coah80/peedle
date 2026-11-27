@@ -13,6 +13,7 @@ pub struct Parser<'a> {
     in_generator: bool,
     in_function: bool,
     in_class: bool,
+    last_expr_was_paren: bool,
 }
 
 #[derive(Clone, Default)]
@@ -64,6 +65,7 @@ impl<'a> Parser<'a> {
             in_generator: false,
             in_function: false,
             in_class: false,
+            last_expr_was_paren: false,
         };
         let mut body = Vec::new();
         let mut checking_directives = true;
@@ -921,6 +923,8 @@ impl<'a> Parser<'a> {
             return self.parse_for_rest(Some(ForInit::VarDecl { kind, decls }));
         }
 
+        let for_expr_starts_unescaped_async =
+            matches!(&self.cur.kind, TokenKind::Ident(s, false) if s == "async");
         let expr = self.parse_expr(false)?;
         if self.cur.kind == TokenKind::KwIn {
             if is_await {
@@ -938,6 +942,14 @@ impl<'a> Parser<'a> {
             });
         }
         if self.is_ident_word("of") {
+            if !is_await
+                && for_expr_starts_unescaped_async
+                && matches!(&expr, Expr::Ident(s) if s == "async")
+            {
+                return Err(JsError::syntax(
+                    "The left-hand side of a for-of loop may not be 'async'",
+                ));
+            }
             self.advance(true)?;
             let left_pat = expr_to_pattern(expr)?;
             let right = self.parse_assign_expr(true)?;
@@ -1183,17 +1195,23 @@ impl<'a> Parser<'a> {
         };
         self.expect(&TokenKind::KwFunction, true)?;
         let is_generator = self.eat(&TokenKind::Star, true)?;
-        let name = if self.cur.kind != TokenKind::LParen {
-            Some(self.parse_binding_ident()?)
-        } else if require_name {
-            return Err(JsError::syntax("Function declaration requires a name"));
-        } else {
-            None
-        };
         let prev_async = self.in_async;
         let prev_gen = self.in_generator;
         let prev_fn = self.in_function;
         let prev_strict = self.strict;
+        if !is_decl {
+            self.in_async = is_async;
+            self.in_generator = is_generator;
+        }
+        let name = if self.cur.kind != TokenKind::LParen {
+            Some(self.parse_binding_ident()?)
+        } else if require_name {
+            self.in_async = prev_async;
+            self.in_generator = prev_gen;
+            return Err(JsError::syntax("Function declaration requires a name"));
+        } else {
+            None
+        };
         self.in_async = is_async;
         self.in_generator = is_generator;
         self.in_function = true;
@@ -1302,6 +1320,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_class(&mut self, require_name: bool) -> Result<Rc<ClassNode>, JsError> {
+        let start = self.cur.start;
         self.expect(&TokenKind::KwClass, true)?;
         let prev_strict = self.strict;
         let prev_class = self.in_class;
@@ -1333,6 +1352,7 @@ impl<'a> Parser<'a> {
             elements.push(self.parse_class_element()?);
         }
         self.expect(&TokenKind::RBrace, true)?;
+        let end = self.last_token_end.min(self.lexer.source().len());
 
         self.strict = prev_strict;
         self.in_class = prev_class;
@@ -1341,6 +1361,7 @@ impl<'a> Parser<'a> {
             name,
             super_class,
             elements,
+            source: self.lexer.source()[start..end].trim().to_string(),
         }))
     }
 
@@ -1390,7 +1411,11 @@ impl<'a> Parser<'a> {
             let next = self.peek_next(true)?;
             if !matches!(
                 next.kind,
-                TokenKind::LParen | TokenKind::Eq | TokenKind::Semi | TokenKind::RBrace
+                TokenKind::LParen
+                    | TokenKind::Eq
+                    | TokenKind::Semi
+                    | TokenKind::RBrace
+                    | TokenKind::Star
             ) {
                 self.advance(true)?;
                 kind = if is_get {
@@ -1620,10 +1645,18 @@ impl<'a> Parser<'a> {
         }
 
         let left = self.parse_conditional_expr(allow_in)?;
+        let left_paren = self.last_expr_was_paren;
         if let Some(op) = token_to_assign_op(&self.cur.kind) {
             self.advance(true)?;
-            let target = expr_to_assign_target(left, op == AssignOp::Assign)?;
+            if left_paren && matches!(left, Expr::Object(_) | Expr::Array(_)) {
+                return Err(JsError::syntax("Invalid destructuring assignment target"));
+            }
+            let target = match expr_to_assign_target(left, op == AssignOp::Assign)? {
+                AssignTarget::Ident(n) if left_paren => AssignTarget::ParenIdent(n),
+                other => other,
+            };
             let right = self.parse_assign_expr(allow_in)?;
+            self.last_expr_was_paren = false;
             return Ok(Expr::Assign {
                 op,
                 left: target,
@@ -1684,18 +1717,32 @@ impl<'a> Parser<'a> {
         if is_async_arrow {
             let start = self.cur.start;
             self.advance(true)?;
-            let params = if self.cur.kind == TokenKind::LParen {
+            let prev_async = self.in_async;
+            let prev_gen = self.in_generator;
+            self.in_async = true;
+            self.in_generator = false;
+            let params_res = if self.cur.kind == TokenKind::LParen {
                 self.advance(true)?;
-                let p = self.parse_param_list()?;
-                self.expect(&TokenKind::RParen, false)?;
+                let p = self.parse_param_list();
+                if p.is_ok() {
+                    if let Err(e) = self.expect(&TokenKind::RParen, false) {
+                        self.in_async = prev_async;
+                        self.in_generator = prev_gen;
+                        return Err(e);
+                    }
+                }
                 p
             } else {
-                let name = self.parse_binding_ident()?;
-                vec![Param {
-                    pattern: Pattern::Ident(name),
-                    rest: false,
-                }]
+                self.parse_binding_ident().map(|name| {
+                    vec![Param {
+                        pattern: Pattern::Ident(name),
+                        rest: false,
+                    }]
+                })
             };
+            self.in_async = prev_async;
+            self.in_generator = prev_gen;
+            let params = params_res?;
             return Ok(Some(self.parse_arrow_body(start, true, params, allow_in)?));
         }
 
@@ -1828,6 +1875,7 @@ impl<'a> Parser<'a> {
             let consequent = self.parse_assign_expr(true)?;
             self.expect(&TokenKind::Colon, true)?;
             let alternate = self.parse_assign_expr(allow_in)?;
+            self.last_expr_was_paren = false;
             return Ok(Expr::Conditional {
                 test: Box::new(test),
                 consequent: Box::new(consequent),
@@ -1848,16 +1896,21 @@ impl<'a> Parser<'a> {
                 | TokenKind::KwVoid
                 | TokenKind::KwDelete
         ) || (self.in_async && self.cur.kind == TokenKind::KwAwait);
-        let mut left = if let TokenKind::PrivateIdent(name) = self.cur.kind.clone() {
-            self.advance(false)?;
-            if !allow_in || self.cur.kind != TokenKind::KwIn {
-                return Err(JsError::syntax("Unexpected private identifier"));
-            }
-            self.advance(true)?;
-            let right = self.parse_binary_expr(8, allow_in)?;
-            Expr::PrivateIn {
-                name,
-                right: Box::new(right),
+        let mut left = if min_prec <= 8 {
+            if let TokenKind::PrivateIdent(name) = self.cur.kind.clone() {
+                self.advance(false)?;
+                if !allow_in || self.cur.kind != TokenKind::KwIn {
+                    return Err(JsError::syntax("Unexpected private identifier"));
+                }
+                self.advance(true)?;
+                let right = self.parse_binary_expr(9, allow_in)?;
+                self.last_expr_was_paren = false;
+                Expr::PrivateIn {
+                    name,
+                    right: Box::new(right),
+                }
+            } else {
+                self.parse_unary_expr()?
             }
         } else {
             self.parse_unary_expr()?
@@ -2059,6 +2112,7 @@ impl<'a> Parser<'a> {
         loop {
             match self.cur.kind {
                 TokenKind::Dot => {
+                    self.last_expr_was_paren = false;
                     self.advance(true)?;
                     let prop = if let TokenKind::PrivateIdent(name) = self.cur.kind.clone() {
                         self.advance(false)?;
@@ -2073,6 +2127,7 @@ impl<'a> Parser<'a> {
                     };
                 }
                 TokenKind::LBracket => {
+                    self.last_expr_was_paren = false;
                     self.advance(true)?;
                     let prop_expr = self.parse_expr(true)?;
                     self.expect(&TokenKind::RBracket, false)?;
@@ -2083,6 +2138,7 @@ impl<'a> Parser<'a> {
                     };
                 }
                 TokenKind::QuestionDot => {
+                    self.last_expr_was_paren = false;
                     is_optional_chain = true;
                     self.advance(true)?;
                     if self.cur.kind == TokenKind::LParen {
@@ -2118,6 +2174,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 TokenKind::LParen if allow_call => {
+                    self.last_expr_was_paren = false;
                     let args = self.parse_call_args()?;
                     expr = Expr::Call {
                         callee: Box::new(expr),
@@ -2126,6 +2183,7 @@ impl<'a> Parser<'a> {
                     };
                 }
                 TokenKind::NoSubTemplate { .. } | TokenKind::TemplateHead { .. } => {
+                    self.last_expr_was_paren = false;
                     if is_optional_chain {
                         return Err(JsError::syntax(
                             "Invalid tagged template on optional chain",
@@ -2194,13 +2252,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_new_expr(&mut self) -> Result<Expr, JsError> {
+        self.last_expr_was_paren = false;
         self.advance(true)?;
         if self.eat(&TokenKind::Dot, true)? {
-            let name = self.parse_ident_name_after_dot()?;
-            if name == "target" {
+            if matches!(&self.cur.kind, TokenKind::Ident(s, false) if s == "target") {
+                self.advance(false)?;
                 return Ok(Expr::NewTarget);
             }
-            return Err(JsError::syntax(format!("Unknown meta property new.{}", name)));
+            return Err(JsError::syntax("Unknown meta property on new"));
         }
         let callee = self.parse_lhs_expr(false)?;
         let args = if self.cur.kind == TokenKind::LParen {
@@ -2232,6 +2291,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary_expr(&mut self) -> Result<Expr, JsError> {
+        self.last_expr_was_paren = false;
         match self.cur.kind.clone() {
             TokenKind::KwNull => {
                 self.advance(false)?;
@@ -2310,6 +2370,7 @@ impl<'a> Parser<'a> {
                 self.advance(true)?;
                 let expr = self.parse_expr(true)?;
                 self.expect(&TokenKind::RParen, false)?;
+                self.last_expr_was_paren = true;
                 Ok(expr)
             }
             TokenKind::LBracket => self.parse_array_literal(),
@@ -2345,6 +2406,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&TokenKind::RBracket, false)?;
+        self.last_expr_was_paren = false;
         Ok(Expr::Array(elems))
     }
 
@@ -2415,6 +2477,8 @@ impl<'a> Parser<'a> {
                 };
                 let func = self.parse_method_func(method_start, is_async, is_generator, name)?;
                 props.push(ObjectProp::Method { key, kind, func });
+            } else if is_async || is_generator || method_kind.is_some() {
+                return Err(JsError::syntax("Expected '(' after method property name"));
             } else if self.eat(&TokenKind::Colon, true)? {
                 let value = self.parse_assign_expr(true)?;
                 props.push(ObjectProp::Property {
@@ -2461,6 +2525,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&TokenKind::RBrace, false)?;
+        self.last_expr_was_paren = false;
         Ok(Expr::Object(props))
     }
 
@@ -2778,7 +2843,7 @@ fn expr_to_pattern(expr: Expr) -> Result<Pattern, JsError> {
             right,
         } => {
             let left_pat = match left {
-                AssignTarget::Ident(n) => Pattern::Ident(n),
+                AssignTarget::Ident(n) | AssignTarget::ParenIdent(n) => Pattern::Ident(n),
                 AssignTarget::Member { object, property } => Pattern::Member(Box::new(
                     Expr::Member {
                         object,
@@ -3236,7 +3301,12 @@ fn validate_stmt(stmt: &Stmt, ctx: ValidationCtx<'_>) -> Result<(), JsError> {
             validate_expr(object, ctx)?;
             validate_stmt(body, ctx)
         }
-        Stmt::Labeled { body, .. } => validate_stmt(body, ctx),
+        Stmt::Labeled { label, body } => {
+            if ctx.in_static_block && label == "await" {
+                return Err(JsError::syntax("Cannot use 'await' as label in class static block"));
+            }
+            validate_stmt(body, ctx)
+        }
         Stmt::For {
             init,
             test,
@@ -3427,6 +3497,9 @@ fn validate_function(
     let fn_strict = outer_ctx.strict || func.strict;
     if let Some(ref n) = func.name {
         check_strict_binding_name(n, fn_strict)?;
+        if outer_ctx.in_static_block && func.is_decl && n == "await" {
+            return Err(JsError::syntax("Cannot use 'await' as function name in class static block"));
+        }
     }
     let has_simple_params = func
         .params
@@ -3459,9 +3532,8 @@ fn validate_function(
         } else {
             false
         },
-        forbid_yield_expr: func.is_generator || (func.is_arrow && outer_ctx.forbid_yield_expr),
-        forbid_await_expr: func.is_async
-            || (func.is_arrow && (outer_ctx.forbid_await_expr || outer_ctx.in_static_block)),
+        forbid_yield_expr: func.is_generator || func.is_arrow,
+        forbid_await_expr: func.is_async || func.is_arrow,
         forbid_arguments: if func.is_arrow {
             outer_ctx.forbid_arguments
         } else {
@@ -3531,6 +3603,9 @@ fn validate_function(
 fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx<'_>) -> Result<(), JsError> {
     if let Some(ref n) = cls.name {
         check_strict_binding_name(n, true)?;
+        if outer_ctx.in_static_block && n == "await" {
+            return Err(JsError::syntax("Cannot use 'await' as class name in class static block"));
+        }
     }
     if let Some(ref sup) = cls.super_class {
         validate_expr(sup, ValidationCtx { strict: true, ..outer_ctx })?;
@@ -3712,6 +3787,10 @@ fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx<'_>) -> Result<(), J
                     forbid_arguments: true,
                     privates: &merged_privates,
                 };
+                let mut active_labels = Vec::new();
+                for s in stmts {
+                    check_duplicate_labels(s, &mut active_labels)?;
+                }
                 validate_stmt_list(stmts, sb_ctx, true, None)?;
             }
         }
@@ -3955,7 +4034,7 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx<'_>) -> Result<(), JsError> {
         }
         Expr::Assign { left, right, .. } => {
             match left {
-                AssignTarget::Ident(n) => {
+                AssignTarget::Ident(n) | AssignTarget::ParenIdent(n) => {
                     check_strict_binding_name(n, ctx.strict)?;
                 }
                 AssignTarget::Member { object, property } => {

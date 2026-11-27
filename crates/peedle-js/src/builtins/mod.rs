@@ -13,6 +13,7 @@ pub mod object;
 pub mod promise;
 pub mod proxy;
 pub mod regexp;
+pub mod shadow_realm;
 pub mod string;
 pub mod typed_array;
 
@@ -87,6 +88,7 @@ pub fn init_builtins(rt: &mut JsRuntime) {
     date::init(rt);
     error::init(rt);
     disposable::init(rt);
+    shadow_realm::init(rt);
     json::init(rt);
     collections::init(rt);
     promise::init(rt);
@@ -289,7 +291,7 @@ fn init_iterators_and_generators(rt: &mut JsRuntime) {
                 return Ok(JsValue::Object(p));
             }
             let JsValue::Object(oid) = this else { unreachable!() };
-            rt.resume_generator(oid, 0, arg)
+            Ok(JsValue::Object(rt.enqueue_async_generator(oid, 0, arg)))
         }),
     );
     set_method(
@@ -309,7 +311,7 @@ fn init_iterators_and_generators(rt: &mut JsRuntime) {
                 return Ok(JsValue::Object(p));
             }
             let JsValue::Object(oid) = this else { unreachable!() };
-            rt.resume_generator(oid, 1, arg)
+            Ok(JsValue::Object(rt.enqueue_async_generator(oid, 1, arg)))
         }),
     );
     set_method(
@@ -329,7 +331,7 @@ fn init_iterators_and_generators(rt: &mut JsRuntime) {
                 return Ok(JsValue::Object(p));
             }
             let JsValue::Object(oid) = this else { unreachable!() };
-            rt.resume_generator(oid, 2, arg)
+            Ok(JsValue::Object(rt.enqueue_async_generator(oid, 2, arg)))
         }),
     );
 }
@@ -464,7 +466,7 @@ fn step_builtin_iterator(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, J
                 Ok(rt.create_iter_result(JsValue::Undefined, true))
             }
         }
-        BuiltinIteratorKind::Keys(ks) => {
+        BuiltinIteratorKind::Keys { keys: ks, .. } => {
             if idx >= ks.len() {
                 return Ok(rt.create_iter_result(JsValue::Undefined, true));
             }
@@ -473,10 +475,14 @@ fn step_builtin_iterator(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, J
             }
             Ok(rt.create_iter_result(ks[idx].clone(), false))
         }
+        BuiltinIteratorKind::CachedIter(_) => {
+            Ok(rt.create_iter_result(JsValue::Undefined, true))
+        }
         BuiltinIteratorKind::RegExpMatchAll {
             regexp,
             input,
             global,
+            full_unicode,
             done,
         } => {
             if done {
@@ -485,7 +491,7 @@ fn step_builtin_iterator(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, J
             let exec_fn = rt.get_property(regexp, "exec")?;
             let m = if rt.is_callable(&exec_fn) {
                 let res =
-                    rt.call_function(exec_fn, JsValue::Object(regexp), &[JsValue::String(input)])?;
+                    rt.call_function(exec_fn, JsValue::Object(regexp), &[JsValue::String(input.clone())])?;
                 if !res.is_null() && !res.is_object() {
                     return Err(JsError::type_err(
                         "RegExp exec method returned something other than an Object or null",
@@ -514,7 +520,22 @@ fn step_builtin_iterator(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, J
                 if rt.to_string(&s0)?.is_empty() {
                     let li = rt.get_property(regexp, "lastIndex")?;
                     let n = to_length(rt.to_number(&li)?);
-                    let _ = rt.set_property(regexp, "lastIndex", JsValue::Number((n + 1) as f64));
+                    let units: Vec<u16> = input.encode_utf16().collect();
+                    let next_idx = if full_unicode
+                        && n + 1 < units.len()
+                        && (0xD800..=0xDBFF).contains(&units[n])
+                        && (0xDC00..=0xDFFF).contains(&units[n + 1])
+                    {
+                        n + 2
+                    } else {
+                        n + 1
+                    };
+                    rt.set_property_key_strict(
+                        regexp,
+                        PropertyKey::from("lastIndex"),
+                        JsValue::Number(next_idx as f64),
+                        true,
+                    )?;
                 }
             }
             Ok(rt.create_iter_result(m, false))

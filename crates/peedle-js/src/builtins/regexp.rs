@@ -1,10 +1,9 @@
-use crate::builtins::string::expand_replacement;
+use crate::builtins::string::expand_replacement_rt;
 use crate::builtins::{set_getter, set_global, set_method, set_symbol_method};
 use crate::error::JsError;
 use crate::heap::*;
 use crate::value::*;
 use crate::vm::JsRuntime;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 pub fn init(rt: &mut JsRuntime) {
@@ -196,6 +195,7 @@ pub fn init(rt: &mut JsRuntime) {
             let flags_v = rt.get_property(oid, "flags")?;
             let flags_str = rt.to_string(&flags_v)?;
             let global = flags_str.contains('g');
+            let full_unicode = flags_str.contains('u') || flags_str.contains('v');
             let matcher_val = rt.construct(ctor, &[this.clone(), JsValue::String(flags_str)])?;
             let JsValue::Object(matcher) = matcher_val else {
                 return Err(JsError::type_err("RegExp species constructor returned non-object"));
@@ -207,6 +207,7 @@ pub fn init(rt: &mut JsRuntime) {
                 regexp: matcher,
                 input,
                 global,
+                full_unicode,
                 done: false,
             });
             Ok(JsValue::Object(it))
@@ -300,50 +301,21 @@ pub fn init(rt: &mut JsRuntime) {
                     let r = rt.call_function(replace_val.clone(), JsValue::Undefined, &cb_args)?;
                     rt.to_string(&r)?
                 } else {
-                    let named_map = if let JsValue::Object(gid) = groups_val {
-                        let mut hm = HashMap::new();
-                        for k in rt.own_keys(gid)? {
-                            if let PropertyKey::String(s) = k {
-                                let v = rt.get_property(gid, &s)?;
-                                hm.insert(
-                                    s,
-                                    if v.is_undefined() {
-                                        None
-                                    } else {
-                                        Some(rt.to_string(&v)?)
-                                    },
-                                );
-                            }
-                        }
-                        Some(hm)
-                    } else if !groups_val.is_undefined() {
-                        let gid = rt.to_object(&groups_val)?;
-                        let mut hm = HashMap::new();
-                        for k in rt.own_keys(gid)? {
-                            if let PropertyKey::String(s) = k {
-                                let v = rt.get_property(gid, &s)?;
-                                hm.insert(
-                                    s,
-                                    if v.is_undefined() {
-                                        None
-                                    } else {
-                                        Some(rt.to_string(&v)?)
-                                    },
-                                );
-                            }
-                        }
-                        Some(hm)
-                    } else {
+                    let groups_obj = if groups_val.is_undefined() {
                         None
+                    } else {
+                        Some(rt.to_object(&groups_val)?)
                     };
-                    expand_replacement(
+                    expand_replacement_rt(
+                        rt,
                         &template,
+                        &matched,
                         &units,
                         pos,
                         (pos + matched_len).min(units.len()),
                         &caps,
-                        named_map.as_ref(),
-                    )
+                        groups_obj,
+                    )?
                 };
                 if pos >= next_pos {
                     out.push_str(&String::from_utf16_lossy(&units[next_pos..pos]));
@@ -689,6 +661,14 @@ fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
     index + 1
 }
 
+fn create_data_prop(rt: &mut JsRuntime, oid: ObjectId, name: &str, val: JsValue) {
+    let _ = rt.define_property(
+        oid,
+        PropertyKey::from(name),
+        PropertyDescriptor::data(val, true, true, true),
+    );
+}
+
 pub(crate) fn regexp_exec(rt: &mut JsRuntime, oid: ObjectId, input: &str) -> Result<JsValue, JsError> {
     let compiled = match &rt.heap.get_obj(oid).kind {
         ObjectKind::RegExp(re) => re.compiled.clone(),
@@ -698,11 +678,8 @@ pub(crate) fn regexp_exec(rt: &mut JsRuntime, oid: ObjectId, input: &str) -> Res
     let sticky = compiled.flags.sticky;
     let has_indices = compiled.flags.has_indices;
     let li_val = rt.get_property(oid, "lastIndex")?;
-    let mut last_index = if global || sticky {
-        to_length(rt.to_number(&li_val)?)
-    } else {
-        0
-    };
+    let li_num = to_length(rt.to_number(&li_val)?);
+    let mut last_index = if global || sticky { li_num } else { 0 };
     let units: Vec<u16> = input.encode_utf16().collect();
     if last_index > units.len() {
         if global || sticky {
@@ -728,20 +705,31 @@ pub(crate) fn regexp_exec(rt: &mut JsRuntime, oid: ObjectId, input: &str) -> Res
         }
     }
     let arr = rt.create_array(elems);
-    let _ = rt.set_property(arr, "index", JsValue::Number(m.start as f64));
-    let _ = rt.set_property(arr, "input", JsValue::String(input.to_string()));
-    if !compiled.named_groups().is_empty() {
+    create_data_prop(rt, arr, "index", JsValue::Number(m.start as f64));
+    create_data_prop(rt, arr, "input", JsValue::String(input.to_string()));
+    let mut ordered_names: Vec<(&str, Option<(usize, usize)>)> = Vec::new();
+    for (name, idx) in compiled.named_groups() {
+        let cap = m.captures.get(*idx).copied().flatten();
+        if let Some(existing) = ordered_names.iter_mut().find(|(n, _)| *n == name.as_str()) {
+            if cap.is_some() {
+                existing.1 = cap;
+            }
+        } else {
+            ordered_names.push((name.as_str(), cap));
+        }
+    }
+    if !ordered_names.is_empty() {
         let gobj = rt.create_object_with_proto(None);
-        for (name, span) in &m.named_groups {
+        for (name, span) in &ordered_names {
             let val = match span {
                 Some((s, e)) => JsValue::String(String::from_utf16_lossy(&units[*s..*e])),
                 None => JsValue::Undefined,
             };
-            let _ = rt.set_property(gobj, name, val);
+            create_data_prop(rt, gobj, name, val);
         }
-        let _ = rt.set_property(arr, "groups", JsValue::Object(gobj));
+        create_data_prop(rt, arr, "groups", JsValue::Object(gobj));
     } else {
-        let _ = rt.set_property(arr, "groups", JsValue::Undefined);
+        create_data_prop(rt, arr, "groups", JsValue::Undefined);
     }
     if has_indices {
         let mut idx_elems = Vec::with_capacity(m.captures.len());
@@ -758,9 +746,9 @@ pub(crate) fn regexp_exec(rt: &mut JsRuntime, oid: ObjectId, input: &str) -> Res
             }
         }
         let indices_arr = rt.create_array(idx_elems);
-        if !compiled.named_groups().is_empty() {
+        if !ordered_names.is_empty() {
             let ig = rt.create_object_with_proto(None);
-            for (name, span) in &m.named_groups {
+            for (name, span) in &ordered_names {
                 let v = match span {
                     Some((s, e)) => JsValue::Object(rt.create_array(vec![
                         JsValue::Number(*s as f64),
@@ -768,13 +756,13 @@ pub(crate) fn regexp_exec(rt: &mut JsRuntime, oid: ObjectId, input: &str) -> Res
                     ])),
                     None => JsValue::Undefined,
                 };
-                let _ = rt.set_property(ig, name, v);
+                create_data_prop(rt, ig, name, v);
             }
-            let _ = rt.set_property(indices_arr, "groups", JsValue::Object(ig));
+            create_data_prop(rt, indices_arr, "groups", JsValue::Object(ig));
         } else {
-            let _ = rt.set_property(indices_arr, "groups", JsValue::Undefined);
+            create_data_prop(rt, indices_arr, "groups", JsValue::Undefined);
         }
-        let _ = rt.set_property(arr, "indices", JsValue::Object(indices_arr));
+        create_data_prop(rt, arr, "indices", JsValue::Object(indices_arr));
     }
     Ok(JsValue::Object(arr))
 }

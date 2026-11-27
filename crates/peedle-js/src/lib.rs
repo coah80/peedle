@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod bigint;
 pub mod builtins;
 pub mod bytecode;
 pub mod compiler;
@@ -13,7 +14,7 @@ pub mod value;
 pub mod vm;
 
 pub use error::{ErrorKind, JsError};
-pub use heap::{NativeCallback, ObjectKind};
+pub use heap::{NativeCallback, ObjectKind, SharedBufferBacking};
 pub use value::{EnvId, JsValue, ObjectId, PropertyDescriptor, PropertyKey, TypedArrayKind};
 pub use vm::{JsRuntime, ModuleLoader};
 

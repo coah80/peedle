@@ -412,19 +412,31 @@ fn init_text_codec(rt: &mut JsRuntime) {
                 return Ok(JsValue::String(String::new()));
             };
             let bytes = match &rt.heap.get_obj(*oid).kind {
-                ObjectKind::ArrayBuffer(ab) => ab.bytes.clone(),
+                ObjectKind::ArrayBuffer(ab) => {
+                    if let Some(shared) = rt.shared_buffer_backing(*oid) {
+                        shared.data.lock().unwrap().clone()
+                    } else {
+                        ab.bytes.clone()
+                    }
+                }
                 ObjectKind::TypedArray(ta) => {
                     let es = ta.kind.element_size();
                     let off = ta.byte_offset;
                     let len = ta.length * es;
-                    if let ObjectKind::ArrayBuffer(ref ab) = rt.heap.get_obj(ta.buffer).kind {
+                    if let Some(shared) = rt.shared_buffer_backing(ta.buffer) {
+                        let guard = shared.data.lock().unwrap();
+                        guard[off..(off + len).min(guard.len())].to_vec()
+                    } else if let ObjectKind::ArrayBuffer(ref ab) = rt.heap.get_obj(ta.buffer).kind {
                         ab.bytes[off..(off + len).min(ab.bytes.len())].to_vec()
                     } else {
                         Vec::new()
                     }
                 }
                 ObjectKind::DataView(dv) => {
-                    if let ObjectKind::ArrayBuffer(ref ab) = rt.heap.get_obj(dv.buffer).kind {
+                    if let Some(shared) = rt.shared_buffer_backing(dv.buffer) {
+                        let guard = shared.data.lock().unwrap();
+                        guard[dv.byte_offset..(dv.byte_offset + dv.byte_length).min(guard.len())].to_vec()
+                    } else if let ObjectKind::ArrayBuffer(ref ab) = rt.heap.get_obj(dv.buffer).kind {
                         ab.bytes[dv.byte_offset..(dv.byte_offset + dv.byte_length).min(ab.bytes.len())]
                             .to_vec()
                     } else {
@@ -644,6 +656,11 @@ fn structured_clone_impl(
             return Ok(JsValue::Object(c));
         }
         ObjectKind::ArrayBuffer(ab) => {
+            if let Some(shared) = rt.shared_buffer_backing(*oid) {
+                let c = rt.create_shared_array_buffer_from_backing(shared);
+                seen.insert(*oid, c);
+                return Ok(JsValue::Object(c));
+            }
             let c = rt.heap.alloc_object(JsObject::new(
                 Some(rt.intrinsics.array_buffer_proto),
                 ObjectKind::ArrayBuffer(ab.clone()),
@@ -654,7 +671,11 @@ fn structured_clone_impl(
         ObjectKind::TypedArray(ta) => {
             let ta_c = ta.clone();
             let c = alloc_typed_array(rt, ta_c.kind, ta_c.length)?;
-            let src_bytes = if let ObjectKind::ArrayBuffer(ref ab) = rt.heap.get_obj(ta_c.buffer).kind {
+            let src_bytes = if let Some(shared) = rt.shared_buffer_backing(ta_c.buffer) {
+                let guard = shared.data.lock().unwrap();
+                let len = ta_c.length * ta_c.kind.element_size();
+                guard[ta_c.byte_offset..ta_c.byte_offset + len].to_vec()
+            } else if let ObjectKind::ArrayBuffer(ref ab) = rt.heap.get_obj(ta_c.buffer).kind {
                 let len = ta_c.length * ta_c.kind.element_size();
                 ab.bytes[ta_c.byte_offset..ta_c.byte_offset + len].to_vec()
             } else {

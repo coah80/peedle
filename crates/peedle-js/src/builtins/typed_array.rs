@@ -3,7 +3,9 @@ use crate::error::JsError;
 use crate::heap::*;
 use crate::value::*;
 use crate::vm::JsRuntime;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 const MAX_ALLOC_BYTES: usize = 128_000_000;
 
@@ -144,6 +146,7 @@ fn ab_transfer_impl(
                 max_byte_length: new_max,
                 is_shared: false,
                 immutable: make_immutable,
+                shared: None,
             },
         );
     }
@@ -384,6 +387,7 @@ fn init_array_buffer(rt: &mut JsRuntime) {
                     max_byte_length: None,
                     is_shared: false,
                     immutable: true,
+                    shared: None,
                 },
             );
             Ok(JsValue::Object(new_ab))
@@ -426,6 +430,7 @@ fn init_array_buffer(rt: &mut JsRuntime) {
                         max_byte_length: max_byte_len,
                         is_shared: false,
                         immutable: false,
+                        shared: None,
                     },
                 );
             }
@@ -484,10 +489,10 @@ fn init_shared_array_buffer(rt: &mut JsRuntime) {
         "byteLength",
         Rc::new(|rt, this, _| {
             let oid = require_array_buffer(rt, &this, true)?;
-            match &rt.heap.get_obj(oid).kind {
-                ObjectKind::ArrayBuffer(ab) => Ok(JsValue::Number(ab.bytes.len() as f64)),
-                _ => Err(JsError::type_err("Not a SharedArrayBuffer")),
-            }
+            let Some(len) = rt.buffer_byte_len(oid) else {
+                return Err(JsError::type_err("Not a SharedArrayBuffer"));
+            };
+            Ok(JsValue::Number(len as f64))
         }),
     );
 
@@ -497,18 +502,16 @@ fn init_shared_array_buffer(rt: &mut JsRuntime) {
         "maxByteLength",
         Rc::new(|rt, this, _| {
             let oid = require_array_buffer(rt, &this, true)?;
-            match &rt.heap.get_obj(oid).kind {
-                ObjectKind::ArrayBuffer(ab) => {
-                    let mx = rt
-                        .heap
-                        .buffer_meta
-                        .get(&oid)
-                        .and_then(|m| m.max_byte_length)
-                        .unwrap_or(ab.bytes.len());
-                    Ok(JsValue::Number(mx as f64))
-                }
-                _ => Err(JsError::type_err("Not a SharedArrayBuffer")),
-            }
+            let Some(len) = rt.buffer_byte_len(oid) else {
+                return Err(JsError::type_err("Not a SharedArrayBuffer"));
+            };
+            let mx = rt
+                .heap
+                .buffer_meta
+                .get(&oid)
+                .and_then(|m| m.max_byte_length)
+                .unwrap_or(len);
+            Ok(JsValue::Number(mx as f64))
         }),
     );
 
@@ -533,6 +536,14 @@ fn init_shared_array_buffer(rt: &mut JsRuntime) {
                 return Err(JsError::type_err("SharedArrayBuffer is not growable"));
             };
             let new_len = to_index(rt, args.first())?;
+            if let Some(shared) = rt.shared_buffer_backing(oid) {
+                let mut guard = shared.data.lock().unwrap();
+                if new_len < guard.len() || new_len > max_len {
+                    return Err(JsError::range("Invalid grow byteLength"));
+                }
+                guard.resize(new_len, 0);
+                return Ok(JsValue::Undefined);
+            }
             let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(oid).kind else {
                 return Err(JsError::type_err("Not a SharedArrayBuffer"));
             };
@@ -551,9 +562,8 @@ fn init_shared_array_buffer(rt: &mut JsRuntime) {
         2,
         Rc::new(|rt, this, args| {
             let oid = require_array_buffer(rt, &this, true)?;
-            let len = match &rt.heap.get_obj(oid).kind {
-                ObjectKind::ArrayBuffer(ab) => ab.bytes.len(),
-                _ => return Err(JsError::type_err("Not a SharedArrayBuffer")),
+            let Some(len) = rt.buffer_byte_len(oid) else {
+                return Err(JsError::type_err("Not a SharedArrayBuffer"));
             };
             let start = resolve_rel(rt, args.first(), len, 0)?;
             let end = resolve_rel(rt, args.get(1), len, len)?;
@@ -564,25 +574,38 @@ fn init_shared_array_buffer(rt: &mut JsRuntime) {
             if new_id == oid {
                 return Err(JsError::type_err("Species constructor returned the same SharedArrayBuffer"));
             }
-            let target_len = match &rt.heap.get_obj(new_id).kind {
-                ObjectKind::ArrayBuffer(ab) => ab.bytes.len(),
-                _ => return Err(JsError::type_err("Not a SharedArrayBuffer")),
+            let Some(target_len) = rt.buffer_byte_len(new_id) else {
+                return Err(JsError::type_err("Not a SharedArrayBuffer"));
             };
             if target_len < new_len {
                 return Err(JsError::type_err("Species constructor returned a SharedArrayBuffer that is too small"));
             }
-            let slice = match &rt.heap.get_obj(oid).kind {
-                ObjectKind::ArrayBuffer(ab) => {
-                    let actual_end = (start + new_len).min(ab.bytes.len());
-                    if start < actual_end {
-                        ab.bytes[start..actual_end].to_vec()
-                    } else {
-                        Vec::new()
-                    }
+            let slice = if let Some(shared) = rt.shared_buffer_backing(oid) {
+                let guard = shared.data.lock().unwrap();
+                let actual_end = (start + new_len).min(guard.len());
+                if start < actual_end {
+                    guard[start..actual_end].to_vec()
+                } else {
+                    Vec::new()
                 }
-                _ => Vec::new(),
+            } else {
+                match &rt.heap.get_obj(oid).kind {
+                    ObjectKind::ArrayBuffer(ab) => {
+                        let actual_end = (start + new_len).min(ab.bytes.len());
+                        if start < actual_end {
+                            ab.bytes[start..actual_end].to_vec()
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    _ => Vec::new(),
+                }
             };
-            if let ObjectKind::ArrayBuffer(ref mut dst) = rt.heap.get_obj_mut(new_id).kind {
+            if let Some(dst_shared) = rt.shared_buffer_backing(new_id) {
+                let mut guard = dst_shared.data.lock().unwrap();
+                let n = slice.len().min(guard.len());
+                guard[..n].copy_from_slice(&slice[..n]);
+            } else if let ObjectKind::ArrayBuffer(ref mut dst) = rt.heap.get_obj_mut(new_id).kind {
                 let n = slice.len().min(dst.bytes.len());
                 dst.bytes[..n].copy_from_slice(&slice[..n]);
             }
@@ -602,6 +625,10 @@ fn init_shared_array_buffer(rt: &mut JsRuntime) {
                 if byte_len > mx {
                     return Err(JsError::range("byteLength exceeds maxByteLength"));
                 }
+            }
+            let obj_proto =
+                rt.get_prototype_from_new_target(rt.intrinsics.shared_array_buffer_proto)?;
+            if let Some(mx) = max_byte_len {
                 if mx > MAX_ALLOC_BYTES {
                     return Err(JsError::range("SharedArrayBuffer maxByteLength allocation failed"));
                 }
@@ -609,12 +636,15 @@ fn init_shared_array_buffer(rt: &mut JsRuntime) {
             if byte_len > MAX_ALLOC_BYTES {
                 return Err(JsError::range("Invalid SharedArrayBuffer length"));
             }
-            let obj_proto =
-                rt.get_prototype_from_new_target(rt.intrinsics.shared_array_buffer_proto)?;
+            let backing = Arc::new(SharedBufferBacking {
+                data: Mutex::new(vec![0u8; byte_len]),
+                waiters: Mutex::new(HashMap::new()),
+                max_byte_length: max_byte_len,
+            });
             let obj = rt.heap.alloc_object(JsObject::new(
                 Some(obj_proto),
                 ObjectKind::ArrayBuffer(ArrayBufferData {
-                    bytes: vec![0u8; byte_len],
+                    bytes: Vec::new(),
                     detached: false,
                 }),
             ));
@@ -624,6 +654,7 @@ fn init_shared_array_buffer(rt: &mut JsRuntime) {
                     max_byte_length: max_byte_len,
                     is_shared: true,
                     immutable: false,
+                    shared: Some(backing),
                 },
             );
             Ok(JsValue::Object(obj))
@@ -800,11 +831,16 @@ fn init_data_view(rt: &mut JsRuntime) {
                     if end > view_len {
                         return Err(JsError::range("Offset is outside the bounds of the DataView"));
                     }
-                    let ObjectKind::ArrayBuffer(ref ab) = rt.heap.get_obj(dv.buffer).kind else {
-                        return Err(JsError::type_err("Invalid buffer"));
-                    };
                     let pos = dv.byte_offset + off;
-                    let slice: [u8; $size] = ab.bytes[pos..pos + $size].try_into().unwrap();
+                    let slice: [u8; $size] = if let Some(shared) = rt.shared_buffer_backing(dv.buffer) {
+                        let guard = shared.data.lock().unwrap();
+                        guard[pos..pos + $size].try_into().unwrap()
+                    } else {
+                        let ObjectKind::ArrayBuffer(ref ab) = rt.heap.get_obj(dv.buffer).kind else {
+                            return Err(JsError::type_err("Invalid buffer"));
+                        };
+                        ab.bytes[pos..pos + $size].try_into().unwrap()
+                    };
                     let v = if le { ($from_le)(slice) } else { ($from_be)(slice) };
                     Ok(($wrap)(v))
                 }),
@@ -821,8 +857,8 @@ fn init_data_view(rt: &mut JsRuntime) {
     dv_get!("getUint32", 4, |b| u32::from_le_bytes(b) as f64, |b| u32::from_be_bytes(b) as f64, JsValue::Number);
     dv_get!("getFloat32", 4, |b| f32::from_le_bytes(b) as f64, |b| f32::from_be_bytes(b) as f64, JsValue::Number);
     dv_get!("getFloat64", 8, f64::from_le_bytes, f64::from_be_bytes, JsValue::Number);
-    dv_get!("getBigInt64", 8, |b| i64::from_le_bytes(b) as i128, |b| i64::from_be_bytes(b) as i128, JsValue::BigInt);
-    dv_get!("getBigUint64", 8, |b| u64::from_le_bytes(b) as i128, |b| u64::from_be_bytes(b) as i128, JsValue::BigInt);
+    dv_get!("getBigInt64", 8, |b| crate::bigint::JsBigInt::from_i64(i64::from_le_bytes(b)), |b| crate::bigint::JsBigInt::from_i64(i64::from_be_bytes(b)), JsValue::BigInt);
+    dv_get!("getBigUint64", 8, |b| crate::bigint::JsBigInt::from_u64(u64::from_le_bytes(b)), |b| crate::bigint::JsBigInt::from_u64(u64::from_be_bytes(b)), JsValue::BigInt);
 
     macro_rules! dv_set_num {
         ($name:expr, $size:expr, $to_le:expr, $to_be:expr) => {
@@ -849,11 +885,16 @@ fn init_data_view(rt: &mut JsRuntime) {
                         return Err(JsError::range("Offset is outside the bounds of the DataView"));
                     }
                     let bytes: [u8; $size] = if le { ($to_le)(num) } else { ($to_be)(num) };
-                    let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(dv.buffer).kind else {
-                        return Err(JsError::type_err("Invalid buffer"));
-                    };
                     let pos = dv.byte_offset + off;
-                    ab.bytes[pos..pos + $size].copy_from_slice(&bytes);
+                    if let Some(shared) = rt.shared_buffer_backing(dv.buffer) {
+                        let mut guard = shared.data.lock().unwrap();
+                        guard[pos..pos + $size].copy_from_slice(&bytes);
+                    } else {
+                        let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(dv.buffer).kind else {
+                            return Err(JsError::type_err("Invalid buffer"));
+                        };
+                        ab.bytes[pos..pos + $size].copy_from_slice(&bytes);
+                    }
                     Ok(JsValue::Undefined)
                 }),
             );
@@ -881,7 +922,7 @@ fn init_data_view(rt: &mut JsRuntime) {
                 return Err(JsError::type_err("ArrayBuffer is immutable"));
             }
             let off = to_index(rt, args.first())?;
-            let bi = rt.to_bigint(args.get(1).unwrap_or(&JsValue::Undefined))? as i64;
+            let bi = rt.to_bigint(args.get(1).unwrap_or(&JsValue::Undefined))?.to_i64_wrapping();
             let le = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
             let Some(view_len) = rt.data_view_effective_byte_length(oid) else {
                 return Err(JsError::type_err("DataView buffer is detached or out of bounds"));
@@ -893,8 +934,11 @@ fn init_data_view(rt: &mut JsRuntime) {
                 return Err(JsError::range("Offset is outside the bounds of the DataView"));
             }
             let bytes = if le { bi.to_le_bytes() } else { bi.to_be_bytes() };
-            if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(dv.buffer).kind {
-                let pos = dv.byte_offset + off;
+            let pos = dv.byte_offset + off;
+            if let Some(shared) = rt.shared_buffer_backing(dv.buffer) {
+                let mut guard = shared.data.lock().unwrap();
+                guard[pos..pos + 8].copy_from_slice(&bytes);
+            } else if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(dv.buffer).kind {
                 ab.bytes[pos..pos + 8].copy_from_slice(&bytes);
             }
             Ok(JsValue::Undefined)
@@ -912,7 +956,7 @@ fn init_data_view(rt: &mut JsRuntime) {
                 return Err(JsError::type_err("ArrayBuffer is immutable"));
             }
             let off = to_index(rt, args.first())?;
-            let bi = rt.to_bigint(args.get(1).unwrap_or(&JsValue::Undefined))? as u64;
+            let bi = rt.to_bigint(args.get(1).unwrap_or(&JsValue::Undefined))?.to_u64_wrapping();
             let le = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
             let Some(view_len) = rt.data_view_effective_byte_length(oid) else {
                 return Err(JsError::type_err("DataView buffer is detached or out of bounds"));
@@ -924,8 +968,11 @@ fn init_data_view(rt: &mut JsRuntime) {
                 return Err(JsError::range("Offset is outside the bounds of the DataView"));
             }
             let bytes = if le { bi.to_le_bytes() } else { bi.to_be_bytes() };
-            if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(dv.buffer).kind {
-                let pos = dv.byte_offset + off;
+            let pos = dv.byte_offset + off;
+            if let Some(shared) = rt.shared_buffer_backing(dv.buffer) {
+                let mut guard = shared.data.lock().unwrap();
+                guard[pos..pos + 8].copy_from_slice(&bytes);
+            } else if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(dv.buffer).kind {
                 ab.bytes[pos..pos + 8].copy_from_slice(&bytes);
             }
             Ok(JsValue::Undefined)
@@ -945,13 +992,9 @@ fn init_data_view(rt: &mut JsRuntime) {
                 return Err(JsError::type_err("First argument to DataView constructor must be an ArrayBuffer"));
             }
             let offset = to_index(rt, args.get(1))?;
-            let (detached, buf_len) = match &rt.heap.get_obj(*buf_id).kind {
-                ObjectKind::ArrayBuffer(ab) => (ab.detached, ab.bytes.len()),
-                _ => return Err(JsError::type_err("First argument to DataView constructor must be an ArrayBuffer")),
-            };
-            if detached {
+            let Some(buf_len) = rt.buffer_byte_len(*buf_id) else {
                 return Err(JsError::type_err("ArrayBuffer is detached"));
-            }
+            };
             if offset > buf_len {
                 return Err(JsError::range("Start offset is outside the bounds of the buffer"));
             }
@@ -969,13 +1012,9 @@ fn init_data_view(rt: &mut JsRuntime) {
                 }
             };
             let obj_proto = rt.get_prototype_from_new_target(rt.intrinsics.data_view_proto)?;
-            let (detached2, buf_len2) = match &rt.heap.get_obj(*buf_id).kind {
-                ObjectKind::ArrayBuffer(ab) => (ab.detached, ab.bytes.len()),
-                _ => return Err(JsError::type_err("Invalid buffer")),
-            };
-            if detached2 {
+            let Some(buf_len2) = rt.buffer_byte_len(*buf_id) else {
                 return Err(JsError::type_err("ArrayBuffer is detached"));
-            }
+            };
             if offset > buf_len2 || (!auto_len && offset.checked_add(byte_length).map_or(true, |e| e > buf_len2)) {
                 return Err(JsError::range("Offset is outside the bounds of the buffer"));
             }
@@ -1114,6 +1153,9 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
         1,
         Rc::new(|rt, this, args| {
             let (oid, ta) = ta_data(rt, &this)?;
+            if is_buffer_immutable(rt, ta.buffer) {
+                return Err(JsError::type_err("TypedArray buffer is immutable"));
+            }
             let src = args.first().unwrap_or(&JsValue::Undefined);
             let offset = match args.get(1) {
                 None | Some(JsValue::Undefined) => 0usize,
@@ -1203,7 +1245,14 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
                     let src_start = ta.byte_offset + from * es;
                     let dst_start = ta.byte_offset + to * es;
                     let byte_count = actual_count * es;
-                    if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(ta.buffer).kind {
+                    if let Some(shared) = rt.shared_buffer_backing(ta.buffer) {
+                        let mut guard = shared.data.lock().unwrap();
+                        if src_start + byte_count <= guard.len()
+                            && dst_start + byte_count <= guard.len()
+                        {
+                            guard.copy_within(src_start..src_start + byte_count, dst_start);
+                        }
+                    } else if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(ta.buffer).kind {
                         if !ab.detached
                             && src_start + byte_count <= ab.bytes.len()
                             && dst_start + byte_count <= ab.bytes.len()
@@ -1322,6 +1371,9 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
             let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
             let (out, out_data) =
                 ta_species_create(rt, oid, ta.kind, &[JsValue::Number(len as f64)])?;
+            if len > 0 && is_buffer_immutable(rt, out_data.buffer) {
+                return Err(JsError::type_err("TypedArray buffer is immutable"));
+            }
             for i in 0..len {
                 let v = rt.get_property(oid, &i.to_string())?;
                 let m = rt.call_function(
@@ -1662,23 +1714,18 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
         }),
     );
 
-    set_method(
-        rt,
-        base_proto,
-        "toString",
-        0,
-        Rc::new(|rt, this, _| {
-            let oid = rt.to_object(&this)?;
-            let join = rt.get_property(oid, "join")?;
-            if rt.is_callable(&join) {
-                rt.call_function(join, this, &[])
-            } else {
-                Ok(JsValue::String(crate::builtins::object::object_to_string(
-                    rt,
-                    &JsValue::Object(oid),
-                )?))
-            }
-        }),
+    let arr_to_str = rt
+        .heap
+        .get_obj(rt.intrinsics.array_proto)
+        .get_own_prop(&PropertyKey::from("toString"))
+        .and_then(|e| match &e.value {
+            PropValue::Data(v) => Some(v.clone()),
+            _ => None,
+        })
+        .unwrap_or(JsValue::Undefined);
+    rt.heap.get_obj_mut(base_proto).set_own_prop(
+        PropertyKey::from("toString"),
+        PropEntry::data(arr_to_str, true, false, true),
     );
 
     set_method(
@@ -1870,6 +1917,9 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
                 return Err(JsError::type_err("Comparison function must be a function"));
             }
             let (oid, ta, len) = validate_typed_array(rt, &this)?;
+            if is_buffer_immutable(rt, ta.buffer) {
+                return Err(JsError::type_err("TypedArray buffer is immutable"));
+            }
             let mut vals = Vec::with_capacity(len);
             for i in 0..len {
                 vals.push(rt.typed_array_get(&ta, i)?);
@@ -1928,7 +1978,7 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
             };
             let actual = if rel >= 0.0 { rel } else { len as f64 + rel };
             let cur_len = rt.typed_array_effective_length(oid).unwrap_or(0);
-            if actual < 0.0 || actual >= len as f64 || actual >= cur_len as f64 {
+            if actual < 0.0 || actual >= cur_len as f64 {
                 return Err(JsError::range("Invalid index in TypedArray.prototype.with"));
             }
             let idx = actual as usize;
@@ -2042,15 +2092,29 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
                     return Err(JsError::type_err("Iterator method is not callable"));
                 }
                 let iter = rt.call_function(iter_method, src.clone(), &[])?;
+                let JsValue::Object(iter_oid) = iter else {
+                    return Err(JsError::type_err("Iterator must be an object"));
+                };
+                let next_fn = rt.get_property(iter_oid, "next")?;
                 let mut values = Vec::new();
-                while let Some(v) = rt.iterator_step(&iter)? {
-                    values.push(v);
+                loop {
+                    let res = rt.call_function(next_fn.clone(), iter.clone(), &[])?;
+                    let JsValue::Object(res_id) = res else {
+                        return Err(JsError::type_err("Iterator result is not an object"));
+                    };
+                    if rt.get_property(res_id, "done")?.to_boolean() {
+                        break;
+                    }
+                    values.push(rt.get_property(res_id, "value")?);
                 }
                 let len = values.len();
                 let target = rt.construct(this, &[JsValue::Number(len as f64)])?;
-                let (tid, _, target_len) = validate_typed_array(rt, &target)?;
+                let (tid, target_ta, target_len) = validate_typed_array(rt, &target)?;
                 if target_len < len {
                     return Err(JsError::type_err("TypedArray constructor created too small array"));
+                }
+                if len > 0 && is_buffer_immutable(rt, target_ta.buffer) {
+                    return Err(JsError::type_err("TypedArray buffer is immutable"));
                 }
                 for (i, item) in values.into_iter().enumerate() {
                     let val = if !map_fn.is_undefined() {
@@ -2069,9 +2133,12 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
             let len_v = rt.get_property(oid, "length")?;
             let len = to_length(rt.to_number(&len_v)?);
             let target = rt.construct(this, &[JsValue::Number(len as f64)])?;
-            let (tid, _, target_len) = validate_typed_array(rt, &target)?;
+            let (tid, target_ta, target_len) = validate_typed_array(rt, &target)?;
             if target_len < len {
                 return Err(JsError::type_err("TypedArray constructor created too small array"));
+            }
+            if len > 0 && is_buffer_immutable(rt, target_ta.buffer) {
+                return Err(JsError::type_err("TypedArray buffer is immutable"));
             }
             for i in 0..len {
                 let item = rt.get_property(oid, &i.to_string())?;
@@ -2439,9 +2506,14 @@ fn init_uint8_encoding(rt: &mut JsRuntime, ctor: ObjectId, proto: ObjectId) {
             let Some(len) = rt.typed_array_effective_length(oid) else {
                 return Err(JsError::type_err("Uint8Array buffer is detached or out of bounds"));
             };
-            let slice = match &rt.heap.get_obj(ta.buffer).kind {
-                ObjectKind::ArrayBuffer(ab) => ab.bytes[ta.byte_offset..ta.byte_offset + len].to_vec(),
-                _ => return Err(JsError::type_err("Invalid buffer")),
+            let slice = if let Some(shared) = rt.shared_buffer_backing(ta.buffer) {
+                let guard = shared.data.lock().unwrap();
+                guard[ta.byte_offset..ta.byte_offset + len].to_vec()
+            } else {
+                match &rt.heap.get_obj(ta.buffer).kind {
+                    ObjectKind::ArrayBuffer(ab) => ab.bytes[ta.byte_offset..ta.byte_offset + len].to_vec(),
+                    _ => return Err(JsError::type_err("Invalid buffer")),
+                }
             };
             let table: &[u8; 64] = if is_url {
                 b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -2487,13 +2559,18 @@ fn init_uint8_encoding(rt: &mut JsRuntime, ctor: ObjectId, proto: ObjectId) {
         0,
         Rc::new(|rt, this, _| {
             let (_, ta, len) = require_uint8_array(rt, &this)?;
-            let slice = match &rt.heap.get_obj(ta.buffer).kind {
-                ObjectKind::ArrayBuffer(ab) => &ab.bytes[ta.byte_offset..ta.byte_offset + len],
-                _ => return Err(JsError::type_err("Invalid buffer")),
+            let slice = if let Some(shared) = rt.shared_buffer_backing(ta.buffer) {
+                let guard = shared.data.lock().unwrap();
+                guard[ta.byte_offset..ta.byte_offset + len].to_vec()
+            } else {
+                match &rt.heap.get_obj(ta.buffer).kind {
+                    ObjectKind::ArrayBuffer(ab) => ab.bytes[ta.byte_offset..ta.byte_offset + len].to_vec(),
+                    _ => return Err(JsError::type_err("Invalid buffer")),
+                }
             };
             const HEX: &[u8; 16] = b"0123456789abcdef";
             let mut out = String::with_capacity(slice.len() * 2);
-            for &b in slice {
+            for b in slice {
                 out.push(HEX[(b >> 4) as usize] as char);
                 out.push(HEX[(b & 0x0F) as usize] as char);
             }
@@ -2522,7 +2599,10 @@ fn init_uint8_encoding(rt: &mut JsRuntime, ctor: ObjectId, proto: ObjectId) {
             let (bytes, read, err) = from_base64_impl(&s, is_url, last_chunk, len);
             let written = bytes.len();
             if written > 0 {
-                if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(ta.buffer).kind {
+                if let Some(shared) = rt.shared_buffer_backing(ta.buffer) {
+                    let mut guard = shared.data.lock().unwrap();
+                    guard[ta.byte_offset..ta.byte_offset + written].copy_from_slice(&bytes);
+                } else if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(ta.buffer).kind {
                     ab.bytes[ta.byte_offset..ta.byte_offset + written].copy_from_slice(&bytes);
                 }
             }
@@ -2570,7 +2650,10 @@ fn init_uint8_encoding(rt: &mut JsRuntime, ctor: ObjectId, proto: ObjectId) {
             }
             let written = bytes.len();
             if written > 0 {
-                if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(ta.buffer).kind {
+                if let Some(shared) = rt.shared_buffer_backing(ta.buffer) {
+                    let mut guard = shared.data.lock().unwrap();
+                    guard[ta.byte_offset..ta.byte_offset + written].copy_from_slice(&bytes);
+                } else if let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(ta.buffer).kind {
                     ab.bytes[ta.byte_offset..ta.byte_offset + written].copy_from_slice(&bytes);
                 }
             }
@@ -2687,11 +2770,12 @@ fn construct_typed_array(
 ) -> Result<JsValue, JsError> {
     rt.require_new_target(kind.name())?;
     let default_proto = typed_array_proto_for(rt, kind);
-    let obj_proto = rt.get_prototype_from_new_target(default_proto)?;
     let Some(first) = args.first() else {
+        let obj_proto = rt.get_prototype_from_new_target(default_proto)?;
         return Ok(JsValue::Object(alloc_typed_array_with_proto(rt, kind, 0, obj_proto)?));
     };
     if let JsValue::Object(oid) = first {
+        let obj_proto = rt.get_prototype_from_new_target(default_proto)?;
         if matches!(rt.heap.get_obj(*oid).kind, ObjectKind::ArrayBuffer(_)) {
             let es = kind.element_size();
             let offset = to_index(rt, args.get(1))?;
@@ -2703,13 +2787,9 @@ fn construct_typed_array(
                 None | Some(JsValue::Undefined) => None,
                 Some(v) => Some(to_index(rt, Some(v))?),
             };
-            let (detached, buf_len) = match &rt.heap.get_obj(*oid).kind {
-                ObjectKind::ArrayBuffer(ab) => (ab.detached, ab.bytes.len()),
-                _ => return Err(JsError::type_err("Invalid buffer")),
-            };
-            if detached {
+            let Some(buf_len) = rt.buffer_byte_len(*oid) else {
                 return Err(JsError::type_err("ArrayBuffer is detached"));
-            }
+            };
             let is_res = is_buffer_resizable(rt, *oid);
             let (auto_len, length) = match explicit_len {
                 None => {
@@ -2766,7 +2846,25 @@ fn construct_typed_array(
         let sym_iter = PropertyKey::Symbol(rt.symbols.iterator);
         let iter_method = rt.get_property_key(*oid, &sym_iter)?;
         if !iter_method.is_nullish() {
-            let items = rt.collect_iterable(first)?;
+            if !rt.is_callable(&iter_method) {
+                return Err(JsError::type_err("Iterator method is not callable"));
+            }
+            let iter = rt.call_function(iter_method, first.clone(), &[])?;
+            let JsValue::Object(iter_oid) = iter else {
+                return Err(JsError::type_err("Iterator must be an object"));
+            };
+            let next_fn = rt.get_property(iter_oid, "next")?;
+            let mut items = Vec::new();
+            loop {
+                let res = rt.call_function(next_fn.clone(), iter.clone(), &[])?;
+                let JsValue::Object(res_id) = res else {
+                    return Err(JsError::type_err("Iterator result is not an object"));
+                };
+                if rt.get_property(res_id, "done")?.to_boolean() {
+                    break;
+                }
+                items.push(rt.get_property(res_id, "value")?);
+            }
             let obj = alloc_typed_array_with_proto(rt, kind, items.len(), obj_proto)?;
             let data = ta_data(rt, &JsValue::Object(obj))?.1;
             for (i, v) in items.iter().enumerate() {
@@ -2785,6 +2883,7 @@ fn construct_typed_array(
         return Ok(JsValue::Object(obj));
     }
     let len = to_index(rt, Some(first))?;
+    let obj_proto = rt.get_prototype_from_new_target(default_proto)?;
     Ok(JsValue::Object(alloc_typed_array_with_proto(rt, kind, len, obj_proto)?))
 }
 

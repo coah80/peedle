@@ -198,12 +198,14 @@ impl CompiledRegExp {
     pub fn compile(pattern: &str, flag_str: &str) -> Result<Self, JsError> {
         let flags = RegExpFlags::parse(flag_str)?;
         let chars: Vec<char> = pattern.chars().collect();
+        let has_named_groups = pattern_has_named_group(&chars);
         let mut parser = RegexParser {
             chars: &chars,
             pos: 0,
             flags,
             capture_count: 0,
             named_groups: Vec::new(),
+            has_named_groups,
         };
         let (root, _) = parser.parse_alt()?;
         if parser.pos < chars.len() {
@@ -216,11 +218,7 @@ impl CompiledRegExp {
             flags.is_unicode(),
         )?;
         Ok(CompiledRegExp {
-            source: if pattern.is_empty() {
-                "(?:)".to_string()
-            } else {
-                pattern.to_string()
-            },
+            source: escape_regexp_pattern(pattern),
             flags,
             root,
             capture_count: parser.capture_count,
@@ -238,40 +236,7 @@ impl CompiledRegExp {
 
     pub fn exec(&self, input: &str, start_utf16: usize) -> Option<RegExpMatch> {
         let units: Vec<u16> = input.encode_utf16().collect();
-        if start_utf16 > units.len() {
-            return None;
-        }
-        let max_start = if self.flags.sticky {
-            start_utf16
-        } else {
-            units.len()
-        };
-        for pos in start_utf16..=max_start {
-            let mut state = MatchState {
-                units: &units,
-                flags: self.flags,
-                captures: vec![None; self.capture_count + 1],
-                named_groups: &self.named_groups,
-                steps: 0,
-            };
-            if let Some(end) = state.match_node(&self.root, pos, false) {
-                state.captures[0] = Some((pos, end));
-                let mut named = HashMap::new();
-                for (name, idx) in &self.named_groups {
-                    named.insert(name.clone(), state.captures[*idx]);
-                }
-                return Some(RegExpMatch {
-                    start: pos,
-                    end,
-                    captures: state.captures,
-                    named_groups: named,
-                });
-            }
-            if self.flags.sticky {
-                break;
-            }
-        }
-        None
+        self.exec_utf16(&units, start_utf16)
     }
 
     pub fn exec_utf16(&self, units: &[u16], start_utf16: usize) -> Option<RegExpMatch> {
@@ -283,7 +248,8 @@ impl CompiledRegExp {
         } else {
             units.len()
         };
-        for pos in start_utf16..=max_start {
+        let mut pos = start_utf16;
+        while pos <= max_start {
             let mut state = MatchState {
                 units,
                 flags: self.flags,
@@ -295,7 +261,10 @@ impl CompiledRegExp {
                 state.captures[0] = Some((pos, end));
                 let mut named = HashMap::new();
                 for (name, idx) in &self.named_groups {
-                    named.insert(name.clone(), state.captures[*idx]);
+                    let entry = named.entry(name.clone()).or_insert(None);
+                    if state.captures[*idx].is_some() {
+                        *entry = state.captures[*idx];
+                    }
                 }
                 return Some(RegExpMatch {
                     start: pos,
@@ -304,12 +273,93 @@ impl CompiledRegExp {
                     named_groups: named,
                 });
             }
-            if self.flags.sticky {
+            if self.flags.sticky || pos == max_start {
                 break;
+            }
+            if self.flags.is_unicode()
+                && pos + 1 < units.len()
+                && (0xD800..=0xDBFF).contains(&units[pos])
+                && (0xDC00..=0xDFFF).contains(&units[pos + 1])
+            {
+                pos += 2;
+            } else {
+                pos += 1;
             }
         }
         None
     }
+}
+
+fn escape_regexp_pattern(pattern: &str) -> String {
+    if pattern.is_empty() {
+        return "(?:)".to_string();
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let mut escaped = false;
+    let mut in_class = false;
+    for ch in pattern.chars() {
+        if escaped {
+            escaped = false;
+            match ch {
+                '\n' => out.push('n'),
+                '\r' => out.push('r'),
+                '\u{2028}' => out.push_str("u2028"),
+                '\u{2029}' => out.push_str("u2029"),
+                _ => out.push(ch),
+            }
+            continue;
+        }
+        match ch {
+            '\\' => {
+                escaped = true;
+                out.push('\\');
+            }
+            '[' => {
+                in_class = true;
+                out.push('[');
+            }
+            ']' => {
+                in_class = false;
+                out.push(']');
+            }
+            '/' if !in_class => out.push_str("\\/"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn pattern_has_named_group(chars: &[char]) -> bool {
+    let mut i = 0;
+    let mut in_class = false;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '[' => {
+                in_class = true;
+                i += 1;
+            }
+            ']' => {
+                in_class = false;
+                i += 1;
+            }
+            '(' if !in_class => {
+                if chars.get(i + 1) == Some(&'?')
+                    && chars.get(i + 2) == Some(&'<')
+                    && !matches!(chars.get(i + 3), Some('=' | '!'))
+                {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 struct RegexParser<'a> {
@@ -318,6 +368,7 @@ struct RegexParser<'a> {
     flags: RegExpFlags,
     capture_count: usize,
     named_groups: Vec<(String, usize)>,
+    has_named_groups: bool,
 }
 
 impl<'a> RegexParser<'a> {
@@ -354,6 +405,17 @@ impl<'a> RegexParser<'a> {
         while let Some(c) = self.peek() {
             if c == '|' || c == ')' {
                 break;
+            }
+            if !self.flags.is_unicode() && (c as u32) > 0xFFFF {
+                self.pos += 1;
+                let u = (c as u32) - 0x10000;
+                let hi = 0xD800 + (u >> 10);
+                let lo = 0xDC00 + (u & 0x3FF);
+                items.push(Node::Literal(hi));
+                let cap_before = self.capture_count;
+                let node = self.parse_quantifier(Node::Literal(lo), cap_before + 1, cap_before)?;
+                items.push(node);
+                continue;
             }
             let cap_before = self.capture_count;
             let (atom, atom_names) = self.parse_atom()?;
@@ -750,12 +812,14 @@ impl<'a> RegexParser<'a> {
                 Err(JsError::syntax("Invalid decimal escape in Unicode character class"))
             }
             'k' if !in_class => {
-                if self.peek() == Some('<') {
-                    self.pos += 1;
-                    let name = self.parse_group_name()?;
-                    Ok(Node::NamedBackref(name))
-                } else if self.flags.is_unicode() {
-                    Err(JsError::syntax("Invalid named backreference in Unicode regex"))
+                if self.flags.is_unicode() || self.has_named_groups {
+                    if self.peek() == Some('<') {
+                        self.pos += 1;
+                        let name = self.parse_group_name()?;
+                        Ok(Node::NamedBackref(name))
+                    } else {
+                        Err(JsError::syntax("Invalid named backreference in regex"))
+                    }
                 } else {
                     Ok(Node::Literal('k' as u32))
                 }
@@ -798,6 +862,21 @@ impl<'a> RegexParser<'a> {
                         Ok(Node::Literal('u' as u32))
                     }
                 } else if let Some(val) = self.try_read_hex(4) {
+                    if self.flags.is_unicode()
+                        && (0xD800..=0xDBFF).contains(&val)
+                        && self.chars.get(self.pos) == Some(&'\\')
+                        && self.chars.get(self.pos + 1) == Some(&'u')
+                    {
+                        let saved = self.pos;
+                        self.pos += 2;
+                        if let Some(lo) = self.try_read_hex(4) {
+                            if (0xDC00..=0xDFFF).contains(&lo) {
+                                let cp = 0x10000 + ((val - 0xD800) << 10) + (lo - 0xDC00);
+                                return Ok(Node::Literal(cp));
+                            }
+                        }
+                        self.pos = saved;
+                    }
                     Ok(Node::Literal(val))
                 } else if self.flags.is_unicode() {
                     Err(JsError::syntax("Invalid Unicode escape in regex"))
@@ -978,9 +1057,11 @@ impl<'a> RegexParser<'a> {
             ClassSetExpr::Intersection(items)
         } else {
             let mut items = vec![first];
+            let mut closed = false;
             while let Some(c) = self.peek() {
                 if c == ']' {
                     self.pos += 1;
+                    closed = true;
                     break;
                 }
                 if (c == '-' && self.chars.get(self.pos + 1) == Some(&'-'))
@@ -992,7 +1073,7 @@ impl<'a> RegexParser<'a> {
                 }
                 items.push(self.parse_v_class_element(true)?);
             }
-            if self.pos == 0 || self.chars.get(self.pos - 1) != Some(&']') {
+            if !closed {
                 return Err(JsError::syntax("Unterminated character class in regex"));
             }
             if items.len() == 1 {
@@ -1379,7 +1460,7 @@ impl<'a> MatchState<'a> {
             }
             Node::Literal(ch) => {
                 let (next_pos, unit) = self.read_unit(pos, rev)?;
-                if chars_equal(unit, *ch, self.flags.ignore_case) {
+                if chars_equal(unit, *ch, self.flags.ignore_case, self.flags.is_unicode()) {
                     cont(self, next_pos)
                 } else {
                     None
@@ -1400,7 +1481,7 @@ impl<'a> MatchState<'a> {
             }
             Node::Word(neg) => {
                 let (next_pos, unit) = self.read_unit(pos, rev)?;
-                let m = is_word_char(unit) ^ *neg;
+                let m = is_word_char(unit, self.flags) ^ *neg;
                 if m { cont(self, next_pos) } else { None }
             }
             Node::Space(neg) => {
@@ -1414,7 +1495,7 @@ impl<'a> MatchState<'a> {
                     return self.match_class_set(&expr, pos, rev, cont);
                 }
                 let (next_pos, unit) = self.read_unit(pos, rev)?;
-                let m = match_unicode_prop(unit, prop) ^ *neg;
+                let m = match_unicode_prop_flags(unit, prop, *neg, self.flags);
                 if m { cont(self, next_pos) } else { None }
             }
             Node::ClassSet(expr) => self.match_class_set(expr, pos, rev, cont),
@@ -1422,7 +1503,7 @@ impl<'a> MatchState<'a> {
                 let (next_pos, unit) = self.read_unit(pos, rev)?;
                 let mut matched = false;
                 for atom in atoms {
-                    if match_class_atom(unit, atom, self.flags.ignore_case) {
+                    if match_class_atom(unit, atom, self.flags) {
                         matched = true;
                         break;
                     }
@@ -1448,8 +1529,8 @@ impl<'a> MatchState<'a> {
                 if ok { cont(self, pos) } else { None }
             }
             Node::WordBoundary(neg) => {
-                let before = pos > 0 && is_word_char(self.units[pos - 1] as u32);
-                let after = pos < self.units.len() && is_word_char(self.units[pos] as u32);
+                let before = pos > 0 && is_word_char(self.units[pos - 1] as u32, self.flags);
+                let after = pos < self.units.len() && is_word_char(self.units[pos] as u32, self.flags);
                 if (before != after) ^ *neg {
                     cont(self, pos)
                 } else {
@@ -1516,12 +1597,11 @@ impl<'a> MatchState<'a> {
                 self.match_backref(cap, pos, rev, cont)
             }
             Node::NamedBackref(name) => {
-                let idx = self
+                let cap = self
                     .named_groups
                     .iter()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, i)| *i);
-                let cap = idx.and_then(|i| self.captures.get(i).copied().flatten());
+                    .filter(|(n, _)| n == name)
+                    .find_map(|(_, i)| self.captures.get(*i).copied().flatten());
                 self.match_backref(cap, pos, rev, cont)
             }
             Node::Quantifier {
@@ -1588,6 +1668,7 @@ impl<'a> MatchState<'a> {
                     self.units[start + i] as u32,
                     self.units[cs + i] as u32,
                     self.flags.ignore_case,
+                    self.flags.is_unicode(),
                 ) {
                     return None;
                 }
@@ -1602,6 +1683,7 @@ impl<'a> MatchState<'a> {
                     self.units[pos + i] as u32,
                     self.units[cs + i] as u32,
                     self.flags.ignore_case,
+                    self.flags.is_unicode(),
                 ) {
                     return None;
                 }
@@ -1626,16 +1708,16 @@ impl<'a> MatchState<'a> {
     fn match_simple_atom(&self, node: &Node, pos: usize, rev: bool) -> Option<usize> {
         let (next_pos, unit) = self.read_unit(pos, rev)?;
         let ok = match node {
-            Node::Literal(ch) => chars_equal(unit, *ch, self.flags.ignore_case),
+            Node::Literal(ch) => chars_equal(unit, *ch, self.flags.ignore_case, self.flags.is_unicode()),
             Node::Dot => self.flags.dot_all || !is_line_term_u32(unit),
             Node::Digit(neg) => (unit >= '0' as u32 && unit <= '9' as u32) ^ *neg,
-            Node::Word(neg) => is_word_char(unit) ^ *neg,
+            Node::Word(neg) => is_word_char(unit, self.flags) ^ *neg,
             Node::Space(neg) => is_space_u32(unit) ^ *neg,
-            Node::UnicodeProp(prop, neg) => match_unicode_prop(unit, prop) ^ *neg,
+            Node::UnicodeProp(prop, neg) => match_unicode_prop_flags(unit, prop, *neg, self.flags),
             Node::CharClass { negated, atoms } => {
                 let mut matched = false;
                 for atom in atoms {
-                    if match_class_atom(unit, atom, self.flags.ignore_case) {
+                    if match_class_atom(unit, atom, self.flags) {
                         matched = true;
                         break;
                     }
@@ -1721,11 +1803,9 @@ impl<'a> MatchState<'a> {
         }
 
         let saved = self.captures.clone();
-        if count >= min {
-            for i in cap_start..=cap_end {
-                if i < self.captures.len() {
-                    self.captures[i] = None;
-                }
+        for i in cap_start..=cap_end {
+            if i < self.captures.len() {
+                self.captures[i] = None;
             }
         }
         let body_res = self.match_with_cont(body, pos, rev, &mut |st, next_pos| {
@@ -1764,8 +1844,8 @@ impl<'a> MatchState<'a> {
         rev: bool,
         cont: &mut dyn FnMut(&mut Self, usize) -> Option<usize>,
     ) -> Option<usize> {
-        let ic = self.flags.ignore_case;
-        let mut strings = collect_class_set_strings(expr, ic);
+        let flags = self.flags;
+        let mut strings = collect_class_set_strings(expr, flags);
         strings.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         strings.dedup();
 
@@ -1778,7 +1858,7 @@ impl<'a> MatchState<'a> {
             if s.len() < 2 {
                 continue;
             }
-            if let Some(next_pos) = self.match_cp_seq(s, pos, rev, ic) {
+            if let Some(next_pos) = self.match_cp_seq(s, pos, rev, flags) {
                 let saved = self.captures.clone();
                 if let Some(res) = cont(self, next_pos) {
                     return Some(res);
@@ -1787,7 +1867,7 @@ impl<'a> MatchState<'a> {
             }
         }
         if let Some((next_pos, unit)) = self.read_unit(pos, rev) {
-            if match_class_set_char(unit, expr, ic) {
+            if match_class_set_char(unit, expr, flags) {
                 let saved = self.captures.clone();
                 if let Some(res) = cont(self, next_pos) {
                     return Some(res);
@@ -1801,12 +1881,12 @@ impl<'a> MatchState<'a> {
         None
     }
 
-    fn match_cp_seq(&self, seq: &[u32], pos: usize, rev: bool, ignore_case: bool) -> Option<usize> {
+    fn match_cp_seq(&self, seq: &[u32], pos: usize, rev: bool, flags: RegExpFlags) -> Option<usize> {
         let mut cur = pos;
         if rev {
             for &expected in seq.iter().rev() {
                 let (next_pos, unit) = self.read_unit(cur, true)?;
-                if !chars_equal(unit, expected, ignore_case) {
+                if !chars_equal(unit, expected, flags.ignore_case, flags.is_unicode()) {
                     return None;
                 }
                 cur = next_pos;
@@ -1814,7 +1894,7 @@ impl<'a> MatchState<'a> {
         } else {
             for &expected in seq {
                 let (next_pos, unit) = self.read_unit(cur, false)?;
-                if !chars_equal(unit, expected, ignore_case) {
+                if !chars_equal(unit, expected, flags.ignore_case, flags.is_unicode()) {
                     return None;
                 }
                 cur = next_pos;
@@ -1854,52 +1934,160 @@ impl<'a> MatchState<'a> {
     }
 }
 
-fn chars_equal(a: u32, b: u32, ignore_case: bool) -> bool {
+fn canonicalize_unicode(u: u32) -> u32 {
+    match u {
+        0x017F => 0x0073,
+        0x212A => 0x006B,
+        0x0390 | 0x1FD3 => 0x0390,
+        0x03B0 | 0x1FE3 => 0x03B0,
+        0xFB05 | 0xFB06 => 0xFB05,
+        0x1FBE => 0x03B9,
+        0x03C2 => 0x03C3,
+        0x03D0 => 0x03B2,
+        0x03D1 => 0x03B8,
+        0x03D5 => 0x03C6,
+        0x03D6 => 0x03C0,
+        0x03F0 => 0x03BA,
+        0x03F1 => 0x03C1,
+        0x03F5 => 0x03B5,
+        0x1E9B => 0x1E61,
+        0x1E9E => 0x00DF,
+        0x00B5 => 0x03BC,
+        _ => {
+            if u < 128 {
+                (u as u8).to_ascii_lowercase() as u32
+            } else if let Some(ch) = char::from_u32(u) {
+                let mut it = ch.to_lowercase();
+                if let Some(first) = it.next() {
+                    if it.next().is_none() {
+                        return first as u32;
+                    }
+                }
+                u
+            } else {
+                u
+            }
+        }
+    }
+}
+
+fn canonicalize_non_unicode(u: u32) -> u32 {
+    if u < 128 {
+        return (u as u8).to_ascii_uppercase() as u32;
+    }
+    if let Some(ch) = char::from_u32(u) {
+        let mut it = ch.to_uppercase();
+        if let Some(first) = it.next() {
+            if it.next().is_none() {
+                let up = first as u32;
+                if up >= 128 {
+                    return up;
+                }
+            }
+        }
+    }
+    u
+}
+
+fn chars_equal(a: u32, b: u32, ignore_case: bool, unicode: bool) -> bool {
     if a == b {
         return true;
     }
     if !ignore_case {
         return false;
     }
-    if a < 128 && b < 128 {
-        return (a as u8).eq_ignore_ascii_case(&(b as u8));
-    }
-    match (char::from_u32(a), char::from_u32(b)) {
-        (Some(ca), Some(cb)) => ca.to_lowercase().eq(cb.to_lowercase()),
-        _ => false,
+    if unicode {
+        canonicalize_unicode(a) == canonicalize_unicode(b)
+    } else {
+        canonicalize_non_unicode(a) == canonicalize_non_unicode(b)
     }
 }
 
-fn match_class_atom(unit: u32, atom: &ClassAtom, ignore_case: bool) -> bool {
+fn case_fold_equivalents(u: u32) -> Vec<u32> {
+    let mut out = vec![u];
+    let canon = canonicalize_unicode(u);
+    if !out.contains(&canon) {
+        out.push(canon);
+    }
+    if let Some(ch) = char::from_u32(canon) {
+        let mut up = ch.to_uppercase();
+        if let Some(first) = up.next() {
+            if up.next().is_none() {
+                let uc = first as u32;
+                if !out.contains(&uc) {
+                    out.push(uc);
+                }
+            }
+        }
+    }
+    match canon {
+        0x0073 => {
+            if !out.contains(&0x017F) {
+                out.push(0x017F);
+            }
+        }
+        0x006B => {
+            if !out.contains(&0x212A) {
+                out.push(0x212A);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn match_unicode_prop_flags(unit: u32, prop: &str, neg: bool, flags: RegExpFlags) -> bool {
+    if !flags.ignore_case {
+        return match_unicode_prop(unit, prop) ^ neg;
+    }
+    let eqs = case_fold_equivalents(unit);
+    if flags.unicode_sets {
+        let m = eqs.iter().any(|&c| match_unicode_prop(c, prop));
+        m ^ neg
+    } else {
+        eqs.iter().any(|&c| match_unicode_prop(c, prop) ^ neg)
+    }
+}
+
+fn match_class_atom(unit: u32, atom: &ClassAtom, flags: RegExpFlags) -> bool {
+    let ignore_case = flags.ignore_case;
+    let unicode = flags.is_unicode();
     match atom {
-        ClassAtom::Char(c) => chars_equal(unit, *c, ignore_case),
+        ClassAtom::Char(c) => chars_equal(unit, *c, ignore_case, unicode),
         ClassAtom::Range(lo, hi) => {
             if unit >= *lo && unit <= *hi {
                 true
             } else if ignore_case {
-                if unit < 128 {
-                    let lower = (unit as u8).to_ascii_lowercase() as u32;
-                    let upper = (unit as u8).to_ascii_uppercase() as u32;
-                    (lower >= *lo && lower <= *hi) || (upper >= *lo && upper <= *hi)
-                } else if let Some(ch) = char::from_u32(unit) {
-                    ch.to_lowercase()
-                        .next()
-                        .is_some_and(|c| (c as u32) >= *lo && (c as u32) <= *hi)
-                        || ch
-                            .to_uppercase()
-                            .next()
-                            .is_some_and(|c| (c as u32) >= *lo && (c as u32) <= *hi)
+                if unicode {
+                    case_fold_equivalents(unit)
+                        .iter()
+                        .any(|&c| c >= *lo && c <= *hi)
                 } else {
-                    false
+                    let cu = canonicalize_non_unicode(unit);
+                    if cu >= *lo && cu <= *hi {
+                        true
+                    } else if unit < 128 {
+                        let lower = (unit as u8).to_ascii_lowercase() as u32;
+                        lower >= *lo && lower <= *hi
+                    } else if let Some(ch) = char::from_u32(unit) {
+                        ch.to_lowercase()
+                            .next()
+                            .is_some_and(|c| {
+                                let lc = c as u32;
+                                lc >= 128 && lc >= *lo && lc <= *hi
+                            })
+                    } else {
+                        false
+                    }
                 }
             } else {
                 false
             }
         }
         ClassAtom::Digit(neg) => (unit >= '0' as u32 && unit <= '9' as u32) ^ *neg,
-        ClassAtom::Word(neg) => is_word_char(unit) ^ *neg,
+        ClassAtom::Word(neg) => is_word_char(unit, flags) ^ *neg,
         ClassAtom::Space(neg) => is_space_u32(unit) ^ *neg,
-        ClassAtom::UnicodeProp(prop, neg) => match_unicode_prop(unit, prop) ^ *neg,
+        ClassAtom::UnicodeProp(prop, neg) => match_unicode_prop_flags(unit, prop, *neg, flags),
     }
 }
 
@@ -1907,11 +2095,12 @@ fn is_line_term_u32(u: u32) -> bool {
     matches!(u, 0x0A | 0x0D | 0x2028 | 0x2029)
 }
 
-fn is_word_char(u: u32) -> bool {
+fn is_word_char(u: u32, flags: RegExpFlags) -> bool {
     (u >= 'a' as u32 && u <= 'z' as u32)
         || (u >= 'A' as u32 && u <= 'Z' as u32)
         || (u >= '0' as u32 && u <= '9' as u32)
         || u == '_' as u32
+        || (flags.is_unicode() && flags.ignore_case && matches!(u, 0x017F | 0x212A))
 }
 
 fn is_space_u32(u: u32) -> bool {
@@ -1940,15 +2129,34 @@ fn match_unicode_prop(unit: u32, prop: &str) -> bool {
     };
     let val = prop.split('=').next_back().unwrap_or(prop);
     match val {
-        "L" | "Letter" | "Alphabetic" => ch.is_alphabetic(),
-        "Lu" | "Uppercase_Letter" | "Uppercase" => ch.is_uppercase(),
-        "Ll" | "Lowercase_Letter" | "Lowercase" => ch.is_lowercase(),
-        "N" | "Number" | "Nd" | "Decimal_Number" => ch.is_numeric(),
-        "P" | "Punctuation" => ch.is_ascii_punctuation() || (!ch.is_alphanumeric() && !ch.is_whitespace() && !ch.is_control()),
+        "L" | "Letter" | "Alphabetic" | "Alpha" => ch.is_alphabetic(),
+        "Lu" | "Uppercase_Letter" | "Uppercase" | "Upper" => ch.is_uppercase(),
+        "Ll" | "Lowercase_Letter" | "Lowercase" | "Lower" => ch.is_lowercase(),
+        "N" | "Number" | "Nd" | "Decimal_Number" | "digit" => ch.is_numeric(),
+        "P" | "Punctuation" | "punct" => {
+            ch.is_ascii_punctuation()
+                || (!ch.is_alphanumeric() && !ch.is_whitespace() && !ch.is_control())
+        }
         "S" | "Symbol" => matches!(ch, '$' | '+' | '<' | '=' | '>' | '^' | '`' | '|' | '~'),
-        "Z" | "Separator" | "White_Space" => ch.is_whitespace(),
+        "Z" | "Separator" | "White_Space" | "space" => ch.is_whitespace(),
         "ASCII" => ch.is_ascii(),
-        "ASCII_Hex_Digit" | "Hex_Digit" => ch.is_ascii_hexdigit(),
+        "ASCII_Hex_Digit" | "AHex" | "Hex_Digit" | "Hex" => ch.is_ascii_hexdigit(),
+        "Han" | "Hani" => matches!(
+            unit,
+            0x2E80..=0x2EFF
+                | 0x2F00..=0x2FDF
+                | 0x3005..=0x3007
+                | 0x3021..=0x3029
+                | 0x3038..=0x303B
+                | 0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0xF900..=0xFAFF
+                | 0x20000..=0x2A6DF
+                | 0x2A700..=0x2EBEF
+                | 0x2F800..=0x2FA1F
+                | 0x30000..=0x323AF
+        ),
+        "Any" => true,
         _ => ch.is_alphabetic(),
     }
 }
@@ -2300,36 +2508,35 @@ fn class_set_has_strings(expr: &ClassSetExpr) -> bool {
     }
 }
 
-fn match_class_set_char(unit: u32, expr: &ClassSetExpr, ignore_case: bool) -> bool {
+fn match_class_set_char(unit: u32, expr: &ClassSetExpr, flags: RegExpFlags) -> bool {
     match expr {
-        ClassSetExpr::Atom(a) => match_class_atom(unit, a, ignore_case),
-        ClassSetExpr::StringLit(cps) => cps.len() == 1 && chars_equal(unit, cps[0], ignore_case),
+        ClassSetExpr::Atom(a) => match_class_atom(unit, a, flags),
+        ClassSetExpr::StringLit(cps) => {
+            cps.len() == 1 && chars_equal(unit, cps[0], flags.ignore_case, flags.is_unicode())
+        }
         ClassSetExpr::StringProp(_) => false,
-        ClassSetExpr::Union(es) => es
-            .iter()
-            .any(|e| match_class_set_char(unit, e, ignore_case)),
-        ClassSetExpr::Intersection(es) => !es.is_empty()
-            && es
-                .iter()
-                .all(|e| match_class_set_char(unit, e, ignore_case)),
+        ClassSetExpr::Union(es) => es.iter().any(|e| match_class_set_char(unit, e, flags)),
+        ClassSetExpr::Intersection(es) => {
+            !es.is_empty() && es.iter().all(|e| match_class_set_char(unit, e, flags))
+        }
         ClassSetExpr::Difference(es) => {
             if let Some((first, rest)) = es.split_first() {
-                match_class_set_char(unit, first, ignore_case)
-                    && !rest
-                        .iter()
-                        .any(|e| match_class_set_char(unit, e, ignore_case))
+                match_class_set_char(unit, first, flags)
+                    && !rest.iter().any(|e| match_class_set_char(unit, e, flags))
             } else {
                 false
             }
         }
-        ClassSetExpr::Negated(inner) => !match_class_set_char(unit, inner, ignore_case),
+        ClassSetExpr::Negated(inner) => !match_class_set_char(unit, inner, flags),
     }
 }
 
-fn match_class_set_str(s: &[u32], expr: &ClassSetExpr, ignore_case: bool) -> bool {
+fn match_class_set_str(s: &[u32], expr: &ClassSetExpr, flags: RegExpFlags) -> bool {
     if s.len() == 1 {
-        return match_class_set_char(s[0], expr, ignore_case);
+        return match_class_set_char(s[0], expr, flags);
     }
+    let ic = flags.ignore_case;
+    let u = flags.is_unicode();
     match expr {
         ClassSetExpr::Atom(_) | ClassSetExpr::Negated(_) => false,
         ClassSetExpr::StringLit(cps) => {
@@ -2337,23 +2544,23 @@ fn match_class_set_str(s: &[u32], expr: &ClassSetExpr, ignore_case: bool) -> boo
                 && cps
                     .iter()
                     .zip(s.iter())
-                    .all(|(&a, &b)| chars_equal(a, b, ignore_case))
+                    .all(|(&a, &b)| chars_equal(a, b, ic, u))
         }
         ClassSetExpr::StringProp(prop) => string_prop_entries(prop).iter().any(|entry| {
             entry.len() == s.len()
                 && entry
                     .iter()
                     .zip(s.iter())
-                    .all(|(&a, &b)| chars_equal(a, b, ignore_case))
+                    .all(|(&a, &b)| chars_equal(a, b, ic, u))
         }),
-        ClassSetExpr::Union(es) => es.iter().any(|e| match_class_set_str(s, e, ignore_case)),
+        ClassSetExpr::Union(es) => es.iter().any(|e| match_class_set_str(s, e, flags)),
         ClassSetExpr::Intersection(es) => {
-            !es.is_empty() && es.iter().all(|e| match_class_set_str(s, e, ignore_case))
+            !es.is_empty() && es.iter().all(|e| match_class_set_str(s, e, flags))
         }
         ClassSetExpr::Difference(es) => {
             if let Some((first, rest)) = es.split_first() {
-                match_class_set_str(s, first, ignore_case)
-                    && !rest.iter().any(|e| match_class_set_str(s, e, ignore_case))
+                match_class_set_str(s, first, flags)
+                    && !rest.iter().any(|e| match_class_set_str(s, e, flags))
             } else {
                 false
             }
@@ -2361,7 +2568,7 @@ fn match_class_set_str(s: &[u32], expr: &ClassSetExpr, ignore_case: bool) -> boo
     }
 }
 
-fn collect_class_set_strings(expr: &ClassSetExpr, ignore_case: bool) -> Vec<Vec<u32>> {
+fn collect_class_set_strings(expr: &ClassSetExpr, flags: RegExpFlags) -> Vec<Vec<u32>> {
     match expr {
         ClassSetExpr::Atom(_) | ClassSetExpr::Negated(_) => Vec::new(),
         ClassSetExpr::StringLit(cps) => {
@@ -2375,7 +2582,7 @@ fn collect_class_set_strings(expr: &ClassSetExpr, ignore_case: bool) -> Vec<Vec<
         ClassSetExpr::Union(es) => {
             let mut out = Vec::new();
             for e in es {
-                out.extend(collect_class_set_strings(e, ignore_case));
+                out.extend(collect_class_set_strings(e, flags));
             }
             out
         }
@@ -2383,18 +2590,18 @@ fn collect_class_set_strings(expr: &ClassSetExpr, ignore_case: bool) -> Vec<Vec<
             let Some((first, rest)) = es.split_first() else {
                 return Vec::new();
             };
-            collect_class_set_strings(first, ignore_case)
+            collect_class_set_strings(first, flags)
                 .into_iter()
-                .filter(|s| rest.iter().all(|r| match_class_set_str(s, r, ignore_case)))
+                .filter(|s| rest.iter().all(|r| match_class_set_str(s, r, flags)))
                 .collect()
         }
         ClassSetExpr::Difference(es) => {
             let Some((first, rest)) = es.split_first() else {
                 return Vec::new();
             };
-            collect_class_set_strings(first, ignore_case)
+            collect_class_set_strings(first, flags)
                 .into_iter()
-                .filter(|s| !rest.iter().any(|r| match_class_set_str(s, r, ignore_case)))
+                .filter(|s| !rest.iter().any(|r| match_class_set_str(s, r, flags)))
                 .collect()
         }
     }

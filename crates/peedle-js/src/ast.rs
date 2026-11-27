@@ -170,6 +170,7 @@ pub struct ClassNode {
     pub name: Option<String>,
     pub super_class: Option<Box<Expr>>,
     pub elements: Vec<ClassElement>,
+    pub source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +253,7 @@ pub struct TemplateQuasi {
 #[derive(Debug, Clone)]
 pub enum AssignTarget {
     Ident(String),
+    ParenIdent(String),
     Member {
         object: Box<Expr>,
         property: MemberProp,

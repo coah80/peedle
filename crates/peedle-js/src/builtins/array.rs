@@ -352,12 +352,12 @@ pub fn init(rt: &mut JsRuntime) {
                 let lk = PropertyKey::String(lo.to_string());
                 let hk = PropertyKey::String(hi.to_string());
                 let l_exists = rt.has_property(oid, &lk)?;
-                let h_exists = rt.has_property(oid, &hk)?;
                 let lv = if l_exists {
                     Some(rt.get_property_key(oid, &lk)?)
                 } else {
                     None
                 };
+                let h_exists = rt.has_property(oid, &hk)?;
                 let hv = if h_exists {
                     Some(rt.get_property_key(oid, &hk)?)
                 } else {

@@ -171,23 +171,26 @@ fn init_number(rt: &mut JsRuntime) {
         }),
     );
 
-    let ctor = rt.create_native_constructor(
+    let ctor = rt.create_spec_constructor(
         "Number",
         1,
         proto,
-        Rc::new(|rt, this, args| {
-            let is_new = matches!(
-                this,
-                JsValue::Object(oid) if rt.heap.get_obj(oid).prototype == Some(rt.intrinsics.number_proto)
-            );
+        Rc::new(|rt, _, args| {
+            let new_target = rt.native_new_target.clone();
+            let is_new = matches!(&new_target, Some(nt) if !nt.is_undefined());
             let n = match args.first() {
                 None => 0.0,
-                Some(JsValue::BigInt(b)) => *b as f64,
+                Some(JsValue::BigInt(b)) => b.to_f64(),
                 Some(v) => rt.to_number(v)?,
             };
             if is_new {
+                let target_proto = if let Some(nt) = new_target {
+                    rt.get_prototype_from_constructor(&nt, rt.intrinsics.number_proto)?
+                } else {
+                    rt.intrinsics.number_proto
+                };
                 let obj = rt.heap.alloc_object(JsObject::new(
-                    Some(rt.intrinsics.number_proto),
+                    Some(target_proto),
                     ObjectKind::NumberObj(n),
                 ));
                 Ok(JsValue::Object(obj))
@@ -949,8 +952,8 @@ fn init_bigint(rt: &mut JsRuntime) {
         0,
         Rc::new(|rt, this, _| match this {
             JsValue::BigInt(n) => Ok(JsValue::BigInt(n)),
-            JsValue::Object(oid) => match rt.heap.get_obj(oid).kind {
-                ObjectKind::BigIntObj(n) => Ok(JsValue::BigInt(n)),
+            JsValue::Object(oid) => match &rt.heap.get_obj(oid).kind {
+                ObjectKind::BigIntObj(n) => Ok(JsValue::BigInt(n.clone())),
                 _ => Err(JsError::type_err("BigInt.prototype.valueOf requires a BigInt")),
             },
             _ => Err(JsError::type_err("BigInt.prototype.valueOf requires a BigInt")),
@@ -964,8 +967,8 @@ fn init_bigint(rt: &mut JsRuntime) {
         Rc::new(|rt, this, args| {
             let n = match this {
                 JsValue::BigInt(b) => b,
-                JsValue::Object(oid) => match rt.heap.get_obj(oid).kind {
-                    ObjectKind::BigIntObj(b) => b,
+                JsValue::Object(oid) => match &rt.heap.get_obj(oid).kind {
+                    ObjectKind::BigIntObj(b) => b.clone(),
                     _ => return Err(JsError::type_err("BigInt.prototype.toString requires a BigInt")),
                 },
                 _ => return Err(JsError::type_err("BigInt.prototype.toString requires a BigInt")),
@@ -980,10 +983,7 @@ fn init_bigint(rt: &mut JsRuntime) {
                     r as u32
                 }
             };
-            if radix == 10 {
-                return Ok(JsValue::String(n.to_string()));
-            }
-            Ok(JsValue::String(format_i128_radix(n, radix)))
+            Ok(JsValue::String(n.to_string_radix(radix)))
         }),
     );
 
@@ -999,13 +999,13 @@ fn init_bigint(rt: &mut JsRuntime) {
             let prim = rt.to_primitive(val, "number")?;
             match prim {
                 JsValue::Number(n) => {
-                    if !n.is_finite() || n.fract() != 0.0 {
+                    let Some(bi) = crate::bigint::JsBigInt::from_f64_exact(n) else {
                         return Err(JsError::range(format!(
                             "The number {} cannot be converted to a BigInt",
                             n
                         )));
-                    }
-                    Ok(JsValue::BigInt(n as i128))
+                    };
+                    Ok(JsValue::BigInt(bi))
                 }
                 other => Ok(JsValue::BigInt(rt.to_bigint(&other)?)),
             }
@@ -1019,21 +1019,7 @@ fn init_bigint(rt: &mut JsRuntime) {
         Rc::new(|rt, _, args| {
             let bits = to_bigint_index(rt, args.first())?;
             let bi = rt.to_bigint(args.get(1).unwrap_or(&JsValue::Undefined))?;
-            if bits == 0 {
-                return Ok(JsValue::BigInt(0));
-            }
-            if bits >= 128 {
-                return Ok(JsValue::BigInt(bi));
-            }
-            let mask = (1u128 << bits) - 1;
-            let m = (bi as u128) & mask;
-            let sign_bit = 1u128 << (bits - 1);
-            let res = if m >= sign_bit {
-                (m as i128).wrapping_sub((1u128 << bits) as i128)
-            } else {
-                m as i128
-            };
-            Ok(JsValue::BigInt(res))
+            Ok(JsValue::BigInt(bi.as_int_n(bits)?))
         }),
     );
     set_method(
@@ -1044,14 +1030,7 @@ fn init_bigint(rt: &mut JsRuntime) {
         Rc::new(|rt, _, args| {
             let bits = to_bigint_index(rt, args.first())?;
             let bi = rt.to_bigint(args.get(1).unwrap_or(&JsValue::Undefined))?;
-            if bits == 0 {
-                return Ok(JsValue::BigInt(0));
-            }
-            if bits >= 128 {
-                return Ok(JsValue::BigInt(bi));
-            }
-            let mask = (1u128 << bits) - 1;
-            Ok(JsValue::BigInt(((bi as u128) & mask) as i128))
+            Ok(JsValue::BigInt(bi.as_uint_n(bits)?))
         }),
     );
 
@@ -1069,28 +1048,6 @@ fn to_bigint_index(rt: &mut JsRuntime, arg: Option<&JsValue>) -> Result<usize, J
             Ok(n as usize)
         }
     }
-}
-
-fn format_i128_radix(n: i128, radix: u32) -> String {
-    if n == 0 {
-        return "0".into();
-    }
-    let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let neg = n < 0;
-    let mut v = n.unsigned_abs();
-    let r = radix as u128;
-    let mut buf = Vec::new();
-    while v > 0 {
-        buf.push(digits[(v % r) as usize]);
-        v /= r;
-    }
-    buf.reverse();
-    let mut s = String::new();
-    if neg {
-        s.push('-');
-    }
-    s.push_str(&String::from_utf8_lossy(&buf));
-    s
 }
 
 fn init_boolean(rt: &mut JsRuntime) {

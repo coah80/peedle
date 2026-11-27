@@ -7,8 +7,27 @@ use crate::value::{
 };
 use crate::JsRuntime;
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WaiterState {
+    Waiting,
+    Notified,
+    TimedOut,
+}
+
+pub struct WaiterEntry {
+    pub state: Mutex<WaiterState>,
+    pub cv: Condvar,
+}
+
+pub struct SharedBufferBacking {
+    pub data: Mutex<Vec<u8>>,
+    pub waiters: Mutex<HashMap<usize, VecDeque<Arc<WaiterEntry>>>>,
+    pub max_byte_length: Option<usize>,
+}
 
 pub type NativeCallback =
     Rc<dyn Fn(&mut JsRuntime, JsValue, &[JsValue]) -> Result<JsValue, JsError>>;
@@ -27,11 +46,13 @@ pub struct BufferMeta {
     pub max_byte_length: Option<usize>,
     pub is_shared: bool,
     pub immutable: bool,
+    pub shared: Option<Arc<SharedBufferBacking>>,
 }
 
 #[derive(Clone)]
 pub struct JsFunction {
     pub name: String,
+    pub has_self_name: bool,
     pub chunk: Rc<Chunk>,
     pub params: Rc<Vec<Param>>,
     pub env: EnvId,
@@ -294,7 +315,15 @@ pub enum GeneratorState {
     SuspendedStart,
     SuspendedYield,
     Executing,
+    AwaitingReturn,
     Completed,
+}
+
+#[derive(Clone)]
+pub struct AsyncGenRequest {
+    pub mode: u8,
+    pub arg: JsValue,
+    pub promise: ObjectId,
 }
 
 #[derive(Clone)]
@@ -304,6 +333,7 @@ pub struct GeneratorData {
     pub is_async: bool,
     pub delegating: Option<(JsValue, JsValue)>,
     pub result_promise: Option<ObjectId>,
+    pub queue: Vec<AsyncGenRequest>,
 }
 
 #[derive(Clone)]
@@ -419,11 +449,16 @@ pub enum BuiltinIteratorKind {
     String { units: Vec<u16> },
     Map { target: ObjectId, mode: IterMode },
     Set { target: ObjectId, mode: IterMode },
-    Keys(Vec<JsValue>),
+    Keys {
+        target: Option<ObjectId>,
+        keys: Vec<JsValue>,
+    },
+    CachedIter(IterRecord),
     RegExpMatchAll {
         regexp: ObjectId,
         input: String,
         global: bool,
+        full_unicode: bool,
         done: bool,
     },
     Wrapped(IterRecord),
@@ -481,7 +516,7 @@ pub enum ObjectKind {
     NumberObj(f64),
     BooleanObj(bool),
     SymbolObj(u64),
-    BigIntObj(i128),
+    BigIntObj(crate::bigint::JsBigInt),
     RegExp(RegExpData),
     Date(f64),
     Error(ErrorData),
@@ -501,6 +536,11 @@ pub enum ObjectKind {
     Arguments(ArgumentsData),
     ModuleNamespace(ModuleNamespaceData),
     Iterator(IteratorData),
+    ShadowRealm(usize),
+    WrappedFunction {
+        target: ObjectId,
+        caller_realm: usize,
+    },
     HostObject(Box<dyn Any>),
 }
 
@@ -743,7 +783,9 @@ impl JsObject {
 
     pub fn is_callable(&self) -> bool {
         match &self.kind {
-            ObjectKind::Function(_) | ObjectKind::NativeFunction(_) => true,
+            ObjectKind::Function(_)
+            | ObjectKind::NativeFunction(_)
+            | ObjectKind::WrappedFunction { .. } => true,
             ObjectKind::Proxy(_) => true,
             _ => false,
         }
@@ -1061,6 +1103,10 @@ impl Heap {
                         if let Some(rp) = g.result_promise {
                             obj_stack.push(rp);
                         }
+                        for req in &g.queue {
+                            trace_value(&req.arg, &mut obj_stack);
+                            obj_stack.push(req.promise);
+                        }
                     }
                     ObjectKind::Arguments(a) => {
                         for v in &a.values {
@@ -1069,6 +1115,9 @@ impl Heap {
                         if let Some(me) = a.mapped_env {
                             env_stack.push(me);
                         }
+                    }
+                    ObjectKind::WrappedFunction { target, .. } => {
+                        obj_stack.push(*target);
                     }
                     ObjectKind::ModuleNamespace(m) => {
                         for (_, target) in &m.exports {
@@ -1084,15 +1133,19 @@ impl Heap {
                         BuiltinIteratorKind::Array { target, .. }
                         | BuiltinIteratorKind::Map { target, .. }
                         | BuiltinIteratorKind::Set { target, .. } => obj_stack.push(*target),
-                        BuiltinIteratorKind::Keys(vs) => {
-                            for v in vs {
+                        BuiltinIteratorKind::Keys { target, keys } => {
+                            if let Some(t) = target {
+                                obj_stack.push(*t);
+                            }
+                            for v in keys {
                                 trace_value(v, &mut obj_stack);
                             }
                         }
                         BuiltinIteratorKind::RegExpMatchAll { regexp, .. } => {
                             obj_stack.push(*regexp);
                         }
-                        BuiltinIteratorKind::Wrapped(rec) => {
+                        BuiltinIteratorKind::Wrapped(rec)
+                        | BuiltinIteratorKind::CachedIter(rec) => {
                             trace_value(&rec.iterator, &mut obj_stack);
                             trace_value(&rec.next_method, &mut obj_stack);
                         }

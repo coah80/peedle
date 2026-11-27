@@ -418,13 +418,13 @@ pub fn init(rt: &mut JsRuntime) {
             } else {
                 to_uint32(rt.to_number(&lim_arg)?) as usize
             };
+            let sep_s = rt.to_string(&sep)?;
             if limit == 0 {
                 return Ok(JsValue::Object(rt.create_array(Vec::new())));
             }
             if sep.is_undefined() {
                 return Ok(JsValue::Object(rt.create_array(vec![JsValue::String(s)])));
             }
-            let sep_s = rt.to_string(&sep)?;
             let units = to_u16(&s);
             let sep_u = to_u16(&sep_s);
             let mut parts = Vec::new();
@@ -468,12 +468,18 @@ pub fn init(rt: &mut JsRuntime) {
             }
             let s = rt.to_string(&this)?;
             let search_s = rt.to_string(&search)?;
+            let is_fn = rt.is_callable(&replace_val);
+            let template = if is_fn {
+                String::new()
+            } else {
+                rt.to_string(&replace_val)?
+            };
             let units = to_u16(&s);
             let needle = to_u16(&search_s);
             let Some(pos) = find_u16(&units, &needle, 0) else {
                 return Ok(JsValue::String(s));
             };
-            let repl = if rt.is_callable(&replace_val) {
+            let repl = if is_fn {
                 let r = rt.call_function(
                     replace_val,
                     JsValue::Undefined,
@@ -485,7 +491,6 @@ pub fn init(rt: &mut JsRuntime) {
                 )?;
                 rt.to_string(&r)?
             } else {
-                let template = rt.to_string(&replace_val)?;
                 expand_replacement(&template, &units, pos, pos + needle.len(), &[], None)
             };
             let mut out = from_u16(&units[..pos]);
@@ -842,7 +847,7 @@ pub fn init(rt: &mut JsRuntime) {
         Rc::new(|rt, this, args| {
             let s = require_string_this(rt, &this)?;
             let that = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
-            let ord = match s.cmp(&that) {
+            let ord = match s.nfc().cmp(that.nfc()) {
                 std::cmp::Ordering::Less => -1.0,
                 std::cmp::Ordering::Equal => 0.0,
                 std::cmp::Ordering::Greater => 1.0,
@@ -885,15 +890,13 @@ pub fn init(rt: &mut JsRuntime) {
         }),
     );
 
-    let ctor = rt.create_native_constructor(
+    let ctor = rt.create_spec_constructor(
         "String",
         1,
         proto,
-        Rc::new(|rt, this, args| {
-            let is_new = matches!(
-                this,
-                JsValue::Object(oid) if rt.heap.get_obj(oid).prototype == Some(rt.intrinsics.string_proto)
-            );
+        Rc::new(|rt, _, args| {
+            let new_target = rt.native_new_target.clone();
+            let is_new = matches!(&new_target, Some(nt) if !nt.is_undefined());
             let s = match args.first() {
                 None => String::new(),
                 Some(JsValue::Symbol(id)) if !is_new => {
@@ -903,10 +906,20 @@ pub fn init(rt: &mut JsRuntime) {
                 Some(v) => rt.to_string(v)?,
             };
             if is_new {
+                let target_proto = if let Some(nt) = new_target {
+                    rt.get_prototype_from_constructor(&nt, rt.intrinsics.string_proto)?
+                } else {
+                    rt.intrinsics.string_proto
+                };
+                let utf16_len = s.encode_utf16().count() as f64;
                 let obj = rt.heap.alloc_object(JsObject::new(
-                    Some(rt.intrinsics.string_proto),
+                    Some(target_proto),
                     ObjectKind::StringObj(s),
                 ));
+                rt.heap.get_obj_mut(obj).set_own_prop(
+                    PropertyKey::from("length"),
+                    PropEntry::data(JsValue::Number(utf16_len), false, false, false),
+                );
                 Ok(JsValue::Object(obj))
             } else {
                 Ok(JsValue::String(s))
@@ -1139,4 +1152,81 @@ pub fn expand_replacement(
         i += 1;
     }
     out
+}
+
+pub fn expand_replacement_rt(
+    rt: &mut JsRuntime,
+    template: &str,
+    matched: &str,
+    input: &[u16],
+    match_start: usize,
+    match_end: usize,
+    captures: &[Option<String>],
+    groups_obj: Option<ObjectId>,
+) -> Result<String, JsError> {
+    let chars: Vec<char> = template.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            match chars[i + 1] {
+                '$' => {
+                    out.push('$');
+                    i += 2;
+                    continue;
+                }
+                '&' => {
+                    out.push_str(matched);
+                    i += 2;
+                    continue;
+                }
+                '`' => {
+                    out.push_str(&from_u16(&input[..match_start]));
+                    i += 2;
+                    continue;
+                }
+                '\'' => {
+                    out.push_str(&from_u16(&input[match_end..]));
+                    i += 2;
+                    continue;
+                }
+                '<' if groups_obj.is_some() => {
+                    if let Some(close) = chars[i + 2..].iter().position(|&c| c == '>') {
+                        let name: String = chars[i + 2..i + 2 + close].iter().collect();
+                        let gid = groups_obj.unwrap();
+                        let v = rt.get_property(gid, &name)?;
+                        if !v.is_undefined() {
+                            out.push_str(&rt.to_string(&v)?);
+                        }
+                        i = i + 2 + close + 1;
+                        continue;
+                    }
+                }
+                c if c.is_ascii_digit() => {
+                    let d1 = (c as usize) - ('0' as usize);
+                    if i + 2 < chars.len() && chars[i + 2].is_ascii_digit() {
+                        let d2 = d1 * 10 + ((chars[i + 2] as usize) - ('0' as usize));
+                        if d2 >= 1 && d2 <= captures.len() {
+                            if let Some(ref s) = captures[d2 - 1] {
+                                out.push_str(s);
+                            }
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    if d1 >= 1 && d1 <= captures.len() {
+                        if let Some(ref s) = captures[d1 - 1] {
+                            out.push_str(s);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    Ok(out)
 }

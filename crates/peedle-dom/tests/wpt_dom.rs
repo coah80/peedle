@@ -162,3 +162,108 @@ fn wpt_url_formdata_headers_abort_and_webcrypto_fips180() {
         "/api/items|a=1&b=2&c=hello+world|v1+v2|one, two|true:true|abc|true|a9993e364706816aba3e25717850c26c9cd0d89d|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
 }
+
+#[test]
+fn wpt_intl_number_datetime_collator_plural() {
+    let res = run_env(
+        "<div></div>",
+        r#"
+            const nf = new Intl.NumberFormat('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 2 });
+            const pct = new Intl.NumberFormat('en-US', { style: 'percent' });
+            const dtf = new Intl.DateTimeFormat('en-US');
+            const col = new Intl.Collator('en-US');
+            const pr = new Intl.PluralRules('en-US');
+            [
+                nf.format(12345.6),
+                pct.format(0.75),
+                dtf.format(0),
+                col.compare('a', 'b'),
+                pr.select(1),
+                pr.select(2),
+            ].join('|');
+        "#,
+    );
+    assert_eq!(res, "12,345.6|75%|1970-01-01|-1|one|other");
+}
+
+#[test]
+fn wpt_domparser_xmlserializer_and_template_contents() {
+    let res = run_env(
+        "<div id='host'></div>",
+        r#"
+            const dp = new DOMParser();
+            const parsed = dp.parseFromString('<section><template id="t"><p class="hi">Hello</p></template></section>', 'text/html');
+            const tpl = parsed.querySelector('#t');
+            const cloned = tpl.content.cloneNode(true);
+            document.getElementById('host').appendChild(cloned);
+            const xs = new XMLSerializer();
+            const ser = xs.serializeToString(document.querySelector('#host p'));
+            document.querySelector('#host p.hi').textContent + '|' + ser.includes('Hello');
+        "#,
+    );
+    assert_eq!(res, "Hello|true");
+}
+
+#[test]
+fn wpt_canvas2d_paths_transforms_and_text_alignment() {
+    let doc = parse_html("<canvas id='c' width='120' height='80'></canvas>");
+    let mut env = BrowserJsEnv::new(
+        doc,
+        "https://wpt.test/canvas.html".to_string(),
+        800.0,
+        600.0,
+        HttpClient::new(),
+    );
+    let out = env
+        .eval(
+            r#"
+            const cv = document.getElementById('c');
+            const ctx = cv.getContext('2d');
+            ctx.fillStyle = '#38bdf8';
+            ctx.beginPath();
+            ctx.roundRect(10, 10, 60, 40, 8);
+            ctx.fill();
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.font = '14px sans-serif';
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText('OK', 40, 30);
+            ctx.textAlign + '|' + ctx.textBaseline + '|' + (ctx.measureText('OK').width > 0);
+        "#,
+        )
+        .unwrap();
+    assert_eq!(out.as_str(), Some("center|middle|true"));
+    let st = env.dom.borrow();
+    let cid = st.doc.get_element_by_id("c").unwrap();
+    let fb = &st.canvases.get(&cid).unwrap().fb;
+    let painted = fb.data.chunks_exact(4).filter(|p| p[3] > 0).count();
+    assert!(painted > 1500, "expected painted rounded rect + text, got {}", painted);
+}
+
+#[test]
+fn wpt_xpath_and_event_once_and_dataset_classlist() {
+    let res = run_env(
+        "<div id='el' class='a b' data-user-id='99'><span>One</span></div>",
+        r#"
+            const el = document.getElementById('el');
+            el.classList.toggle('b');
+            el.classList.add('c');
+            el.dataset.roleName = 'admin';
+            let hits = 0;
+            el.addEventListener('tap', () => { hits += 1; }, { once: true });
+            el.dispatchEvent(new Event('tap'));
+            el.dispatchEvent(new Event('tap'));
+            const ev = new XPathEvaluator();
+            const expr = ev.createExpression('//span', null);
+            const r = expr.evaluate(document, 4, null);
+            [
+                el.className,
+                el.dataset.userId,
+                el.getAttribute('data-role-name'),
+                String(hits),
+                r.iterateNext() === null,
+            ].join('|');
+        "#,
+    );
+    assert_eq!(res, "a c|99|admin|1|true");
+}

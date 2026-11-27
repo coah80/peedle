@@ -1,7 +1,323 @@
-use peedle_js::{JsError, JsRuntime, JsValue};
-use std::collections::HashMap;
+use peedle_js::{JsError, JsRuntime, JsValue, SharedBufferBacking};
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+struct AgentHub {
+    reports: Mutex<VecDeque<String>>,
+    broadcasts: Mutex<Vec<(Arc<SharedBufferBacking>, Option<i32>)>>,
+    broadcast_cv: Condvar,
+    shutdown: AtomicBool,
+    start_instant: Instant,
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl AgentHub {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            reports: Mutex::new(VecDeque::new()),
+            broadcasts: Mutex::new(Vec::new()),
+            broadcast_cv: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            start_instant: Instant::now(),
+            threads: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+struct AgentGuard(Arc<AgentHub>);
+
+impl Drop for AgentGuard {
+    fn drop(&mut self) {
+        self.0.shutdown.store(true, Ordering::SeqCst);
+        self.0.broadcast_cv.notify_all();
+        if let Ok(list) = self.0.broadcasts.lock() {
+            for (backing, _) in list.iter() {
+                if let Ok(mut wmap) = backing.waiters.lock() {
+                    for q in wmap.values_mut() {
+                        for entry in q.drain(..) {
+                            let mut st = entry.state.lock().unwrap();
+                            *st = peedle_js::heap::WaiterState::Notified;
+                            entry.cv.notify_all();
+                        }
+                    }
+                }
+            }
+        }
+        let handles = {
+            let mut guard = self.0.threads.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+}
+
+fn install_set_timeout(
+    rt: &mut JsRuntime,
+    timers: Rc<RefCell<Vec<(Instant, JsValue)>>>,
+) {
+    let timers_gc = timers.clone();
+    rt.add_gc_root_tracer(move |roots| {
+        for (_, cb) in timers_gc.borrow().iter() {
+            if let JsValue::Object(oid) = cb {
+                roots.push(*oid);
+            }
+        }
+    });
+    let set_timeout_fn = rt.create_native_function(
+        "setTimeout",
+        2,
+        Rc::new(move |rt, _, args| {
+            let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let ms = match args.get(1) {
+                None | Some(JsValue::Undefined) => 0.0,
+                Some(v) => rt.to_number(v).unwrap_or(0.0),
+            };
+            let clamped = if ms.is_nan() || ms < 0.0 {
+                0u64
+            } else {
+                ms.min(60_000.0) as u64
+            };
+            timers
+                .borrow_mut()
+                .push((Instant::now() + Duration::from_millis(clamped), cb));
+            Ok(JsValue::Number(1.0))
+        }),
+    );
+    let g = rt.global_object();
+    let _ = rt.set_property(g, "setTimeout", JsValue::Object(set_timeout_fn));
+}
+
+fn pump_event_loop(
+    rt: &mut JsRuntime,
+    timers: &Rc<RefCell<Vec<(Instant, JsValue)>>>,
+    print_log: Option<&Rc<RefCell<Vec<String>>>>,
+    hub: &Arc<AgentHub>,
+    max_wait: Duration,
+) {
+    let deadline = Instant::now() + max_wait;
+    loop {
+        if let Some(log) = print_log {
+            let lines = log.borrow();
+            if lines
+                .iter()
+                .any(|l| l.contains("Test262:AsyncTestComplete") || l.contains("Test262:AsyncTestFailure"))
+            {
+                break;
+            }
+        }
+        if hub.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut progressed = rt.tick_async_waiters();
+        let now = Instant::now();
+        let mut due = Vec::new();
+        {
+            let mut list = timers.borrow_mut();
+            let mut i = 0;
+            while i < list.len() {
+                if list[i].0 <= now {
+                    due.push(list.remove(i).1);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        if !due.is_empty() {
+            progressed = true;
+            for cb in due {
+                let _ = rt.call_function(cb, JsValue::Undefined, &[]);
+                rt.drain_microtasks();
+            }
+        }
+        if progressed {
+            rt.drain_microtasks();
+            continue;
+        }
+        let has_timers = !timers.borrow().is_empty();
+        let has_waiters = rt.has_pending_async_waiters();
+        if !has_timers && !has_waiters {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        let mut next_wake = Instant::now() + Duration::from_millis(2);
+        if let Some(t) = timers.borrow().iter().map(|(t, _)| *t).min() {
+            if t < next_wake {
+                next_wake = t;
+            }
+        }
+        if let Some(t) = rt.next_async_waiter_deadline() {
+            if t < next_wake {
+                next_wake = t;
+            }
+        }
+        let now2 = Instant::now();
+        if next_wake > now2 {
+            std::thread::sleep((next_wake - now2).min(Duration::from_millis(2)));
+        }
+    }
+}
+
+fn make_agent_object(rt: &mut JsRuntime, hub: Arc<AgentHub>) -> peedle_js::ObjectId {
+    let agent = rt.create_object();
+    let broadcast_idx = Rc::new(RefCell::new(0usize));
+
+    let hub_start = hub.clone();
+    let start_fn = rt.create_native_function(
+        "start",
+        1,
+        Rc::new(move |rt, _, args| {
+            let script = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
+            let hub_w = hub_start.clone();
+            let handle = std::thread::spawn(move || {
+                let mut wrt = JsRuntime::new();
+                wrt.max_steps = Some(100_000_000);
+                wrt.max_call_depth = 128;
+                let wtimers = Rc::new(RefCell::new(Vec::<(Instant, JsValue)>::new()));
+                install_set_timeout(&mut wrt, wtimers.clone());
+                let h = make_host_262(&mut wrt, 0, hub_w.clone());
+                let wg = wrt.global_object();
+                let _ = wrt.set_property(wg, "$262", JsValue::Object(h));
+                let _ = wrt.eval(&script);
+                pump_event_loop(&mut wrt, &wtimers, None, &hub_w, Duration::from_secs(15));
+            });
+            hub_start.threads.lock().unwrap().push(handle);
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    let hub_bcast = hub.clone();
+    let broadcast_fn = rt.create_native_function(
+        "broadcast",
+        1,
+        Rc::new(move |rt, _, args| {
+            let Some(JsValue::Object(oid)) = args.first() else {
+                return Err(JsError::type_err("broadcast requires a SharedArrayBuffer"));
+            };
+            let Some(backing) = rt.shared_buffer_backing(*oid) else {
+                return Err(JsError::type_err("broadcast requires a SharedArrayBuffer"));
+            };
+            let extra = match args.get(1) {
+                None | Some(JsValue::Undefined) => None,
+                Some(v) => Some(rt.to_number(v)? as i32),
+            };
+            {
+                let mut list = hub_bcast.broadcasts.lock().unwrap();
+                list.push((backing, extra));
+            }
+            hub_bcast.broadcast_cv.notify_all();
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    let hub_recv = hub.clone();
+    let bidx_recv = broadcast_idx.clone();
+    let receive_broadcast_fn = rt.create_native_function(
+        "receiveBroadcast",
+        1,
+        Rc::new(move |rt, _, args| {
+            let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let idx = *bidx_recv.borrow();
+            let item = {
+                let mut guard = hub_recv.broadcasts.lock().unwrap();
+                loop {
+                    if idx < guard.len() {
+                        break Some(guard[idx].clone());
+                    }
+                    if hub_recv.shutdown.load(Ordering::SeqCst) {
+                        break None;
+                    }
+                    let (g, _) = hub_recv
+                        .broadcast_cv
+                        .wait_timeout(guard, Duration::from_millis(50))
+                        .unwrap();
+                    guard = g;
+                }
+            };
+            if let Some((backing, extra)) = item {
+                *bidx_recv.borrow_mut() = idx + 1;
+                let sab = rt.create_shared_array_buffer_from_backing(backing);
+                let mut call_args = vec![JsValue::Object(sab)];
+                if let Some(id) = extra {
+                    call_args.push(JsValue::Number(id as f64));
+                }
+                let _ = rt.call_function(cb, JsValue::Undefined, &call_args)?;
+                rt.drain_microtasks();
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    let hub_rep = hub.clone();
+    let report_fn = rt.create_native_function(
+        "report",
+        1,
+        Rc::new(move |rt, _, args| {
+            let s = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
+            hub_rep.reports.lock().unwrap().push_back(s);
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    let hub_get = hub.clone();
+    let get_report_fn = rt.create_native_function(
+        "getReport",
+        0,
+        Rc::new(move |_, _, _| {
+            let item = hub_get.reports.lock().unwrap().pop_front();
+            Ok(match item {
+                Some(s) => JsValue::String(s),
+                None => JsValue::Null,
+            })
+        }),
+    );
+
+    let sleep_fn = rt.create_native_function(
+        "sleep",
+        1,
+        Rc::new(|rt, _, args| {
+            let ms = match args.first() {
+                None | Some(JsValue::Undefined) => 0.0,
+                Some(v) => rt.to_number(v)?,
+            };
+            if ms > 0.0 && ms.is_finite() {
+                std::thread::sleep(Duration::from_millis(ms.min(60_000.0) as u64));
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    let hub_mono = hub.clone();
+    let mono_fn = rt.create_native_function(
+        "monotonicNow",
+        0,
+        Rc::new(move |_, _, _| {
+            Ok(JsValue::Number(
+                hub_mono.start_instant.elapsed().as_secs_f64() * 1000.0,
+            ))
+        }),
+    );
+
+    let leaving_fn = rt.create_native_function("leaving", 0, Rc::new(|_, _, _| Ok(JsValue::Undefined)));
+
+    let _ = rt.set_property(agent, "start", JsValue::Object(start_fn));
+    let _ = rt.set_property(agent, "broadcast", JsValue::Object(broadcast_fn));
+    let _ = rt.set_property(agent, "receiveBroadcast", JsValue::Object(receive_broadcast_fn));
+    let _ = rt.set_property(agent, "report", JsValue::Object(report_fn));
+    let _ = rt.set_property(agent, "getReport", JsValue::Object(get_report_fn));
+    let _ = rt.set_property(agent, "sleep", JsValue::Object(sleep_fn));
+    let _ = rt.set_property(agent, "monotonicNow", JsValue::Object(mono_fn));
+    let _ = rt.set_property(agent, "leaving", JsValue::Object(leaving_fn));
+    agent
+}
 
 fn test262_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -29,7 +345,7 @@ fn parse_meta(src: &str) -> TestMeta {
     };
     let yaml = &rest[..end];
     let mut section = "";
-    for line in yaml.lines() {
+    for line in yaml.split(|c| c == '\n' || c == '\r') {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -141,7 +457,7 @@ fn format_js_error(rt: &mut JsRuntime, err: &JsError) -> String {
     }
 }
 
-fn make_host_262(rt: &mut JsRuntime, realm_id: usize) -> peedle_js::ObjectId {
+fn make_host_262(rt: &mut JsRuntime, realm_id: usize, hub: Arc<AgentHub>) -> peedle_js::ObjectId {
     let host_262 = rt.create_object();
     let realm_global = rt.realms[realm_id].global_object;
     let _ = rt.set_property(host_262, "global", JsValue::Object(realm_global));
@@ -168,19 +484,24 @@ fn make_host_262(rt: &mut JsRuntime, realm_id: usize) -> peedle_js::ObjectId {
             rt.eval_in_realm(realm_id, &src)
         }),
     );
+    let hub_realm = hub.clone();
     let create_realm_fn = rt.create_native_function(
         "createRealm",
         0,
-        Rc::new(|rt, _, _| {
+        Rc::new(move |rt, _, _| {
             let new_id = rt.create_realm();
             let prev = rt.switch_realm(new_id);
-            let h = make_host_262(rt, new_id);
+            let h = make_host_262(rt, new_id, hub_realm.clone());
             let rg = rt.global_object();
             let _ = rt.set_property(rg, "$262", JsValue::Object(h));
             rt.switch_realm(prev);
             Ok(JsValue::Object(h))
         }),
     );
+    let agent = make_agent_object(rt, hub);
+    let ams = rt.abstract_module_source_ctor();
+    let _ = rt.set_property(host_262, "agent", JsValue::Object(agent));
+    let _ = rt.set_property(host_262, "AbstractModuleSource", JsValue::Object(ams));
     let _ = rt.set_property(host_262, "detachArrayBuffer", JsValue::Object(detach_fn));
     let _ = rt.set_property(host_262, "evalScript", JsValue::Object(eval_script_fn));
     let _ = rt.set_property(host_262, "createRealm", JsValue::Object(create_realm_fn));
@@ -196,6 +517,7 @@ fn run_single_test(
     let mut rt = JsRuntime::new();
     rt.max_steps = Some(100_000_000);
     rt.max_call_depth = 128;
+    rt.can_block = !meta.flags.iter().any(|f| f == "CanBlockIsFalse");
 
     let base_dir = test_path
         .parent()
@@ -240,7 +562,14 @@ fn run_single_test(
     let g = rt.global_object();
     let _ = rt.set_property(g, "print", JsValue::Object(print_fn));
 
-    let host_262 = make_host_262(&mut rt, 0);
+    let hub = AgentHub::new();
+    let _agent_guard = AgentGuard(hub.clone());
+    let timers = Rc::new(RefCell::new(Vec::<(Instant, JsValue)>::new()));
+    if meta.includes.iter().any(|inc| inc == "atomicsHelper.js") {
+        install_set_timeout(&mut rt, timers.clone());
+    }
+
+    let host_262 = make_host_262(&mut rt, 0, hub.clone());
     let _ = rt.set_property(g, "$262", JsValue::Object(host_262));
 
     if !is_raw {
@@ -278,6 +607,16 @@ fn run_single_test(
     } else {
         rt.eval(&test_src)
     };
+
+    if result.is_ok() && (is_async || rt.has_pending_async_waiters() || !timers.borrow().is_empty()) {
+        pump_event_loop(
+            &mut rt,
+            &timers,
+            if is_async { Some(&print_log) } else { None },
+            &hub,
+            Duration::from_secs(15),
+        );
+    }
 
     if let Some(ref expected_type) = meta.negative_type {
         return match result {
@@ -576,18 +915,7 @@ fn test262_broad_suite() {
         ("built-ins/ThrowTypeError", 30),
         ("built-ins/ArrayBuffer", 300),
         ("built-ins/SharedArrayBuffer", 150),
-        ("built-ins/Atomics@flat", 20),
-        ("built-ins/Atomics/add", 50),
-        ("built-ins/Atomics/and", 50),
-        ("built-ins/Atomics/compareExchange", 50),
-        ("built-ins/Atomics/exchange", 50),
-        ("built-ins/Atomics/isLockFree", 50),
-        ("built-ins/Atomics/load", 50),
-        ("built-ins/Atomics/or", 50),
-        ("built-ins/Atomics/pause", 50),
-        ("built-ins/Atomics/store", 50),
-        ("built-ins/Atomics/sub", 50),
-        ("built-ins/Atomics/xor", 50),
+        ("built-ins/Atomics", 500),
         ("built-ins/DataView", 650),
         ("built-ins/Date", 650),
         ("built-ins/BigInt", 100),
@@ -596,6 +924,8 @@ fn test262_broad_suite() {
         ("built-ins/WeakSet", 100),
         ("built-ins/WeakRef", 50),
         ("built-ins/FinalizationRegistry", 100),
+        ("built-ins/AbstractModuleSource", 20),
+        ("built-ins/ShadowRealm", 100),
     ];
 
     let filter = std::env::var("TEST262_FILTER").ok();
@@ -619,7 +949,7 @@ fn test262_broad_suite() {
     }
 
     let workers = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(4, 8))
+        .map(|n| n.get().clamp(4, 16))
         .unwrap_or(4);
     let mut flat_jobs: Vec<(usize, PathBuf)> = Vec::new();
     for (s_idx, (_, files)) in suite_files.iter().enumerate() {
@@ -725,7 +1055,7 @@ fn test262_broad_suite() {
         0.0
     };
     eprintln!(
-        "TEST262 TOTAL: {}/{} ({:.1}%)",
+        "TEST262 TOTAL: {}/{} ({:.2}%)",
         total_pass, grand, grand_pct
     );
     for s in sample_failures.iter().take(30) {
@@ -733,19 +1063,19 @@ fn test262_broad_suite() {
     }
     if filter.is_none() {
         assert!(
-            grand >= 42_000,
-            "Expected at least 42000 Test262 tests run, got {}",
+            grand >= 42_600,
+            "Expected at least 42600 Test262 tests run, got {}",
             grand
         );
         assert!(
-            total_pass >= 42_000,
-            "Expected at least 42000 Test262 tests passing, got {}/{}",
+            total_pass >= 42_500,
+            "Expected at least 42500 Test262 tests passing, got {}/{}",
             total_pass,
             grand
         );
         assert!(
-            grand_pct >= 99.0,
-            "Test262 pass rate too low: {:.1}% ({}/{})",
+            grand_pct >= 99.7,
+            "Test262 pass rate too low: {:.2}% ({}/{})",
             grand_pct,
             total_pass,
             grand

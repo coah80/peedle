@@ -21,11 +21,14 @@ pub struct Compiler {
     chunk: Chunk,
     loops: Vec<LoopContext>,
     env_depth: u32,
+    with_depth: u32,
     stack_depth: u32,
     handler_depth: u32,
     track_completion: bool,
     pending_label: Option<String>,
     strict: bool,
+    can_tail_call: bool,
+    is_async_gen: bool,
     dispose_stacks: Vec<String>,
     next_dispose_id: u32,
 }
@@ -36,11 +39,14 @@ impl Compiler {
             chunk: Chunk::new(program.strict, true),
             loops: Vec::new(),
             env_depth: 0,
+            with_depth: 0,
             stack_depth: 0,
             handler_depth: 0,
             track_completion: !program.is_module,
             pending_label: None,
             strict: program.strict,
+            can_tail_call: false,
+            is_async_gen: false,
             dispose_stacks: Vec::new(),
             next_dispose_id: 0,
         };
@@ -57,15 +63,19 @@ impl Compiler {
     }
 
     pub fn compile_function(func: &FuncNode) -> Result<Rc<FuncTemplate>, JsError> {
+        let can_tail_call = func.strict && !func.is_async && !func.is_generator;
         let mut comp = Compiler {
             chunk: Chunk::new(func.strict, false),
             loops: Vec::new(),
             env_depth: 0,
+            with_depth: 0,
             stack_depth: 0,
             handler_depth: 0,
             track_completion: false,
             pending_label: None,
             strict: func.strict,
+            can_tail_call,
+            is_async_gen: func.is_async && func.is_generator,
             dispose_stacks: Vec::new(),
             next_dispose_id: 0,
         };
@@ -78,12 +88,18 @@ impl Compiler {
                 comp.emit(Op::Return);
             }
             FuncBody::Expr(expr) => {
-                comp.compile_expr(expr)?;
-                comp.emit(Op::Return);
+                if comp.can_tail_call {
+                    comp.compile_tail_expr(expr)?;
+                } else {
+                    comp.compile_expr(expr)?;
+                    comp.emit(Op::Return);
+                }
             }
         }
+        comp.chunk.needs_arguments = chunk_needs_arguments(&comp.chunk);
         Ok(Rc::new(FuncTemplate {
             name: func.name.clone(),
+            has_self_name: func.name.is_some(),
             chunk: Rc::new(comp.chunk),
             params: Rc::new(func.params.clone()),
             is_async: func.is_async,
@@ -109,11 +125,14 @@ impl Compiler {
             chunk: Chunk::new(strict, false),
             loops: Vec::new(),
             env_depth: 0,
+            with_depth: 0,
             stack_depth: 0,
             handler_depth: 0,
             track_completion: false,
             pending_label: None,
             strict,
+            can_tail_call: false,
+            is_async_gen: false,
             dispose_stacks: Vec::new(),
             next_dispose_id: 0,
         };
@@ -131,11 +150,14 @@ impl Compiler {
             chunk: Chunk::new(strict, false),
             loops: Vec::new(),
             env_depth: 0,
+            with_depth: 0,
             stack_depth: 0,
             handler_depth: 0,
             track_completion: false,
             pending_label: None,
             strict,
+            can_tail_call: false,
+            is_async_gen: false,
             dispose_stacks: Vec::new(),
             next_dispose_id: 0,
         };
@@ -346,7 +368,13 @@ impl Compiler {
             }
             Stmt::Return(expr) => {
                 if let Some(e) = expr {
+                    if self.can_tail_call && self.dispose_stacks.is_empty() {
+                        return self.compile_tail_expr(e);
+                    }
                     self.compile_expr(e)?;
+                    if self.is_async_gen {
+                        self.emit(Op::Await);
+                    }
                 } else {
                     self.emit(Op::PushUndefined);
                     self.stack_depth += 1;
@@ -401,7 +429,10 @@ impl Compiler {
                 self.emit(Op::EnterWith);
                 self.stack_depth -= 1;
                 self.env_depth += 1;
+                self.with_depth += 1;
+                self.emit_clear_completion();
                 self.compile_stmt(body)?;
+                self.with_depth -= 1;
                 self.pop_scope();
                 Ok(())
             }
@@ -558,6 +589,16 @@ impl Compiler {
     fn compile_var_decl(&mut self, kind: VarKind, decls: &[VarDeclarator]) -> Result<(), JsError> {
         for decl in decls {
             if let Some(ref init) = decl.init {
+                if kind == VarKind::Var && self.with_depth > 0 {
+                    if let Pattern::Ident(ref name) = decl.pattern {
+                        let idx = self.str_const(name);
+                        self.emit(Op::ResolveBinding(idx));
+                        self.compile_expr_with_name(init, name)?;
+                        self.emit(Op::SetResolvedBinding(idx));
+                        self.stack_depth -= 1;
+                        continue;
+                    }
+                }
                 if let Pattern::Ident(ref name) = decl.pattern {
                     self.compile_expr_with_name(init, name)?;
                 } else {
@@ -698,8 +739,16 @@ impl Compiler {
             cont_handler_depth: cont_handler,
         });
 
+        let init_may_capture = match init {
+            Some(ForInit::VarDecl { decls, .. }) => decls
+                .iter()
+                .any(|d| d.init.as_ref().is_some_and(expr_may_capture_env)),
+            Some(ForInit::Expr(e)) => expr_may_capture_env(e),
+            None => false,
+        };
         let needs_per_iter_clone = !per_iter_names.is_empty()
-            && (stmt_may_capture_env(body)
+            && (init_may_capture
+                || stmt_may_capture_env(body)
                 || test.as_ref().is_some_and(expr_may_capture_env)
                 || update.as_ref().is_some_and(expr_may_capture_env));
         let names_const = if needs_per_iter_clone {
@@ -709,6 +758,9 @@ impl Compiler {
         };
 
         self.emit_clear_completion();
+        if let Some(nc) = names_const {
+            self.emit(Op::CloneLoopEnv(nc));
+        }
         let loop_start = self.current_ip();
         let j_exit = if let Some(t) = test {
             self.compile_expr(t)?;
@@ -719,9 +771,6 @@ impl Compiler {
             None
         };
 
-        if let Some(nc) = names_const {
-            self.emit(Op::CloneLoopEnv(nc));
-        }
         self.compile_stmt(body)?;
         let update_ip = self.current_ip();
         if let Some(nc) = names_const {
@@ -928,7 +977,7 @@ impl Compiler {
         let j_done = if is_await {
             self.emit(Op::AsyncIteratorNextCall);
             self.stack_depth += 1;
-            self.emit(Op::Await);
+            self.emit(Op::AwaitIterNext);
             self.emit(Op::IteratorResultUnpack(0))
         } else {
             let j = self.emit(Op::IteratorNext(0));
@@ -1365,17 +1414,37 @@ impl Compiler {
                 }
                 let mut excluded_names = Vec::new();
                 for prop in props {
+                    let var_ident_target = if kind == VarKind::Var && self.with_depth > 0 {
+                        match &prop.value {
+                            Pattern::Ident(name) => Some((name.as_str(), None)),
+                            Pattern::Assign { left, right } => match left.as_ref() {
+                                Pattern::Ident(name) => Some((name.as_str(), Some(right.as_ref()))),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     self.emit(Op::Dup);
                     self.stack_depth += 1;
                     match &prop.key {
                         PropKey::Ident(s) | PropKey::String(s) => {
                             excluded_names.push(s.clone());
+                            if let Some((name, _)) = var_ident_target {
+                                let nidx = self.str_const(name);
+                                self.emit(Op::ResolveBinding(nidx));
+                            }
                             let idx = self.str_const(s);
                             self.emit(Op::GetProp(idx));
                         }
                         PropKey::Number(n) => {
                             let s = crate::value::number_to_string(*n);
                             excluded_names.push(s.clone());
+                            if let Some((name, _)) = var_ident_target {
+                                let nidx = self.str_const(name);
+                                self.emit(Op::ResolveBinding(nidx));
+                            }
                             let idx = self.str_const(&s);
                             self.emit(Op::GetProp(idx));
                         }
@@ -1383,16 +1452,40 @@ impl Compiler {
                             self.compile_expr(expr)?;
                             if track_computed {
                                 self.emit(Op::RecordExcludedKey);
+                            } else {
+                                self.emit(Op::ToPropertyKeyOnly);
+                            }
+                            if let Some((name, _)) = var_ident_target {
+                                let nidx = self.str_const(name);
+                                self.emit(Op::ResolveBinding(nidx));
                             }
                             self.emit(Op::GetElem);
                             self.stack_depth -= 1;
                         }
                         PropKey::Private(s) => {
+                            if let Some((name, _)) = var_ident_target {
+                                let nidx = self.str_const(name);
+                                self.emit(Op::ResolveBinding(nidx));
+                            }
                             let idx = self.str_const(s);
                             self.emit(Op::GetPrivate(idx));
                         }
                     }
-                    self.compile_pattern_bind(&prop.value, kind)?;
+                    if let Some((name, def)) = var_ident_target {
+                        if let Some(right) = def {
+                            let j_skip = self.emit(Op::JumpIfNotUndefined(0));
+                            self.emit(Op::Pop);
+                            self.stack_depth -= 1;
+                            self.compile_expr_with_name(right, name)?;
+                            let target = self.current_ip();
+                            self.chunk.patch_jump(j_skip, target);
+                        }
+                        let nidx = self.str_const(name);
+                        self.emit(Op::SetResolvedBinding(nidx));
+                        self.stack_depth -= 1;
+                    } else {
+                        self.compile_pattern_bind(&prop.value, kind)?;
+                    }
                 }
                 if let Some(rest_pat) = rest {
                     let cidx = self.chunk.add_const(ConstValue::Names(excluded_names));
@@ -1479,17 +1572,152 @@ impl Compiler {
                 }
                 let mut excluded = Vec::new();
                 for prop in props {
+                    let member_target = match &prop.value {
+                        Pattern::Member(m) => Some((m.as_ref(), None)),
+                        Pattern::Assign { left, right } => match left.as_ref() {
+                            Pattern::Member(m) => Some((m.as_ref(), Some(right.as_ref()))),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((
+                        Expr::Member {
+                            object, property, ..
+                        },
+                        default_expr,
+                    )) = member_target
+                    {
+                        if !matches!(object.as_ref(), Expr::Super) {
+                            let computed_src_key = match &prop.key {
+                                PropKey::Ident(s) | PropKey::String(s) => {
+                                    excluded.push(s.clone());
+                                    false
+                                }
+                                PropKey::Number(n) => {
+                                    excluded.push(crate::value::number_to_string(*n));
+                                    false
+                                }
+                                PropKey::Computed(expr) => {
+                                    self.emit(Op::Dup);
+                                    self.stack_depth += 1;
+                                    self.compile_expr(expr)?;
+                                    if track_computed {
+                                        self.emit(Op::RecordExcludedKey);
+                                    } else {
+                                        self.emit(Op::ToPropertyKeyOnly);
+                                    }
+                                    true
+                                }
+                                PropKey::Private(_) => false,
+                            };
+                            let target_slots: u8 = match property {
+                                MemberProp::Ident(_) | MemberProp::Private(_) => {
+                                    self.compile_expr(object)?;
+                                    1
+                                }
+                                MemberProp::Computed(tkey) => {
+                                    self.compile_expr(object)?;
+                                    self.compile_expr(tkey)?;
+                                    2
+                                }
+                            };
+                            if computed_src_key {
+                                self.emit(Op::DupAt(target_slots + 1));
+                                self.stack_depth += 1;
+                                self.emit(Op::DupAt(target_slots + 1));
+                                self.stack_depth += 1;
+                                self.emit(Op::GetElem);
+                                self.stack_depth -= 1;
+                            } else {
+                                self.emit(Op::DupAt(target_slots));
+                                self.stack_depth += 1;
+                                match &prop.key {
+                                    PropKey::Ident(s) | PropKey::String(s) => {
+                                        let idx = self.str_const(s);
+                                        self.emit(Op::GetProp(idx));
+                                    }
+                                    PropKey::Number(n) => {
+                                        let s = crate::value::number_to_string(*n);
+                                        let idx = self.str_const(&s);
+                                        self.emit(Op::GetProp(idx));
+                                    }
+                                    PropKey::Private(s) => {
+                                        let idx = self.str_const(s);
+                                        self.emit(Op::GetPrivate(idx));
+                                    }
+                                    PropKey::Computed(_) => unreachable!(),
+                                }
+                            }
+                            if let Some(def) = default_expr {
+                                let j_skip = self.emit(Op::JumpIfNotUndefined(0));
+                                self.emit(Op::Pop);
+                                self.stack_depth -= 1;
+                                self.compile_expr(def)?;
+                                let target = self.current_ip();
+                                self.chunk.patch_jump(j_skip, target);
+                            }
+                            match property {
+                                MemberProp::Ident(tname) => {
+                                    let idx = self.str_const(tname);
+                                    self.emit(Op::SetProp(idx));
+                                    self.stack_depth -= 1;
+                                    self.emit(Op::Pop);
+                                    self.stack_depth -= 1;
+                                }
+                                MemberProp::Private(tname) => {
+                                    let idx = self.str_const(tname);
+                                    self.emit(Op::SetPrivate(idx));
+                                    self.stack_depth -= 1;
+                                    self.emit(Op::Pop);
+                                    self.stack_depth -= 1;
+                                }
+                                MemberProp::Computed(_) => {
+                                    self.emit(Op::SetElem);
+                                    self.stack_depth -= 2;
+                                    self.emit(Op::Pop);
+                                    self.stack_depth -= 1;
+                                }
+                            }
+                            if computed_src_key {
+                                self.emit(Op::Pop);
+                                self.stack_depth -= 1;
+                                self.emit(Op::Pop);
+                                self.stack_depth -= 1;
+                            }
+                            continue;
+                        }
+                    }
+                    let ident_target = if self.with_depth > 0 {
+                        match &prop.value {
+                            Pattern::Ident(name) => Some((name.as_str(), None)),
+                            Pattern::Assign { left, right } => match left.as_ref() {
+                                Pattern::Ident(name) => Some((name.as_str(), Some(right.as_ref()))),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     self.emit(Op::Dup);
                     self.stack_depth += 1;
                     match &prop.key {
                         PropKey::Ident(s) | PropKey::String(s) => {
                             excluded.push(s.clone());
+                            if let Some((name, _)) = ident_target {
+                                let nidx = self.str_const(name);
+                                self.emit(Op::ResolveBinding(nidx));
+                            }
                             let idx = self.str_const(s);
                             self.emit(Op::GetProp(idx));
                         }
                         PropKey::Number(n) => {
                             let s = crate::value::number_to_string(*n);
                             excluded.push(s.clone());
+                            if let Some((name, _)) = ident_target {
+                                let nidx = self.str_const(name);
+                                self.emit(Op::ResolveBinding(nidx));
+                            }
                             let idx = self.str_const(&s);
                             self.emit(Op::GetProp(idx));
                         }
@@ -1497,16 +1725,40 @@ impl Compiler {
                             self.compile_expr(expr)?;
                             if track_computed {
                                 self.emit(Op::RecordExcludedKey);
+                            } else {
+                                self.emit(Op::ToPropertyKeyOnly);
+                            }
+                            if let Some((name, _)) = ident_target {
+                                let nidx = self.str_const(name);
+                                self.emit(Op::ResolveBinding(nidx));
                             }
                             self.emit(Op::GetElem);
                             self.stack_depth -= 1;
                         }
                         PropKey::Private(s) => {
+                            if let Some((name, _)) = ident_target {
+                                let nidx = self.str_const(name);
+                                self.emit(Op::ResolveBinding(nidx));
+                            }
                             let idx = self.str_const(s);
                             self.emit(Op::GetPrivate(idx));
                         }
                     }
-                    self.compile_pattern_assign(&prop.value)?;
+                    if let Some((name, def)) = ident_target {
+                        if let Some(right) = def {
+                            let j_skip = self.emit(Op::JumpIfNotUndefined(0));
+                            self.emit(Op::Pop);
+                            self.stack_depth -= 1;
+                            self.compile_expr_with_name(right, name)?;
+                            let target = self.current_ip();
+                            self.chunk.patch_jump(j_skip, target);
+                        }
+                        let nidx = self.str_const(name);
+                        self.emit(Op::SetResolvedBinding(nidx));
+                        self.stack_depth -= 1;
+                    } else {
+                        self.compile_pattern_assign(&prop.value)?;
+                    }
                 }
                 if let Some(rest_pat) = rest {
                     let cidx = self.chunk.add_const(ConstValue::Names(excluded));
@@ -1592,7 +1844,6 @@ impl Compiler {
                 MemberProp::Computed(key) => {
                     self.compile_expr(object)?;
                     self.compile_expr(key)?;
-                    self.emit(Op::ToPropertyKeyOnly);
                     if is_rest {
                         self.emit(Op::IteratorRestAt(2));
                     } else {
@@ -1986,6 +2237,8 @@ impl Compiler {
                             self.stack_depth += 1;
                         }
                         MemberProp::Computed(key) => {
+                            self.emit(Op::PushThis);
+                            self.emit(Op::Pop);
                             self.compile_expr(key)?;
                             self.emit(Op::GetSuperElem);
                         }
@@ -2116,39 +2369,143 @@ impl Compiler {
                 args,
                 optional,
             } => {
-                if let Expr::Member {
+                if matches!(callee.as_ref(), Expr::Super) {
+                    let has_spread = args.iter().any(|a| matches!(a, CallArg::Spread(_)));
+                    if !has_spread {
+                        for arg in args {
+                            if let CallArg::Expr(e) = arg {
+                                self.compile_expr(e)?;
+                            }
+                        }
+                        let argc = args.len() as u32;
+                        self.emit(Op::CallSuper(argc));
+                        self.stack_depth = self.stack_depth + 1 - argc;
+                    } else {
+                        self.compile_args_array(args)?;
+                        self.emit(Op::CallSuperSpread);
+                    }
+                } else if let Expr::Member {
                     object,
                     property,
                     optional: mem_opt,
                 } = callee.as_ref()
                 {
-                    self.compile_optional_inner(object, short_circuits)?;
-                    if *mem_opt {
+                    if matches!(object.as_ref(), Expr::Super) {
+                        match property {
+                            MemberProp::Ident(name) => {
+                                let idx = self.str_const(name);
+                                self.emit(Op::GetSuperProp(idx));
+                                self.stack_depth += 1;
+                            }
+                            MemberProp::Computed(k) => {
+                                self.emit(Op::PushThis);
+                                self.emit(Op::Pop);
+                                self.compile_expr(k)?;
+                                self.emit(Op::GetSuperElem);
+                            }
+                            MemberProp::Private(_) => {
+                                return Err(JsError::syntax("Private member on super"));
+                            }
+                        }
+                        if *optional {
+                            self.emit(Op::Dup);
+                            self.stack_depth += 1;
+                            let j = self.emit(Op::JumpIfNullish(0));
+                            self.stack_depth -= 1;
+                            short_circuits.push(j);
+                        }
+                        self.emit(Op::PushThis);
+                        self.stack_depth += 1;
+                        self.compile_call_args_and_emit(args, true)?;
+                    } else {
+                        self.compile_optional_inner(object, short_circuits)?;
+                        if *mem_opt {
+                            self.emit(Op::Dup);
+                            self.stack_depth += 1;
+                            let j = self.emit(Op::JumpIfNullish(0));
+                            self.stack_depth -= 1;
+                            short_circuits.push(j);
+                        }
                         self.emit(Op::Dup);
                         self.stack_depth += 1;
-                        let j = self.emit(Op::JumpIfNullish(0));
-                        self.stack_depth -= 1;
-                        short_circuits.push(j);
+                        self.compile_member_get(property)?;
+                        if *optional {
+                            self.emit(Op::Dup);
+                            self.stack_depth += 1;
+                            let j = self.emit(Op::JumpIfNullish(0));
+                            self.stack_depth -= 1;
+                            let j_ok = self.emit(Op::Jump(0));
+                            let null_ip = self.current_ip();
+                            self.chunk.patch_jump(j, null_ip);
+                            self.emit(Op::Pop);
+                            let j2 = self.emit(Op::Jump(0));
+                            short_circuits.push(j2);
+                            let ok_ip = self.current_ip();
+                            self.chunk.patch_jump(j_ok, ok_ip);
+                        }
+                        self.emit(Op::Swap);
+                        self.compile_call_args_and_emit(args, true)?;
                     }
-                    self.emit(Op::Dup);
-                    self.stack_depth += 1;
-                    self.compile_member_get(property)?;
-                    if *optional {
+                } else if let Expr::OptionalChain(inner) = callee.as_ref() {
+                    if let Expr::Member {
+                        object,
+                        property,
+                        optional: mem_opt,
+                    } = inner.as_ref()
+                    {
+                        let mut inner_sc = Vec::new();
+                        self.compile_optional_inner(object, &mut inner_sc)?;
+                        if *mem_opt {
+                            self.emit(Op::Dup);
+                            self.stack_depth += 1;
+                            let j = self.emit(Op::JumpIfNullish(0));
+                            self.stack_depth -= 1;
+                            inner_sc.push(j);
+                        }
                         self.emit(Op::Dup);
                         self.stack_depth += 1;
-                        let j = self.emit(Op::JumpIfNullish(0));
-                        self.stack_depth -= 1;
-                        let j_ok = self.emit(Op::Jump(0));
-                        let null_ip = self.current_ip();
-                        self.chunk.patch_jump(j, null_ip);
-                        self.emit(Op::Pop);
-                        let j2 = self.emit(Op::Jump(0));
-                        short_circuits.push(j2);
-                        let ok_ip = self.current_ip();
-                        self.chunk.patch_jump(j_ok, ok_ip);
+                        self.compile_member_get(property)?;
+                        if *optional {
+                            self.emit(Op::Dup);
+                            self.stack_depth += 1;
+                            let j = self.emit(Op::JumpIfNullish(0));
+                            self.stack_depth -= 1;
+                            let j_ok = self.emit(Op::Jump(0));
+                            let null_ip = self.current_ip();
+                            self.chunk.patch_jump(j, null_ip);
+                            self.emit(Op::Pop);
+                            let j2 = self.emit(Op::Jump(0));
+                            short_circuits.push(j2);
+                            for j in inner_sc {
+                                short_circuits.push(j);
+                            }
+                            let ok_ip = self.current_ip();
+                            self.chunk.patch_jump(j_ok, ok_ip);
+                        } else {
+                            let j_ok = self.emit(Op::Jump(0));
+                            let short_ip = self.current_ip();
+                            for j in inner_sc {
+                                self.chunk.patch_jump(j, short_ip);
+                            }
+                            self.emit(Op::Pop);
+                            self.emit(Op::PushUndefined);
+                            self.emit(Op::PushUndefined);
+                            let ok_ip = self.current_ip();
+                            self.chunk.patch_jump(j_ok, ok_ip);
+                        }
+                        self.emit(Op::Swap);
+                        self.compile_call_args_and_emit(args, true)?;
+                    } else {
+                        self.compile_expr(callee)?;
+                        if *optional {
+                            self.emit(Op::Dup);
+                            self.stack_depth += 1;
+                            let j = self.emit(Op::JumpIfNullish(0));
+                            self.stack_depth -= 1;
+                            short_circuits.push(j);
+                        }
+                        self.compile_call_args_and_emit(args, false)?;
                     }
-                    self.emit(Op::Swap);
-                    self.compile_call_args_and_emit(args, true)?;
                 } else {
                     self.compile_optional_inner(callee, short_circuits)?;
                     if *optional {
@@ -2185,7 +2542,152 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_tail_expr(&mut self, expr: &Expr) -> Result<(), JsError> {
+        let saved = self.stack_depth;
+        match expr {
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                self.compile_expr(test)?;
+                let j_alt = self.emit(Op::JumpIfFalse(0));
+                self.stack_depth -= 1;
+                self.compile_tail_expr(consequent)?;
+                let alt_ip = self.current_ip();
+                self.chunk.patch_jump(j_alt, alt_ip);
+                self.stack_depth = saved;
+                self.compile_tail_expr(alternate)?;
+                self.stack_depth = saved;
+                Ok(())
+            }
+            Expr::Logical { op, left, right } => {
+                self.compile_expr(left)?;
+                self.emit(Op::Dup);
+                self.stack_depth += 1;
+                let j_short = match op {
+                    LogicalOp::And => self.emit(Op::JumpIfFalse(0)),
+                    LogicalOp::Or => self.emit(Op::JumpIfTrue(0)),
+                    LogicalOp::Nullish => self.emit(Op::JumpIfNotNullish(0)),
+                };
+                self.stack_depth -= 1;
+                self.emit(Op::Pop);
+                self.stack_depth -= 1;
+                self.compile_tail_expr(right)?;
+                let short_ip = self.current_ip();
+                self.chunk.patch_jump(j_short, short_ip);
+                self.stack_depth = saved + 1;
+                self.emit(Op::Return);
+                self.stack_depth = saved;
+                Ok(())
+            }
+            Expr::Sequence(exprs) => {
+                let len = exprs.len();
+                for (i, e) in exprs.iter().enumerate() {
+                    if i + 1 < len {
+                        self.compile_expr(e)?;
+                        self.emit(Op::Pop);
+                        self.stack_depth -= 1;
+                    } else {
+                        self.compile_tail_expr(e)?;
+                    }
+                }
+                self.stack_depth = saved;
+                Ok(())
+            }
+            Expr::Call {
+                callee,
+                args,
+                optional: false,
+            } if !matches!(callee.as_ref(), Expr::Super) => {
+                self.compile_call_inner(callee, args, true)?;
+                self.stack_depth = saved;
+                Ok(())
+            }
+            Expr::Template {
+                tag: Some(tag_expr),
+                quasis,
+                exprs,
+            } => {
+                static NEXT_TAIL_SITE_ID: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0x8000_0000_0000_0001);
+                let site_id =
+                    NEXT_TAIL_SITE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let raw: Vec<String> = quasis.iter().map(|q| q.raw.clone()).collect();
+                let cooked: Vec<Option<String>> = quasis.iter().map(|q| q.cooked.clone()).collect();
+                let tidx = self.chunk.add_const(ConstValue::TemplateStrings {
+                    site_id,
+                    raw,
+                    cooked,
+                });
+                let argc = (1 + exprs.len()) as u32;
+                if let Expr::Member {
+                    object, property, ..
+                } = tag_expr.as_ref()
+                {
+                    if matches!(object.as_ref(), Expr::Super) {
+                        match property {
+                            MemberProp::Ident(name) => {
+                                let idx = self.str_const(name);
+                                self.emit(Op::GetSuperProp(idx));
+                                self.stack_depth += 1;
+                            }
+                            MemberProp::Computed(k) => {
+                                self.emit(Op::PushThis);
+                                self.emit(Op::Pop);
+                                self.compile_expr(k)?;
+                                self.emit(Op::GetSuperElem);
+                            }
+                            MemberProp::Private(_) => {
+                                return Err(JsError::syntax("Private member on super"));
+                            }
+                        }
+                        self.emit(Op::PushThis);
+                        self.stack_depth += 1;
+                    } else {
+                        self.compile_expr(object)?;
+                        self.emit(Op::Dup);
+                        self.stack_depth += 1;
+                        self.compile_member_get(property)?;
+                        self.emit(Op::Swap);
+                    }
+                    self.emit(Op::CreateTemplateObject(tidx));
+                    self.stack_depth += 1;
+                    for e in exprs {
+                        self.compile_expr(e)?;
+                    }
+                    self.emit(Op::TailCallMethod(argc));
+                } else {
+                    self.compile_expr(tag_expr)?;
+                    self.emit(Op::CreateTemplateObject(tidx));
+                    self.stack_depth += 1;
+                    for e in exprs {
+                        self.compile_expr(e)?;
+                    }
+                    self.emit(Op::TailCall(argc));
+                }
+                self.stack_depth = saved;
+                Ok(())
+            }
+            _ => {
+                self.compile_expr(expr)?;
+                self.emit(Op::Return);
+                self.stack_depth = saved;
+                Ok(())
+            }
+        }
+    }
+
     fn compile_call(&mut self, callee: &Expr, args: &[CallArg]) -> Result<(), JsError> {
+        self.compile_call_inner(callee, args, false)
+    }
+
+    fn compile_call_inner(
+        &mut self,
+        callee: &Expr,
+        args: &[CallArg],
+        is_tail: bool,
+    ) -> Result<(), JsError> {
         if matches!(callee, Expr::Super) {
             let has_spread = args.iter().any(|a| matches!(a, CallArg::Spread(_)));
             if !has_spread {
@@ -2216,14 +2718,60 @@ impl Compiler {
                         }
                     }
                     let argc = args.len() as u32;
-                    self.emit(Op::CallDirectEval(argc));
+                    if is_tail {
+                        self.emit(Op::TailCallDirectEval(argc));
+                    } else {
+                        self.emit(Op::CallDirectEval(argc));
+                    }
                     self.stack_depth -= argc;
                 } else {
                     self.compile_args_array(args)?;
-                    self.emit(Op::CallDirectEvalSpread);
+                    if is_tail {
+                        self.emit(Op::TailCallDirectEvalSpread);
+                    } else {
+                        self.emit(Op::CallDirectEvalSpread);
+                    }
                     self.stack_depth -= 1;
                 }
                 return Ok(());
+            }
+            let idx = self.str_const(name);
+            self.emit(Op::GetVarWithThis(idx));
+            self.stack_depth += 2;
+            return self.compile_call_args_and_emit_tail(args, true, is_tail);
+        }
+
+        if let Expr::OptionalChain(inner) = callee {
+            if let Expr::Member {
+                object,
+                property,
+                optional: mem_opt,
+            } = inner.as_ref()
+            {
+                let mut sc = Vec::new();
+                self.compile_optional_inner(object, &mut sc)?;
+                if *mem_opt {
+                    self.emit(Op::Dup);
+                    self.stack_depth += 1;
+                    let j = self.emit(Op::JumpIfNullish(0));
+                    self.stack_depth -= 1;
+                    sc.push(j);
+                }
+                self.emit(Op::Dup);
+                self.stack_depth += 1;
+                self.compile_member_get(property)?;
+                self.emit(Op::Swap);
+                let j_done = self.emit(Op::Jump(0));
+                let short_ip = self.current_ip();
+                for j in sc {
+                    self.chunk.patch_jump(j, short_ip);
+                }
+                self.emit(Op::Pop);
+                self.emit(Op::PushUndefined);
+                self.emit(Op::PushUndefined);
+                let done_ip = self.current_ip();
+                self.chunk.patch_jump(j_done, done_ip);
+                return self.compile_call_args_and_emit_tail(args, true, is_tail);
             }
         }
 
@@ -2248,24 +2796,33 @@ impl Compiler {
                 }
                 self.emit(Op::PushThis);
                 self.stack_depth += 1;
-                return self.compile_call_args_and_emit(args, true);
+                return self.compile_call_args_and_emit_tail(args, true, is_tail);
             }
             self.compile_expr(object)?;
             self.emit(Op::Dup);
             self.stack_depth += 1;
             self.compile_member_get(property)?;
             self.emit(Op::Swap);
-            return self.compile_call_args_and_emit(args, true);
+            return self.compile_call_args_and_emit_tail(args, true, is_tail);
         }
 
         self.compile_expr(callee)?;
-        self.compile_call_args_and_emit(args, false)
+        self.compile_call_args_and_emit_tail(args, false, is_tail)
     }
 
     fn compile_call_args_and_emit(
         &mut self,
         args: &[CallArg],
         is_method: bool,
+    ) -> Result<(), JsError> {
+        self.compile_call_args_and_emit_tail(args, is_method, false)
+    }
+
+    fn compile_call_args_and_emit_tail(
+        &mut self,
+        args: &[CallArg],
+        is_method: bool,
+        is_tail: bool,
     ) -> Result<(), JsError> {
         let has_spread = args.iter().any(|a| matches!(a, CallArg::Spread(_)));
         if !has_spread {
@@ -2276,19 +2833,35 @@ impl Compiler {
             }
             let argc = args.len() as u32;
             if is_method {
-                self.emit(Op::CallMethod(argc));
+                self.emit(if is_tail {
+                    Op::TailCallMethod(argc)
+                } else {
+                    Op::CallMethod(argc)
+                });
                 self.stack_depth -= argc + 1;
             } else {
-                self.emit(Op::Call(argc));
+                self.emit(if is_tail {
+                    Op::TailCall(argc)
+                } else {
+                    Op::Call(argc)
+                });
                 self.stack_depth -= argc;
             }
         } else {
             self.compile_args_array(args)?;
             if is_method {
-                self.emit(Op::CallMethodSpread);
+                self.emit(if is_tail {
+                    Op::TailCallMethodSpread
+                } else {
+                    Op::CallMethodSpread
+                });
                 self.stack_depth -= 2;
             } else {
-                self.emit(Op::CallSpread);
+                self.emit(if is_tail {
+                    Op::TailCallSpread
+                } else {
+                    Op::CallSpread
+                });
                 self.stack_depth -= 1;
             }
         }
@@ -2342,6 +2915,8 @@ impl Compiler {
                     object, property, ..
                 } => {
                     if matches!(object.as_ref(), Expr::Super) {
+                        self.emit(Op::PushThis);
+                        self.emit(Op::Pop);
                         if let MemberProp::Computed(k) = property {
                             self.compile_expr(k)?;
                             self.emit(Op::Pop);
@@ -2498,36 +3073,74 @@ impl Compiler {
                     }
                 }
                 MemberProp::Computed(key) => {
-                    self.compile_expr(object)?;
-                    self.compile_expr(key)?;
-                    self.emit(Op::ToPropertyKey);
-                    self.emit(Op::Dup2);
-                    self.stack_depth += 2;
-                    self.emit(Op::GetElem);
-                    self.stack_depth -= 1;
-                    self.emit(Op::ToNumber);
-                    if !prefix {
-                        self.emit(Op::Dup);
-                        self.stack_depth += 1;
-                        self.emit(step_op);
-                        let tmp = self.str_const("__upd_tmp__");
-                        self.push_scope();
-                        self.emit(Op::DeclareLet(tmp));
-                        self.emit(Op::InitBinding(tmp));
-                        self.stack_depth -= 1;
-                        self.emit(Op::Rot3);
-                        self.emit(Op::Rot3);
-                        self.emit(Op::GetVar(tmp));
-                        self.stack_depth += 1;
-                        self.emit(Op::SetElem);
-                        self.stack_depth -= 2;
+                    if matches!(object.as_ref(), Expr::Super) {
+                        self.emit(Op::PushThis);
                         self.emit(Op::Pop);
+                        self.compile_expr(key)?;
+                        self.emit(Op::PushSuperBase);
+                        self.stack_depth += 1;
+                        self.emit(Op::Swap);
+                        self.emit(Op::ToPropertyKeyOnly);
+                        self.emit(Op::Dup2);
+                        self.stack_depth += 2;
+                        self.emit(Op::GetSuperElemWithBase);
                         self.stack_depth -= 1;
-                        self.pop_scope();
+                        self.emit(Op::ToNumber);
+                        if !prefix {
+                            self.emit(Op::Dup);
+                            self.stack_depth += 1;
+                            self.emit(step_op);
+                            let tmp = self.str_const("__upd_tmp__");
+                            self.push_scope();
+                            self.emit(Op::DeclareLet(tmp));
+                            self.emit(Op::InitBinding(tmp));
+                            self.stack_depth -= 1;
+                            self.emit(Op::Rot3);
+                            self.emit(Op::Rot3);
+                            self.emit(Op::GetVar(tmp));
+                            self.stack_depth += 1;
+                            self.emit(Op::SetSuperElemWithBase);
+                            self.stack_depth -= 2;
+                            self.emit(Op::Pop);
+                            self.stack_depth -= 1;
+                            self.pop_scope();
+                        } else {
+                            self.emit(step_op);
+                            self.emit(Op::SetSuperElemWithBase);
+                            self.stack_depth -= 2;
+                        }
                     } else {
-                        self.emit(step_op);
-                        self.emit(Op::SetElem);
-                        self.stack_depth -= 2;
+                        self.compile_expr(object)?;
+                        self.compile_expr(key)?;
+                        self.emit(Op::ToPropertyKey);
+                        self.emit(Op::Dup2);
+                        self.stack_depth += 2;
+                        self.emit(Op::GetElem);
+                        self.stack_depth -= 1;
+                        self.emit(Op::ToNumber);
+                        if !prefix {
+                            self.emit(Op::Dup);
+                            self.stack_depth += 1;
+                            self.emit(step_op);
+                            let tmp = self.str_const("__upd_tmp__");
+                            self.push_scope();
+                            self.emit(Op::DeclareLet(tmp));
+                            self.emit(Op::InitBinding(tmp));
+                            self.stack_depth -= 1;
+                            self.emit(Op::Rot3);
+                            self.emit(Op::Rot3);
+                            self.emit(Op::GetVar(tmp));
+                            self.stack_depth += 1;
+                            self.emit(Op::SetElem);
+                            self.stack_depth -= 2;
+                            self.emit(Op::Pop);
+                            self.stack_depth -= 1;
+                            self.pop_scope();
+                        } else {
+                            self.emit(step_op);
+                            self.emit(Op::SetElem);
+                            self.stack_depth -= 2;
+                        }
                     }
                 }
             },
@@ -2553,6 +3166,15 @@ impl Compiler {
                     self.emit(Op::SetResolvedBinding(idx));
                     self.stack_depth -= 1;
                 }
+                AssignTarget::ParenIdent(name) => {
+                    let idx = self.str_const(name);
+                    self.emit(Op::ResolveBinding(idx));
+                    self.compile_expr(right)?;
+                    self.emit(Op::Dup);
+                    self.stack_depth += 1;
+                    self.emit(Op::SetResolvedBinding(idx));
+                    self.stack_depth -= 1;
+                }
                 AssignTarget::Member { object, property } => {
                     if matches!(object.as_ref(), Expr::Super) {
                         match property {
@@ -2562,6 +3184,8 @@ impl Compiler {
                                 self.emit(Op::SetSuperProp(idx));
                             }
                             MemberProp::Computed(k) => {
+                                self.emit(Op::PushThis);
+                                self.emit(Op::Pop);
                                 self.compile_expr(k)?;
                                 self.compile_expr(right)?;
                                 self.emit(Op::SetSuperElem);
@@ -2607,7 +3231,8 @@ impl Compiler {
 
         let is_logical = matches!(op, AssignOp::And | AssignOp::Or | AssignOp::Nullish);
         match left {
-            AssignTarget::Ident(name) => {
+            AssignTarget::Ident(name) | AssignTarget::ParenIdent(name) => {
+                let is_paren = matches!(left, AssignTarget::ParenIdent(_));
                 let idx = self.str_const(name);
                 self.emit(Op::ResolveBinding(idx));
                 self.emit(Op::GetResolvedBinding(idx));
@@ -2624,7 +3249,11 @@ impl Compiler {
                     self.stack_depth -= 1;
                     self.emit(Op::Pop);
                     self.stack_depth -= 1;
-                    self.compile_expr_with_name(right, name)?;
+                    if is_paren {
+                        self.compile_expr(right)?;
+                    } else {
+                        self.compile_expr_with_name(right, name)?;
+                    }
                     self.emit(Op::Dup);
                     self.stack_depth += 1;
                     self.emit(Op::SetResolvedBinding(idx));
@@ -2646,6 +3275,84 @@ impl Compiler {
                 }
             }
             AssignTarget::Member { object, property } => {
+                if matches!(object.as_ref(), Expr::Super) {
+                    match property {
+                        MemberProp::Ident(name) => {
+                            let idx = self.str_const(name);
+                            self.emit(Op::GetSuperProp(idx));
+                            self.stack_depth += 1;
+                            if is_logical {
+                                self.emit(Op::Dup);
+                                self.stack_depth += 1;
+                                let j_skip = match op {
+                                    AssignOp::And => self.emit(Op::JumpIfFalse(0)),
+                                    AssignOp::Or => self.emit(Op::JumpIfTrue(0)),
+                                    AssignOp::Nullish => self.emit(Op::JumpIfNotNullish(0)),
+                                    _ => unreachable!(),
+                                };
+                                self.stack_depth -= 1;
+                                self.emit(Op::Pop);
+                                self.stack_depth -= 1;
+                                self.compile_expr(right)?;
+                                self.emit(Op::SetSuperProp(idx));
+                                let skip_ip = self.current_ip();
+                                self.chunk.patch_jump(j_skip, skip_ip);
+                            } else {
+                                self.compile_expr(right)?;
+                                self.emit(Op::Binary(assign_to_binary(op)));
+                                self.stack_depth -= 1;
+                                self.emit(Op::SetSuperProp(idx));
+                            }
+                        }
+                        MemberProp::Computed(k) => {
+                            self.emit(Op::PushThis);
+                            self.emit(Op::Pop);
+                            self.compile_expr(k)?;
+                            self.emit(Op::PushSuperBase);
+                            self.stack_depth += 1;
+                            self.emit(Op::Swap);
+                            self.emit(Op::ToPropertyKeyOnly);
+                            self.emit(Op::Dup2);
+                            self.stack_depth += 2;
+                            self.emit(Op::GetSuperElemWithBase);
+                            self.stack_depth -= 1;
+                            if is_logical {
+                                self.emit(Op::Dup);
+                                self.stack_depth += 1;
+                                let j_skip = match op {
+                                    AssignOp::And => self.emit(Op::JumpIfFalse(0)),
+                                    AssignOp::Or => self.emit(Op::JumpIfTrue(0)),
+                                    AssignOp::Nullish => self.emit(Op::JumpIfNotNullish(0)),
+                                    _ => unreachable!(),
+                                };
+                                self.stack_depth -= 1;
+                                self.emit(Op::Pop);
+                                self.stack_depth -= 1;
+                                self.compile_expr(right)?;
+                                self.emit(Op::SetSuperElemWithBase);
+                                self.stack_depth -= 2;
+                                let j_end = self.emit(Op::Jump(0));
+                                let skip_ip = self.current_ip();
+                                self.chunk.patch_jump(j_skip, skip_ip);
+                                self.emit(Op::Rot3);
+                                self.emit(Op::Pop);
+                                self.emit(Op::Pop);
+                                let end_ip = self.current_ip();
+                                self.chunk.patch_jump(j_end, end_ip);
+                            } else {
+                                self.compile_expr(right)?;
+                                self.emit(Op::Binary(assign_to_binary(op)));
+                                self.stack_depth -= 1;
+                                self.emit(Op::SetSuperElemWithBase);
+                                self.stack_depth -= 2;
+                            }
+                        }
+                        MemberProp::Private(_) => {
+                            return Err(JsError::syntax("Private field on super"));
+                        }
+                    }
+                    return Ok(());
+                }
                 self.compile_expr(object)?;
                 match property {
                     MemberProp::Ident(name) => {
@@ -2773,7 +3480,9 @@ impl Compiler {
             Expr::Function(func) | Expr::Arrow(func) if func.name.is_none() => {
                 let mut named = (**func).clone();
                 named.name = Some(name.to_string());
-                let tmpl = Compiler::compile_function(&named)?;
+                let mut tmpl_val = (*Compiler::compile_function(&named)?).clone();
+                tmpl_val.has_self_name = false;
+                let tmpl = Rc::new(tmpl_val);
                 let idx = self.chunk.add_const(ConstValue::Func(tmpl));
                 self.emit(Op::CreateFunction(idx));
                 self.stack_depth += 1;
@@ -2789,6 +3498,12 @@ impl Compiler {
     }
 
     fn compile_class(&mut self, cls: &ClassNode) -> Result<(), JsError> {
+        let has_name_scope = cls.name.is_some();
+        if let Some(ref n) = cls.name {
+            self.push_scope();
+            let nidx = self.str_const(n);
+            self.emit(Op::DeclareConst(nidx));
+        }
         let has_super = cls.super_class.is_some();
         if let Some(ref sup) = cls.super_class {
             self.compile_expr(sup)?;
@@ -2797,7 +3512,7 @@ impl Compiler {
         let mut constructor = None;
         let mut methods = Vec::new();
         let mut fields = Vec::new();
-        let mut static_blocks = Vec::new();
+        let mut static_inits = Vec::new();
         let mut computed_count = 0u32;
 
         for elem in &cls.elements {
@@ -2809,27 +3524,33 @@ impl Compiler {
                     is_static,
                     is_private,
                 } => {
-                    let tmpl = Compiler::compile_function(func)?;
+                    let mut tmpl_val = (*Compiler::compile_function(func)?).clone();
+                    if *kind != MethodKind::Constructor || *is_static {
+                        tmpl_val.is_method = true;
+                    }
+                    let tmpl = Rc::new(tmpl_val);
                     if *kind == MethodKind::Constructor && !*is_static {
                         constructor = Some(tmpl);
                         continue;
                     }
-                    let (name, is_computed) = match key {
+                    let (name, is_computed, computed_idx) = match key {
                         PropKey::Ident(s) | PropKey::String(s) | PropKey::Private(s) => {
-                            (Some(s.clone()), false)
+                            (Some(s.clone()), false, None)
                         }
                         PropKey::Number(n) => {
-                            (Some(crate::value::number_to_string(*n)), false)
+                            (Some(crate::value::number_to_string(*n)), false, None)
                         }
                         PropKey::Computed(e) => {
+                            let cidx = computed_count as usize;
                             self.compile_expr(e)?;
                             computed_count += 1;
-                            (None, true)
+                            (None, true, Some(cidx))
                         }
                     };
                     methods.push(ClassMethodTemplate {
                         name,
                         is_computed,
+                        computed_idx,
                         is_static: *is_static,
                         is_private: *is_private,
                         kind: *kind,
@@ -2842,33 +3563,48 @@ impl Compiler {
                     is_static,
                     is_private,
                 } => {
-                    let (name, is_computed) = match key {
-                        PropKey::Ident(s) | PropKey::String(s) | PropKey::Private(s) => {
-                            (Some(s.clone()), false)
+                    let (name, is_computed, computed_idx, fn_name) = match key {
+                        PropKey::Ident(s) | PropKey::String(s) => {
+                            (Some(s.clone()), false, None, Some(s.clone()))
+                        }
+                        PropKey::Private(s) => {
+                            (Some(s.clone()), false, None, Some(format!("#{}", s)))
                         }
                         PropKey::Number(n) => {
-                            (Some(crate::value::number_to_string(*n)), false)
+                            let ns = crate::value::number_to_string(*n);
+                            (Some(ns.clone()), false, None, Some(ns))
                         }
                         PropKey::Computed(e) => {
+                            let cidx = computed_count as usize;
                             self.compile_expr(e)?;
                             computed_count += 1;
-                            (None, true)
+                            (None, true, Some(cidx), None)
                         }
                     };
                     let init_chunk = match init {
-                        Some(e) => Some(Compiler::compile_expr_chunk(e, true)?),
+                        Some(e) => {
+                            Some(Compiler::compile_expr_chunk_with_name(e, true, fn_name.as_deref())?)
+                        }
                         None => None,
                     };
-                    fields.push(ClassFieldTemplate {
+                    let ft = ClassFieldTemplate {
                         name,
                         is_computed,
+                        computed_idx,
                         is_static: *is_static,
                         is_private: *is_private,
                         init: init_chunk,
-                    });
+                    };
+                    if *is_static {
+                        static_inits.push(StaticInitTemplate::Field(ft));
+                    } else {
+                        fields.push(ft);
+                    }
                 }
                 ClassElement::StaticBlock(stmts) => {
-                    static_blocks.push(Compiler::compile_block_chunk(stmts, true)?);
+                    static_inits.push(StaticInitTemplate::Block(Compiler::compile_block_chunk(
+                        stmts, true,
+                    )?));
                 }
             }
         }
@@ -2879,14 +3615,68 @@ impl Compiler {
             constructor,
             methods,
             fields,
-            static_blocks,
+            static_inits,
+            source: cls.source.clone(),
         });
         let idx = self.chunk.add_const(ConstValue::Class(tmpl));
         self.emit(Op::CreateClass(idx));
         let popped = computed_count + if has_super { 1 } else { 0 };
         self.stack_depth = self.stack_depth + 1 - popped;
+        if has_name_scope {
+            self.pop_scope();
+        }
         Ok(())
     }
+}
+
+fn chunk_needs_arguments(chunk: &Chunk) -> bool {
+    for c in &chunk.consts {
+        match c {
+            ConstValue::String(s) if s == "arguments" || s == "eval" => return true,
+            ConstValue::Func(f) => {
+                if f.is_arrow && chunk_needs_arguments(&f.chunk) {
+                    return true;
+                }
+            }
+            ConstValue::Class(cls) => {
+                for m in &cls.methods {
+                    if m.func.is_arrow && chunk_needs_arguments(&m.func.chunk) {
+                        return true;
+                    }
+                }
+                for f in &cls.fields {
+                    if let Some(ref ic) = f.init {
+                        if chunk_needs_arguments(ic) {
+                            return true;
+                        }
+                    }
+                }
+                for si in &cls.static_inits {
+                    match si {
+                        StaticInitTemplate::Field(f) => {
+                            if let Some(ref ic) = f.init {
+                                if chunk_needs_arguments(ic) {
+                                    return true;
+                                }
+                            }
+                        }
+                        StaticInitTemplate::Block(b) => {
+                            if chunk_needs_arguments(b) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (_, hf) in &chunk.hoisted_funcs {
+        if hf.is_arrow && chunk_needs_arguments(&hf.chunk) {
+            return true;
+        }
+    }
+    false
 }
 
 fn assign_to_binary(op: AssignOp) -> BinaryOp {
@@ -3066,7 +3856,7 @@ fn expr_may_capture_env(expr: &Expr) -> bool {
         }
         Expr::Assign { left, right, .. } => {
             let lcap = match left {
-                AssignTarget::Ident(_) => false,
+                AssignTarget::Ident(_) | AssignTarget::ParenIdent(_) => false,
                 AssignTarget::Member { object, property } => {
                     expr_may_capture_env(object)
                         || matches!(property, MemberProp::Computed(e) if expr_may_capture_env(e))
@@ -3084,17 +3874,8 @@ fn expr_may_capture_env(expr: &Expr) -> bool {
     }
 }
 
-fn parse_bigint_literal(s: &str) -> Result<i128, JsError> {
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        i128::from_str_radix(hex, 16)
-    } else if let Some(oct) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
-        i128::from_str_radix(oct, 8)
-    } else if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
-        i128::from_str_radix(bin, 2)
-    } else {
-        s.parse::<i128>()
-    }
-    .map_err(|_| JsError::syntax(format!("BigInt literal out of range: {}", s)))
+fn parse_bigint_literal(s: &str) -> Result<crate::bigint::JsBigInt, JsError> {
+    crate::bigint::JsBigInt::parse_literal(s)
 }
 
 fn collect_hoisted(stmts: &[Stmt], chunk: &mut Chunk, strict: bool) -> Result<(), JsError> {
@@ -3148,7 +3929,7 @@ fn collect_hoisted_stmt(
                 }
             }
         }
-        Stmt::FuncDecl(func) if top_level || !strict => {
+        Stmt::FuncDecl(func) if top_level || (!strict && !func.is_async && !func.is_generator) => {
             if let Some(ref name) = func.name {
                 if top_level {
                     let tmpl = Compiler::compile_function(func)?;

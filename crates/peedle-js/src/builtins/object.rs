@@ -770,7 +770,9 @@ pub fn object_to_string(rt: &mut JsRuntime, val: &JsValue) -> Result<String, JsE
     } else {
         match &rt.heap.get_obj(oid).kind {
             ObjectKind::Arguments(_) => "Arguments",
-            ObjectKind::Function(_) | ObjectKind::NativeFunction(_) => "Function",
+            ObjectKind::Function(_)
+            | ObjectKind::NativeFunction(_)
+            | ObjectKind::WrappedFunction { .. } => "Function",
             ObjectKind::Error(_) => "Error",
             ObjectKind::BooleanObj(_) => "Boolean",
             ObjectKind::NumberObj(_) => "Number",

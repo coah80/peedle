@@ -196,10 +196,10 @@ fn validate_atomic_access(
     ta: &TypedArrayData,
     index_arg: Option<&JsValue>,
 ) -> Result<(usize, usize), JsError> {
-    let idx = to_index(rt, index_arg)?;
     let Some(len) = rt.typed_array_effective_length(oid) else {
         return Err(JsError::type_err("TypedArray buffer is detached or out of bounds"));
     };
+    let idx = to_index(rt, index_arg)?;
     if idx >= len {
         return Err(JsError::range("Atomics index out of range"));
     }
@@ -301,7 +301,7 @@ fn write_int_at(bytes: &mut [u8], offset: usize, kind: TypedArrayKind, val: i128
 
 fn int_to_js(val: i128, kind: TypedArrayKind) -> JsValue {
     if kind.is_bigint() {
-        JsValue::BigInt(val)
+        JsValue::BigInt(crate::bigint::JsBigInt::from_i128(val))
     } else {
         JsValue::Number(val as f64)
     }
@@ -314,7 +314,8 @@ fn to_atomic_int(
 ) -> Result<(i128, JsValue), JsError> {
     if kind.is_bigint() {
         let bi = rt.to_bigint(val)?;
-        Ok((bi, JsValue::BigInt(bi)))
+        let raw = bi.to_i128_wrapping();
+        Ok((raw, JsValue::BigInt(bi)))
     } else {
         let n = to_integer_or_infinity(rt.to_number(val)?);
         let norm = if n == 0.0 { 0.0 } else { n };
@@ -456,6 +457,13 @@ fn atomic_rmw(rt: &mut JsRuntime, args: &[JsValue], op: RmwOp) -> Result<JsValue
     let (idx, byte_idx) = validate_atomic_access(rt, oid, &ta, args.get(1))?;
     let (arg_int, _) = to_atomic_int(rt, args.get(2).unwrap_or(&JsValue::Undefined), ta.kind)?;
     check_still_in_bounds(rt, oid, idx)?;
+    if let Some(sb) = rt.shared_buffer_backing(ta.buffer) {
+        let mut guard = sb.data.lock().unwrap();
+        let old = read_int_at(&guard, byte_idx, ta.kind);
+        let new = apply_rmw(op, old, arg_int, ta.kind);
+        write_int_at(&mut guard, byte_idx, ta.kind, new);
+        return Ok(int_to_js(old, ta.kind));
+    }
     let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(ta.buffer).kind else {
         return Err(JsError::type_err("Invalid buffer"));
     };
@@ -473,6 +481,14 @@ fn atomic_compare_exchange(rt: &mut JsRuntime, args: &[JsValue]) -> Result<JsVal
     let (rep_int, _) = to_atomic_int(rt, args.get(3).unwrap_or(&JsValue::Undefined), ta.kind)?;
     check_still_in_bounds(rt, oid, idx)?;
     let exp_trunc = truncate_to_kind(exp_int, ta.kind);
+    if let Some(sb) = rt.shared_buffer_backing(ta.buffer) {
+        let mut guard = sb.data.lock().unwrap();
+        let old = read_int_at(&guard, byte_idx, ta.kind);
+        if old == exp_trunc {
+            write_int_at(&mut guard, byte_idx, ta.kind, rep_int);
+        }
+        return Ok(int_to_js(old, ta.kind));
+    }
     let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(ta.buffer).kind else {
         return Err(JsError::type_err("Invalid buffer"));
     };
@@ -487,6 +503,11 @@ fn atomic_load(rt: &mut JsRuntime, args: &[JsValue]) -> Result<JsValue, JsError>
     let (oid, ta) = validate_integer_typed_array(rt, args.first().unwrap_or(&JsValue::Undefined), false)?;
     let (idx, byte_idx) = validate_atomic_access(rt, oid, &ta, args.get(1))?;
     check_still_in_bounds(rt, oid, idx)?;
+    if let Some(sb) = rt.shared_buffer_backing(ta.buffer) {
+        let guard = sb.data.lock().unwrap();
+        let val = read_int_at(&guard, byte_idx, ta.kind);
+        return Ok(int_to_js(val, ta.kind));
+    }
     let ObjectKind::ArrayBuffer(ref ab) = rt.heap.get_obj(ta.buffer).kind else {
         return Err(JsError::type_err("Invalid buffer"));
     };
@@ -500,6 +521,11 @@ fn atomic_store(rt: &mut JsRuntime, args: &[JsValue]) -> Result<JsValue, JsError
     let (idx, byte_idx) = validate_atomic_access(rt, oid, &ta, args.get(1))?;
     let (arg_int, ret_val) = to_atomic_int(rt, args.get(2).unwrap_or(&JsValue::Undefined), ta.kind)?;
     check_still_in_bounds(rt, oid, idx)?;
+    if let Some(sb) = rt.shared_buffer_backing(ta.buffer) {
+        let mut guard = sb.data.lock().unwrap();
+        write_int_at(&mut guard, byte_idx, ta.kind, arg_int);
+        return Ok(ret_val);
+    }
     let ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(ta.buffer).kind else {
         return Err(JsError::type_err("Invalid buffer"));
     };
@@ -509,32 +535,54 @@ fn atomic_store(rt: &mut JsRuntime, args: &[JsValue]) -> Result<JsValue, JsError
 
 fn atomic_notify(rt: &mut JsRuntime, args: &[JsValue]) -> Result<JsValue, JsError> {
     let (oid, ta) = validate_integer_typed_array(rt, args.first().unwrap_or(&JsValue::Undefined), true)?;
-    let (_idx, _byte_idx) = validate_atomic_access(rt, oid, &ta, args.get(1))?;
-    if let Some(c) = args.get(2) {
-        if !c.is_undefined() {
-            let _ = to_integer_or_infinity(rt.to_number(c)?).max(0.0);
+    let (_idx, byte_idx) = validate_atomic_access(rt, oid, &ta, args.get(1))?;
+    let count = match args.get(2) {
+        None | Some(JsValue::Undefined) => usize::MAX,
+        Some(c) => {
+            let n = to_integer_or_infinity(rt.to_number(c)?).max(0.0);
+            if n.is_infinite() {
+                usize::MAX
+            } else {
+                n as usize
+            }
+        }
+    };
+    let Some(sb) = rt.shared_buffer_backing(ta.buffer) else {
+        return Ok(JsValue::Number(0.0));
+    };
+    if count == 0 {
+        return Ok(JsValue::Number(0.0));
+    }
+    let _data_guard = sb.data.lock().unwrap();
+    let mut waiters_map = sb.waiters.lock().unwrap();
+    let mut woken = 0usize;
+    if let Some(q) = waiters_map.get_mut(&byte_idx) {
+        while woken < count {
+            let Some(entry) = q.pop_front() else {
+                break;
+            };
+            let mut st = entry.state.lock().unwrap();
+            if *st == WaiterState::Waiting {
+                *st = WaiterState::Notified;
+                entry.cv.notify_one();
+                woken += 1;
+            }
         }
     }
-    Ok(JsValue::Number(0.0))
+    Ok(JsValue::Number(woken as f64))
 }
 
 fn atomic_wait(rt: &mut JsRuntime, args: &[JsValue], is_async: bool) -> Result<JsValue, JsError> {
     let (oid, ta) = validate_integer_typed_array(rt, args.first().unwrap_or(&JsValue::Undefined), true)?;
-    let is_shared = rt
-        .heap
-        .buffer_meta
-        .get(&ta.buffer)
-        .map(|m| m.is_shared)
-        .unwrap_or(false);
-    if !is_shared {
+    let Some(sb) = rt.shared_buffer_backing(ta.buffer) else {
         return Err(JsError::type_err(
             "Atomics.wait requires a SharedArrayBuffer",
         ));
-    }
+    };
     let (_idx, byte_idx) = validate_atomic_access(rt, oid, &ta, args.get(1))?;
     let val_arg = args.get(2).unwrap_or(&JsValue::Undefined);
     let expected = if ta.kind == TypedArrayKind::BigInt64 {
-        (rt.to_bigint(val_arg)? as i64) as i128
+        rt.to_bigint(val_arg)?.to_i64_wrapping() as i128
     } else {
         to_int32(rt.to_number(val_arg)?) as i128
     };
@@ -549,10 +597,16 @@ fn atomic_wait(rt: &mut JsRuntime, args: &[JsValue], is_async: bool) -> Result<J
             }
         }
     };
-    let ObjectKind::ArrayBuffer(ref ab) = rt.heap.get_obj(ta.buffer).kind else {
-        return Err(JsError::type_err("Invalid buffer"));
-    };
-    let cur = read_int_at(&ab.bytes, byte_idx, ta.kind);
+    if !is_async && !rt.can_block {
+        return Err(JsError::type_err(
+            "Atomics.wait cannot be called in this context",
+        ));
+    }
+    let data_guard = sb.data.lock().unwrap();
+    if byte_idx + ta.kind.element_size() > data_guard.len() {
+        return Err(JsError::range("Atomics index out of range"));
+    }
+    let cur = read_int_at(&data_guard, byte_idx, ta.kind);
     if !is_async {
         if cur != expected {
             return Ok(JsValue::String("not-equal".into()));
@@ -560,23 +614,79 @@ fn atomic_wait(rt: &mut JsRuntime, args: &[JsValue], is_async: bool) -> Result<J
         if q == 0.0 {
             return Ok(JsValue::String("timed-out".into()));
         }
+        let entry = std::sync::Arc::new(WaiterEntry {
+            state: std::sync::Mutex::new(WaiterState::Waiting),
+            cv: std::sync::Condvar::new(),
+        });
+        {
+            let mut map = sb.waiters.lock().unwrap();
+            map.entry(byte_idx).or_default().push_back(entry.clone());
+        }
+        drop(data_guard);
+        let mut st = entry.state.lock().unwrap();
+        if q.is_infinite() {
+            while *st == WaiterState::Waiting {
+                st = entry.cv.wait(st).unwrap();
+            }
+        } else {
+            let dur = std::time::Duration::from_secs_f64((q / 1000.0).min(86400.0));
+            let deadline = std::time::Instant::now() + dur;
+            while *st == WaiterState::Waiting {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let (next_st, timeout_res) = entry.cv.wait_timeout(st, deadline - now).unwrap();
+                st = next_st;
+                if timeout_res.timed_out() {
+                    break;
+                }
+            }
+        }
+        if *st == WaiterState::Notified {
+            return Ok(JsValue::String("ok".into()));
+        }
+        *st = WaiterState::TimedOut;
+        drop(st);
+        let mut map = sb.waiters.lock().unwrap();
+        if let Some(queue) = map.get_mut(&byte_idx) {
+            queue.retain(|e| !std::sync::Arc::ptr_eq(e, &entry));
+        }
         return Ok(JsValue::String("timed-out".into()));
     }
     let res = rt.create_object();
     if cur != expected {
+        drop(data_guard);
         let _ = rt.set_property(res, "async", JsValue::Boolean(false));
         let _ = rt.set_property(res, "value", JsValue::String("not-equal".into()));
         return Ok(JsValue::Object(res));
     }
     if q == 0.0 {
+        drop(data_guard);
         let _ = rt.set_property(res, "async", JsValue::Boolean(false));
         let _ = rt.set_property(res, "value", JsValue::String("timed-out".into()));
         return Ok(JsValue::Object(res));
     }
-    let p = rt.create_promise();
-    if q.is_finite() {
-        rt.resolve_promise(p, JsValue::String("timed-out".into()));
+    let entry = std::sync::Arc::new(WaiterEntry {
+        state: std::sync::Mutex::new(WaiterState::Waiting),
+        cv: std::sync::Condvar::new(),
+    });
+    {
+        let mut map = sb.waiters.lock().unwrap();
+        map.entry(byte_idx).or_default().push_back(entry.clone());
     }
+    drop(data_guard);
+    let p = rt.create_promise();
+    let deadline = if q.is_finite() {
+        Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_secs_f64((q / 1000.0).min(86400.0)),
+        )
+    } else {
+        None
+    };
+    rt.async_waiters
+        .push((sb, byte_idx, entry, p, deadline));
     let _ = rt.set_property(res, "async", JsValue::Boolean(true));
     let _ = rt.set_property(res, "value", JsValue::Object(p));
     Ok(JsValue::Object(res))

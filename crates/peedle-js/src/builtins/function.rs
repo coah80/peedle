@@ -143,6 +143,7 @@ pub fn init(rt: &mut JsRuntime) {
                 target_proto,
                 ObjectKind::Function(JsFunction {
                     name: bound_name.clone(),
+                    has_self_name: false,
                     chunk,
                     params: Rc::new(Vec::new()),
                     env: rt.global_env,
@@ -202,6 +203,9 @@ pub fn init(rt: &mut JsRuntime) {
                     "function {}() {{ [native code] }}",
                     nf.name
                 ))),
+                ObjectKind::WrappedFunction { .. } => {
+                    Ok(JsValue::String("function () { [native code] }".into()))
+                }
                 ObjectKind::Proxy(_) if rt.is_callable(&this) => {
                     Ok(JsValue::String("function () { [native code] }".into()))
                 }
