@@ -1475,5 +1475,7 @@ input, textarea, select {
 input[type=hidden] { display: none; }
 textarea { white-space: pre-wrap; }
 fieldset { border: 2px groove #c0c0c0; padding: 0.35em 0.75em 0.625em; margin: 0 2px; }
+details:not([open]) > :not(summary) { display: none; }
+summary { cursor: pointer; font-weight: bold; }
 center { text-align: center; }
 ";

@@ -228,6 +228,7 @@ impl Compiler {
                 alternate,
             } => {
                 self.compile_expr(test)?;
+                self.emit_clear_completion();
                 let j_else = self.emit(Op::JumpIfFalse(0));
                 self.stack_depth -= 1;
                 self.compile_stmt(consequent)?;
@@ -245,6 +246,7 @@ impl Compiler {
                 Ok(())
             }
             Stmt::While { test, body } => {
+                self.emit_clear_completion();
                 let break_env = self.env_depth;
                 let break_stack = self.stack_depth;
                 let break_handler = self.handler_depth;
@@ -279,6 +281,7 @@ impl Compiler {
                 Ok(())
             }
             Stmt::DoWhile { body, test } => {
+                self.emit_clear_completion();
                 let break_env = self.env_depth;
                 let break_stack = self.stack_depth;
                 let break_handler = self.handler_depth;
@@ -566,6 +569,14 @@ impl Compiler {
         Ok(())
     }
 
+    fn emit_clear_completion(&mut self) {
+        if self.track_completion {
+            self.emit(Op::PushUndefined);
+            self.emit(Op::SetLastValue);
+            self.emit(Op::Pop);
+        }
+    }
+
     fn compile_for(
         &mut self,
         label: Option<String>,
@@ -639,6 +650,7 @@ impl Compiler {
             None
         };
 
+        self.emit_clear_completion();
         let loop_start = self.current_ip();
         let j_exit = if let Some(t) = test {
             self.compile_expr(t)?;
@@ -688,8 +700,34 @@ impl Compiler {
         right: &Expr,
         body: &Stmt,
     ) -> Result<(), JsError> {
+        let has_lex = matches!(
+            left,
+            ForInOfLeft::VarDecl {
+                kind: VarKind::Let | VarKind::Const,
+                ..
+            }
+        );
+        if has_lex {
+            self.push_scope();
+            if let ForInOfLeft::VarDecl { kind, pattern } = left {
+                let mut names = Vec::new();
+                collect_pattern_names(pattern, &mut names, *kind == VarKind::Const);
+                for (n, is_c) in names {
+                    let idx = self.str_const(&n);
+                    if is_c {
+                        self.emit(Op::DeclareConst(idx));
+                    } else {
+                        self.emit(Op::DeclareLet(idx));
+                    }
+                }
+            }
+        }
         self.compile_expr(right)?;
+        if has_lex {
+            self.pop_scope();
+        }
         self.emit(Op::ForInInit);
+        self.emit_clear_completion();
 
         let break_env = self.env_depth;
         let break_stack = self.stack_depth;
@@ -769,8 +807,40 @@ impl Compiler {
         body: &Stmt,
         is_await: bool,
     ) -> Result<(), JsError> {
+        let has_lex_head = matches!(
+            left,
+            ForInOfLeft::VarDecl {
+                kind: VarKind::Let | VarKind::Const,
+                ..
+            }
+        );
+        if has_lex_head {
+            self.push_scope();
+            if let ForInOfLeft::VarDecl { kind, pattern } = left {
+                let mut names = Vec::new();
+                collect_pattern_names(pattern, &mut names, *kind == VarKind::Const);
+                for (n, is_c) in names {
+                    let idx = self.str_const(&n);
+                    if is_c {
+                        self.emit(Op::DeclareConst(idx));
+                    } else {
+                        self.emit(Op::DeclareLet(idx));
+                    }
+                }
+            }
+        }
         self.compile_expr(right)?;
+        if has_lex_head {
+            self.pop_scope();
+        }
         self.emit(Op::GetIterator(is_await));
+        self.emit_clear_completion();
+
+        let try_push_idx = self.emit(Op::TryPush {
+            catch_ip: None,
+            finally_ip: None,
+        });
+        self.handler_depth += 1;
 
         let break_env = self.env_depth;
         let break_stack = self.stack_depth;
@@ -831,17 +901,23 @@ impl Compiler {
             self.pop_scope();
         }
         self.emit(Op::Jump(loop_start));
-        let break_ip = self.current_ip();
-        self.emit(Op::IteratorClose);
-        let done_ip = self.current_ip();
-        self.chunk.patch_jump(j_done, done_ip);
+        let fin_ip = self.current_ip();
+        self.chunk.ops[try_push_idx] = Op::TryPush {
+            catch_ip: None,
+            finally_ip: Some(fin_ip),
+        };
+        self.chunk.patch_jump(j_done, fin_ip);
         let ctx = self.loops.pop().unwrap();
         for j in ctx.continue_jumps {
             self.chunk.patch_jump(j, loop_start);
         }
         for j in ctx.break_jumps {
-            self.chunk.patch_jump(j, break_ip);
+            self.chunk.patch_jump(j, fin_ip);
         }
+        self.emit(Op::FinallyStart);
+        self.emit(Op::IteratorClose);
+        self.emit(Op::FinallyEnd);
+        self.handler_depth -= 1;
         self.emit(Op::Pop);
         self.stack_depth -= 1;
         Ok(())
@@ -854,6 +930,7 @@ impl Compiler {
         cases: &[SwitchCase],
     ) -> Result<(), JsError> {
         self.compile_expr(discriminant)?;
+        self.emit_clear_completion();
         let break_env = self.env_depth;
         let break_stack = self.stack_depth;
         let break_handler = self.handler_depth;
@@ -870,6 +947,41 @@ impl Compiler {
             cont_stack_depth: break_stack,
             cont_handler_depth: break_handler,
         });
+
+        let mut lex_names = Vec::new();
+        let mut block_funcs = Vec::new();
+        for case in cases {
+            collect_block_lex(&case.consequent, &mut lex_names);
+            for stmt in &case.consequent {
+                if let Stmt::FuncDecl(func) = stmt {
+                    if let Some(ref name) = func.name {
+                        block_funcs.push((name.clone(), func.clone()));
+                    }
+                }
+            }
+        }
+        let has_scope = !lex_names.is_empty() || !block_funcs.is_empty();
+        if has_scope {
+            self.push_scope();
+            for (name, is_c) in lex_names {
+                let idx = self.str_const(&name);
+                if is_c {
+                    self.emit(Op::DeclareConst(idx));
+                } else {
+                    self.emit(Op::DeclareLet(idx));
+                }
+            }
+            for (name, func) in &block_funcs {
+                let tmpl = Compiler::compile_function(func)?;
+                let fidx = self.chunk.add_const(ConstValue::Func(tmpl));
+                let nidx = self.str_const(name);
+                self.emit(Op::DeclareLet(nidx));
+                self.emit(Op::CreateFunction(fidx));
+                self.stack_depth += 1;
+                self.emit(Op::InitBinding(nidx));
+                self.stack_depth -= 1;
+            }
+        }
 
         let mut test_jumps: Vec<(usize, usize)> = Vec::new();
         let mut default_idx: Option<usize> = None;
@@ -891,27 +1003,16 @@ impl Compiler {
         let j_default = self.emit(Op::Jump(0));
 
         let mut case_ips = Vec::with_capacity(cases.len());
-        self.push_scope();
-        let mut lex_names = Vec::new();
-        for case in cases {
-            collect_block_lex(&case.consequent, &mut lex_names);
-        }
-        for (name, is_c) in lex_names {
-            let idx = self.str_const(&name);
-            if is_c {
-                self.emit(Op::DeclareConst(idx));
-            } else {
-                self.emit(Op::DeclareLet(idx));
-            }
-        }
-
         for case in cases {
             case_ips.push(self.current_ip());
             for stmt in &case.consequent {
                 self.compile_stmt(stmt)?;
             }
         }
-        self.pop_scope();
+        let before_pop_ip = self.current_ip();
+        if has_scope {
+            self.pop_scope();
+        }
 
         let end_ip = self.current_ip();
         for (i, j) in test_jumps {
@@ -920,7 +1021,7 @@ impl Compiler {
         if let Some(di) = default_idx {
             self.chunk.patch_jump(j_default, case_ips[di]);
         } else {
-            self.chunk.patch_jump(j_default, end_ip);
+            self.chunk.patch_jump(j_default, before_pop_ip);
         }
 
         let ctx = self.loops.pop().unwrap();
@@ -938,6 +1039,7 @@ impl Compiler {
         handler: &Option<CatchClause>,
         finalizer: &Option<Vec<Stmt>>,
     ) -> Result<(), JsError> {
+        self.emit_clear_completion();
         let try_push_idx = self.emit(Op::TryPush {
             catch_ip: None,
             finally_ip: None,
@@ -952,6 +1054,7 @@ impl Compiler {
 
         if let Some(catch) = handler {
             catch_ip = Some(self.current_ip());
+            self.emit_clear_completion();
             self.stack_depth += 1;
             self.push_scope();
             if let Some(ref pat) = catch.param {
@@ -979,6 +1082,7 @@ impl Compiler {
             if let Some(jc) = j_after_catch {
                 self.chunk.patch_jump(jc, fin_entry);
             }
+            self.emit(Op::FinallyStart);
             self.compile_block_stmts(fin)?;
             self.emit(Op::FinallyEnd);
         } else {
@@ -1213,6 +1317,11 @@ impl Compiler {
             }
             Pattern::Array { elements, rest } => {
                 self.emit(Op::GetIterator(false));
+                let try_push_idx = self.emit(Op::TryPush {
+                    catch_ip: None,
+                    finally_ip: None,
+                });
+                self.handler_depth += 1;
                 for el in elements {
                     self.emit(Op::IteratorNextValue);
                     self.stack_depth += 1;
@@ -1227,14 +1336,22 @@ impl Compiler {
                     self.emit(Op::IteratorRest);
                     self.stack_depth += 1;
                     self.compile_pattern_bind(rest_pat, kind)?;
-                } else {
-                    self.emit(Op::IteratorClose);
                 }
+                let fin_ip = self.current_ip();
+                self.chunk.ops[try_push_idx] = Op::TryPush {
+                    catch_ip: None,
+                    finally_ip: Some(fin_ip),
+                };
+                self.emit(Op::FinallyStart);
+                self.emit(Op::IteratorClose);
+                self.emit(Op::FinallyEnd);
+                self.handler_depth -= 1;
                 self.emit(Op::Pop);
                 self.stack_depth -= 1;
                 Ok(())
             }
             Pattern::Object { props, rest } => {
+                self.emit(Op::RequireObjectCoercible);
                 let mut excluded_names = Vec::new();
                 for prop in props {
                     self.emit(Op::Dup);
@@ -1301,28 +1418,39 @@ impl Compiler {
             }
             Pattern::Array { elements, rest } => {
                 self.emit(Op::GetIterator(false));
+                let try_push_idx = self.emit(Op::TryPush {
+                    catch_ip: None,
+                    finally_ip: None,
+                });
+                self.handler_depth += 1;
                 for el in elements {
-                    self.emit(Op::IteratorNextValue);
-                    self.stack_depth += 1;
                     if let Some(sub) = el {
-                        self.compile_pattern_assign(sub)?;
+                        self.compile_array_assign_elem(sub, false)?;
                     } else {
+                        self.emit(Op::IteratorNextValue);
+                        self.stack_depth += 1;
                         self.emit(Op::Pop);
                         self.stack_depth -= 1;
                     }
                 }
                 if let Some(rest_pat) = rest {
-                    self.emit(Op::IteratorRest);
-                    self.stack_depth += 1;
-                    self.compile_pattern_assign(rest_pat)?;
-                } else {
-                    self.emit(Op::IteratorClose);
+                    self.compile_array_assign_elem(rest_pat, true)?;
                 }
+                let fin_ip = self.current_ip();
+                self.chunk.ops[try_push_idx] = Op::TryPush {
+                    catch_ip: None,
+                    finally_ip: Some(fin_ip),
+                };
+                self.emit(Op::FinallyStart);
+                self.emit(Op::IteratorClose);
+                self.emit(Op::FinallyEnd);
+                self.handler_depth -= 1;
                 self.emit(Op::Pop);
                 self.stack_depth -= 1;
                 Ok(())
             }
             Pattern::Object { props, rest } => {
+                self.emit(Op::RequireObjectCoercible);
                 let mut excluded = Vec::new();
                 for prop in props {
                     self.emit(Op::Dup);
@@ -1362,6 +1490,104 @@ impl Compiler {
                 Ok(())
             }
         }
+    }
+
+    fn compile_array_assign_elem(&mut self, pat: &Pattern, is_rest: bool) -> Result<(), JsError> {
+        let (member_expr, default_expr) = match pat {
+            Pattern::Member(m) => (Some(m.as_ref()), None),
+            Pattern::Assign { left, right } if !is_rest => {
+                if let Pattern::Member(m) = left.as_ref() {
+                    (Some(m.as_ref()), Some(right.as_ref()))
+                } else {
+                    (None, None)
+                }
+            }
+            _ => (None, None),
+        };
+        if let Some(Expr::Member {
+            object, property, ..
+        }) = member_expr
+        {
+            match property {
+                MemberProp::Ident(name) => {
+                    self.compile_expr(object)?;
+                    if is_rest {
+                        self.emit(Op::IteratorRestAt(1));
+                    } else {
+                        self.emit(Op::IteratorNextValueAt(1));
+                    }
+                    self.stack_depth += 1;
+                    if let Some(def) = default_expr {
+                        let j_skip = self.emit(Op::JumpIfNotUndefined(0));
+                        self.emit(Op::Pop);
+                        self.stack_depth -= 1;
+                        self.compile_expr(def)?;
+                        let target = self.current_ip();
+                        self.chunk.patch_jump(j_skip, target);
+                    }
+                    let idx = self.str_const(name);
+                    self.emit(Op::SetProp(idx));
+                    self.stack_depth -= 1;
+                    self.emit(Op::Pop);
+                    self.stack_depth -= 1;
+                    return Ok(());
+                }
+                MemberProp::Private(name) => {
+                    self.compile_expr(object)?;
+                    if is_rest {
+                        self.emit(Op::IteratorRestAt(1));
+                    } else {
+                        self.emit(Op::IteratorNextValueAt(1));
+                    }
+                    self.stack_depth += 1;
+                    if let Some(def) = default_expr {
+                        let j_skip = self.emit(Op::JumpIfNotUndefined(0));
+                        self.emit(Op::Pop);
+                        self.stack_depth -= 1;
+                        self.compile_expr(def)?;
+                        let target = self.current_ip();
+                        self.chunk.patch_jump(j_skip, target);
+                    }
+                    let idx = self.str_const(name);
+                    self.emit(Op::SetPrivate(idx));
+                    self.stack_depth -= 1;
+                    self.emit(Op::Pop);
+                    self.stack_depth -= 1;
+                    return Ok(());
+                }
+                MemberProp::Computed(key) => {
+                    self.compile_expr(object)?;
+                    self.compile_expr(key)?;
+                    self.emit(Op::ToPropertyKeyOnly);
+                    if is_rest {
+                        self.emit(Op::IteratorRestAt(2));
+                    } else {
+                        self.emit(Op::IteratorNextValueAt(2));
+                    }
+                    self.stack_depth += 1;
+                    if let Some(def) = default_expr {
+                        let j_skip = self.emit(Op::JumpIfNotUndefined(0));
+                        self.emit(Op::Pop);
+                        self.stack_depth -= 1;
+                        self.compile_expr(def)?;
+                        let target = self.current_ip();
+                        self.chunk.patch_jump(j_skip, target);
+                    }
+                    self.emit(Op::SetElem);
+                    self.stack_depth -= 2;
+                    self.emit(Op::Pop);
+                    self.stack_depth -= 1;
+                    return Ok(());
+                }
+            }
+        }
+        if is_rest {
+            self.emit(Op::IteratorRest);
+        } else {
+            self.emit(Op::IteratorNextValue);
+        }
+        self.stack_depth += 1;
+        self.compile_pattern_assign(pat)
     }
 
     fn compile_member_assign_from_stack(&mut self, expr: &Expr) -> Result<(), JsError> {
@@ -1477,7 +1703,7 @@ impl Compiler {
             Expr::Array(elems) => {
                 let has_spread_or_hole = elems
                     .iter()
-                    .any(|e| matches!(e, ArrayElem::Spread(_) | ArrayElem::Hole));
+                    .any(|e| matches!(e, ArrayElem::Spread(_, _) | ArrayElem::Hole));
                 if !has_spread_or_hole {
                     for el in elems {
                         if let ArrayElem::Expr(e) = el {
@@ -1500,7 +1726,7 @@ impl Compiler {
                                 self.emit(Op::ArrayPush);
                                 self.stack_depth -= 1;
                             }
-                            ArrayElem::Spread(e) => {
+                            ArrayElem::Spread(e, _) => {
                                 self.compile_expr(e)?;
                                 self.emit(Op::ArraySpread);
                                 self.stack_depth -= 1;
@@ -1514,16 +1740,25 @@ impl Compiler {
                 self.stack_depth += 1;
                 for prop in props {
                     match prop {
-                        ObjectProp::Spread(e) => {
+                        ObjectProp::Spread(e, _) => {
                             self.compile_expr(e)?;
                             self.emit(Op::ObjectSpread);
                             self.stack_depth -= 1;
                         }
-                        ObjectProp::Property { key, value, .. } => match key {
+                        ObjectProp::Property {
+                            key,
+                            value,
+                            shorthand,
+                            ..
+                        } => match key {
                             PropKey::Ident(s) | PropKey::String(s) => {
                                 self.compile_expr(value)?;
                                 let idx = self.str_const(s);
-                                self.emit(Op::ObjectSetProp(idx));
+                                if *shorthand {
+                                    self.emit(Op::ObjectSetOwnProp(idx));
+                                } else {
+                                    self.emit(Op::ObjectSetProp(idx));
+                                }
                                 self.stack_depth -= 1;
                             }
                             PropKey::Number(n) => {
@@ -1535,6 +1770,7 @@ impl Compiler {
                             }
                             PropKey::Computed(k) => {
                                 self.compile_expr(k)?;
+                                self.emit(Op::ToPropertyKeyOnly);
                                 self.compile_expr(value)?;
                                 self.emit(Op::ObjectSetComputed);
                                 self.stack_depth -= 2;
@@ -1607,11 +1843,16 @@ impl Compiler {
             }
             Expr::Template { tag, quasis, exprs } => {
                 if let Some(tag_expr) = tag {
+                    static NEXT_SITE_ID: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(1);
+                    let site_id = NEXT_SITE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let raw: Vec<String> = quasis.iter().map(|q| q.raw.clone()).collect();
                     let cooked: Vec<Option<String>> = quasis.iter().map(|q| q.cooked.clone()).collect();
-                    let tidx = self
-                        .chunk
-                        .add_const(ConstValue::TemplateStrings { raw, cooked });
+                    let tidx = self.chunk.add_const(ConstValue::TemplateStrings {
+                        site_id,
+                        raw,
+                        cooked,
+                    });
                     let argc = (1 + exprs.len()) as u32;
                     if let Expr::Member {
                         object, property, ..
@@ -1646,6 +1887,7 @@ impl Compiler {
                     self.stack_depth += 1;
                     for (i, e) in exprs.iter().enumerate() {
                         self.compile_expr(e)?;
+                        self.emit(Op::ToString);
                         self.emit(Op::Binary(BinaryOp::Add));
                         self.stack_depth -= 1;
                         let part = quasis[i + 1].cooked.as_deref().unwrap_or("");
@@ -1902,18 +2144,24 @@ impl Compiler {
         }
 
         if let Expr::Ident(name) = callee {
-            if name == "eval" && !args.iter().any(|a| matches!(a, CallArg::Spread(_))) {
+            if name == "eval" {
                 let idx = self.str_const("eval");
                 self.emit(Op::GetVar(idx));
                 self.stack_depth += 1;
-                for arg in args {
-                    if let CallArg::Expr(e) = arg {
-                        self.compile_expr(e)?;
+                if !args.iter().any(|a| matches!(a, CallArg::Spread(_))) {
+                    for arg in args {
+                        if let CallArg::Expr(e) = arg {
+                            self.compile_expr(e)?;
+                        }
                     }
+                    let argc = args.len() as u32;
+                    self.emit(Op::CallDirectEval(argc));
+                    self.stack_depth -= argc;
+                } else {
+                    self.compile_args_array(args)?;
+                    self.emit(Op::CallDirectEvalSpread);
+                    self.stack_depth -= 1;
                 }
-                let argc = args.len() as u32;
-                self.emit(Op::CallDirectEval(argc));
-                self.stack_depth -= argc;
                 return Ok(());
             }
         }
@@ -2224,7 +2472,7 @@ impl Compiler {
         if op == AssignOp::Assign {
             match left {
                 AssignTarget::Ident(name) => {
-                    self.compile_expr(right)?;
+                    self.compile_expr_with_name(right, name)?;
                     self.emit(Op::Dup);
                     self.stack_depth += 1;
                     let idx = self.str_const(name);
@@ -2301,7 +2549,7 @@ impl Compiler {
                     self.stack_depth -= 1;
                     self.emit(Op::Pop);
                     self.stack_depth -= 1;
-                    self.compile_expr(right)?;
+                    self.compile_expr_with_name(right, name)?;
                     self.emit(Op::Dup);
                     self.stack_depth += 1;
                     self.emit(Op::SetVar(idx));
@@ -2393,6 +2641,7 @@ impl Compiler {
                     }
                     MemberProp::Computed(k) => {
                         self.compile_expr(k)?;
+                        self.emit(Op::ToPropertyKey);
                         self.emit(Op::Dup2);
                         self.stack_depth += 2;
                         self.emit(Op::GetElem);
@@ -2417,6 +2666,7 @@ impl Compiler {
                             self.chunk.patch_jump(j_skip, skip_ip);
                             self.emit(Op::Rot3);
                             self.emit(Op::Pop);
+                            self.emit(Op::Swap);
                             self.emit(Op::Pop);
                             let end_ip = self.current_ip();
                             self.chunk.patch_jump(j_end, end_ip);

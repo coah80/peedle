@@ -124,11 +124,17 @@ pub fn init(rt: &mut JsRuntime) {
         },
     );
 
-    let ctor = rt.create_native_constructor(
+    let ctor = rt.create_spec_constructor(
         "Object",
         1,
         proto,
         Rc::new(|rt, _, args| {
+            if let Some(JsValue::Object(nt_id)) = rt.native_new_target {
+                if nt_id != rt.intrinsics.object_ctor {
+                    let obj_proto = rt.get_prototype_from_new_target(rt.intrinsics.object_proto)?;
+                    return Ok(JsValue::Object(rt.create_object_with_proto(Some(obj_proto))));
+                }
+            }
             match args.first() {
                 None | Some(JsValue::Undefined) | Some(JsValue::Null) => {
                     Ok(JsValue::Object(rt.create_object()))

@@ -306,6 +306,8 @@ pub struct GeneratorData {
 pub struct ArgumentsData {
     pub values: Vec<JsValue>,
     pub strict: bool,
+    pub mapped_env: Option<EnvId>,
+    pub mapped_params: Vec<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -566,20 +568,19 @@ impl JsObject {
             _ => {}
         }
 
+        if matches!(self.kind, ObjectKind::Array(_) | ObjectKind::StringObj(_)) {
+            strings.push("length".to_string());
+        }
         for item in self.prop_list.iter().flatten() {
             if let Some(idx) = parse_array_index(&item.0) {
                 if seen_idx.insert(idx) {
                     indices.push(idx);
                 }
-            } else {
+            } else if !(matches!(self.kind, ObjectKind::Array(_) | ObjectKind::StringObj(_))
+                && item.0 == "length")
+            {
                 strings.push(item.0.clone());
             }
-        }
-
-        if matches!(self.kind, ObjectKind::Array(_) | ObjectKind::StringObj(_))
-            && !self.prop_index.contains_key("length")
-        {
-            strings.push("length".to_string());
         }
 
         indices.sort_unstable();
@@ -618,12 +619,19 @@ pub struct Binding {
 pub struct EnvRecord {
     pub parent: Option<EnvId>,
     pub bindings: HashMap<String, Binding>,
+    pub lex_names: HashSet<String>,
+    pub var_names: HashSet<String>,
     pub object_env: Option<ObjectId>,
     pub this_binding: Option<JsValue>,
     pub new_target: Option<JsValue>,
     pub super_proto: Option<ObjectId>,
     pub is_function_scope: bool,
+    pub is_param_env: bool,
     pub strict: bool,
+    pub allow_super_call: bool,
+    pub allow_super_prop: bool,
+    pub allow_new_target: bool,
+    pub allow_private: bool,
 }
 
 impl EnvRecord {
@@ -631,12 +639,19 @@ impl EnvRecord {
         EnvRecord {
             parent,
             bindings: HashMap::new(),
+            lex_names: HashSet::new(),
+            var_names: HashSet::new(),
             object_env: None,
             this_binding: None,
             new_target: None,
             super_proto: None,
             is_function_scope,
+            is_param_env: false,
             strict,
+            allow_super_call: false,
+            allow_super_prop: false,
+            allow_new_target: false,
+            allow_private: false,
         }
     }
 }
@@ -886,6 +901,9 @@ impl Heap {
                     ObjectKind::Arguments(a) => {
                         for v in &a.values {
                             trace_value(v, &mut obj_stack);
+                        }
+                        if let Some(me) = a.mapped_env {
+                            env_stack.push(me);
                         }
                     }
                     ObjectKind::ModuleNamespace(m) => {

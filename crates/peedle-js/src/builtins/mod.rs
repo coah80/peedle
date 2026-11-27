@@ -114,7 +114,43 @@ fn init_iterators_and_generators(rt: &mut JsRuntime) {
         }),
     );
 
+    let to_str_tag = rt.symbols.to_string_tag;
+    let iter_protos: [(ObjectId, &str); 5] = [
+        (rt.intrinsics.array_iterator_proto, "Array Iterator"),
+        (rt.intrinsics.string_iterator_proto, "String Iterator"),
+        (rt.intrinsics.map_iterator_proto, "Map Iterator"),
+        (rt.intrinsics.set_iterator_proto, "Set Iterator"),
+        (rt.intrinsics.regexp_string_iterator_proto, "RegExp String Iterator"),
+    ];
+    for (p, tag) in iter_protos {
+        set_method(
+            rt,
+            p,
+            "next",
+            0,
+            Rc::new(|rt, this, _| {
+                let JsValue::Object(oid) = this else {
+                    return Err(JsError::type_err("Iterator.next called on non-object"));
+                };
+                step_builtin_iterator(rt, oid)
+            }),
+        );
+        rt.heap.get_obj_mut(p).set_own_prop(
+            PropertyKey::Symbol(to_str_tag),
+            PropEntry::data(JsValue::String(tag.into()), false, false, true),
+        );
+    }
+
     let gen_proto = rt.intrinsics.generator_proto;
+    rt.heap.get_obj_mut(gen_proto).set_own_prop(
+        PropertyKey::from("constructor"),
+        PropEntry::data(
+            JsValue::Object(rt.intrinsics.generator_function_proto),
+            false,
+            false,
+            true,
+        ),
+    );
     set_method(
         rt,
         gen_proto,
@@ -154,13 +190,25 @@ fn init_iterators_and_generators(rt: &mut JsRuntime) {
             rt.resume_generator(oid, 2, arg)
         }),
     );
-    let to_str_tag = rt.symbols.to_string_tag;
     rt.heap.get_obj_mut(gen_proto).set_own_prop(
         PropertyKey::Symbol(to_str_tag),
         PropEntry::data(JsValue::String("Generator".into()), false, false, true),
     );
 
     let async_gen_proto = rt.intrinsics.async_generator_proto;
+    rt.heap.get_obj_mut(async_gen_proto).set_own_prop(
+        PropertyKey::from("constructor"),
+        PropEntry::data(
+            JsValue::Object(rt.intrinsics.async_generator_function_proto),
+            false,
+            false,
+            true,
+        ),
+    );
+    rt.heap.get_obj_mut(async_gen_proto).set_own_prop(
+        PropertyKey::Symbol(to_str_tag),
+        PropEntry::data(JsValue::String("AsyncGenerator".into()), false, false, true),
+    );
     let sym_async_iter = rt.symbols.async_iterator;
     set_symbol_method(
         rt,
@@ -271,6 +319,9 @@ fn step_builtin_iterator(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, J
             Ok(rt.create_iter_result(JsValue::String(ch_str), false))
         }
         BuiltinIteratorKind::Map { target, mode } => {
+            if idx == usize::MAX {
+                return Ok(rt.create_iter_result(JsValue::Undefined, true));
+            }
             let entry = {
                 let ObjectKind::Map(ref m) = rt.heap.get_obj(target).kind else {
                     return Ok(rt.create_iter_result(JsValue::Undefined, true));
@@ -297,10 +348,16 @@ fn step_builtin_iterator(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, J
                 };
                 Ok(rt.create_iter_result(val, false))
             } else {
+                if let ObjectKind::Iterator(ref mut it) = rt.heap.get_obj_mut(oid).kind {
+                    it.index = usize::MAX;
+                }
                 Ok(rt.create_iter_result(JsValue::Undefined, true))
             }
         }
         BuiltinIteratorKind::Set { target, mode } => {
+            if idx == usize::MAX {
+                return Ok(rt.create_iter_result(JsValue::Undefined, true));
+            }
             let entry = {
                 let ObjectKind::Set(ref s) = rt.heap.get_obj(target).kind else {
                     return Ok(rt.create_iter_result(JsValue::Undefined, true));
@@ -326,6 +383,9 @@ fn step_builtin_iterator(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, J
                 };
                 Ok(rt.create_iter_result(val, false))
             } else {
+                if let ObjectKind::Iterator(ref mut it) = rt.heap.get_obj_mut(oid).kind {
+                    it.index = usize::MAX;
+                }
                 Ok(rt.create_iter_result(JsValue::Undefined, true))
             }
         }
@@ -348,7 +408,18 @@ fn step_builtin_iterator(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, J
                 return Ok(rt.create_iter_result(JsValue::Undefined, true));
             }
             let exec_fn = rt.get_property(regexp, "exec")?;
-            let m = rt.call_function(exec_fn, JsValue::Object(regexp), &[JsValue::String(input)])?;
+            let m = if rt.is_callable(&exec_fn) {
+                let res =
+                    rt.call_function(exec_fn, JsValue::Object(regexp), &[JsValue::String(input)])?;
+                if !res.is_null() && !res.is_object() {
+                    return Err(JsError::type_err(
+                        "RegExp exec method returned something other than an Object or null",
+                    ));
+                }
+                res
+            } else {
+                crate::builtins::regexp::regexp_exec(rt, regexp, &input)?
+            };
             if m.is_null() {
                 if let ObjectKind::Iterator(ref mut it) = rt.heap.get_obj_mut(oid).kind {
                     if let BuiltinIteratorKind::RegExpMatchAll { ref mut done, .. } = it.kind {

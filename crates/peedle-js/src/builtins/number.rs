@@ -83,7 +83,8 @@ fn init_number(rt: &mut JsRuntime) {
                 return Ok(JsValue::String(number_to_string(n)));
             }
             let prec = f as usize;
-            Ok(JsValue::String(format!("{:.*}", prec, n)))
+            let norm = if n == 0.0 { 0.0 } else { n };
+            Ok(JsValue::String(format!("{:.*}", prec, norm)))
         }),
     );
 
@@ -114,8 +115,7 @@ fn init_number(rt: &mut JsRuntime) {
                             "toExponential() argument must be between 0 and 100",
                         ));
                     }
-                    let s = format!("{:.*e}", f as usize, x);
-                    Ok(JsValue::String(normalize_exp(&s)))
+                    Ok(JsValue::String(format_exponential_half_up(x, f as usize)))
                 }
             }
         }),
@@ -420,6 +420,12 @@ fn init_math(rt: &mut JsRuntime) {
             if x < 0.0 && x >= -0.5 {
                 return Ok(JsValue::Number(-0.0));
             }
+            if x > 0.0 && x < 0.5 {
+                return Ok(JsValue::Number(0.0));
+            }
+            if x.fract() == 0.0 {
+                return Ok(JsValue::Number(x));
+            }
             Ok(JsValue::Number((x + 0.5).floor()))
         }),
     );
@@ -591,6 +597,32 @@ fn init_math(rt: &mut JsRuntime) {
     set_method(
         rt,
         math,
+        "sumPrecise",
+        1,
+        Rc::new(|rt, _, args| {
+            let items = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let sym_iter = PropertyKey::Symbol(rt.symbols.iterator);
+            let oid = rt.to_object(&items)?;
+            let iter_fn = rt.get_property_key(oid, &sym_iter)?;
+            if !rt.is_callable(&iter_fn) {
+                return Err(JsError::type_err("Math.sumPrecise argument is not iterable"));
+            }
+            let iter = rt.call_function(iter_fn, items, &[])?;
+            let mut state = SumPreciseState::new();
+            while let Some(v) = rt.iterator_step(&iter)? {
+                let JsValue::Number(n) = v else {
+                    let _ = rt.iterator_close(&iter);
+                    return Err(JsError::type_err("Math.sumPrecise element is not a number"));
+                };
+                state.add(n);
+            }
+            Ok(JsValue::Number(state.finish()))
+        }),
+    );
+
+    set_method(
+        rt,
+        math,
         "random",
         0,
         Rc::new(|_, _, _| {
@@ -603,6 +635,260 @@ fn init_math(rt: &mut JsRuntime) {
     );
 
     set_global(rt, "Math", JsValue::Object(math));
+}
+
+fn format_exponential_half_up(x: f64, frac_digits: usize) -> String {
+    let neg = x.is_sign_negative() && x != 0.0;
+    let abs = x.abs();
+    if abs == 0.0 {
+        let mut s = String::from("0");
+        if frac_digits > 0 {
+            s.push('.');
+            for _ in 0..frac_digits {
+                s.push('0');
+            }
+        }
+        s.push_str("e+0");
+        return s;
+    }
+    let wide = format!("{:.*e}", frac_digits + 40, abs);
+    let (mant, exp_str) = wide.split_once('e').unwrap();
+    let mut exp: i32 = exp_str.parse().unwrap_or(0);
+    let mut digits: Vec<u8> = mant
+        .bytes()
+        .filter(|&b| b.is_ascii_digit())
+        .map(|b| b - b'0')
+        .collect();
+    let keep = frac_digits + 1;
+    let round_up = digits.get(keep).copied().unwrap_or(0) >= 5;
+    digits.truncate(keep);
+    while digits.len() < keep {
+        digits.push(0);
+    }
+    if round_up {
+        let mut carry = 1u8;
+        for d in digits.iter_mut().rev() {
+            let sum = *d + carry;
+            if sum >= 10 {
+                *d = sum - 10;
+                carry = 1;
+            } else {
+                *d = sum;
+                carry = 0;
+                break;
+            }
+        }
+        if carry > 0 {
+            digits.insert(0, 1);
+            digits.truncate(keep);
+            exp += 1;
+        }
+    }
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    out.push((b'0' + digits[0]) as char);
+    if frac_digits > 0 {
+        out.push('.');
+        for &d in &digits[1..] {
+            out.push((b'0' + d) as char);
+        }
+    }
+    if exp >= 0 {
+        out.push_str(&format!("e+{}", exp));
+    } else {
+        out.push_str(&format!("e{}", exp));
+    }
+    out
+}
+
+struct SumPreciseState {
+    acc: [u64; 36],
+    neg: bool,
+    has_nan: bool,
+    has_pos_inf: bool,
+    has_neg_inf: bool,
+    all_neg_zero: bool,
+}
+
+impl SumPreciseState {
+    fn new() -> Self {
+        Self {
+            acc: [0u64; 36],
+            neg: false,
+            has_nan: false,
+            has_pos_inf: false,
+            has_neg_inf: false,
+            all_neg_zero: true,
+        }
+    }
+
+    fn add_mag_at(buf: &mut [u64; 36], mant: u64, bit_pos: usize) {
+        let word = bit_pos / 64;
+        let shift = bit_pos % 64;
+        let lo = mant << shift;
+        let hi = if shift == 0 { 0 } else { mant >> (64 - shift) };
+        let (v0, c0) = buf[word].overflowing_add(lo);
+        buf[word] = v0;
+        let mut carry = (c0 as u128) + (hi as u128);
+        let mut w = word + 1;
+        while carry > 0 && w < 36 {
+            let sum = (buf[w] as u128) + carry;
+            buf[w] = sum as u64;
+            carry = sum >> 64;
+            w += 1;
+        }
+    }
+
+    fn cmp_mag(a: &[u64; 36], b: &[u64; 36]) -> std::cmp::Ordering {
+        for i in (0..36).rev() {
+            if a[i] != b[i] {
+                return a[i].cmp(&b[i]);
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    fn sub_mag(dst: &mut [u64; 36], a: &[u64; 36], b: &[u64; 36]) {
+        let mut borrow = 0u128;
+        for i in 0..36 {
+            let av = a[i] as u128;
+            let bv = (b[i] as u128) + borrow;
+            if av >= bv {
+                dst[i] = (av - bv) as u64;
+                borrow = 0;
+            } else {
+                dst[i] = ((1u128 << 64) + av - bv) as u64;
+                borrow = 1;
+            }
+        }
+    }
+
+    fn add(&mut self, x: f64) {
+        if x.is_nan() {
+            self.has_nan = true;
+            return;
+        }
+        if x.is_infinite() {
+            if x.is_sign_positive() {
+                self.has_pos_inf = true;
+            } else {
+                self.has_neg_inf = true;
+            }
+            return;
+        }
+        if !(x == 0.0 && x.is_sign_negative()) {
+            self.all_neg_zero = false;
+        }
+        if x == 0.0 {
+            return;
+        }
+        let bits = x.to_bits();
+        let x_neg = (bits >> 63) != 0;
+        let exp_raw = ((bits >> 52) & 0x7FF) as usize;
+        let frac = bits & ((1u64 << 52) - 1);
+        let (mant, bit_pos) = if exp_raw == 0 {
+            (frac, 0usize)
+        } else {
+            ((1u64 << 52) | frac, exp_raw - 1)
+        };
+        if x_neg == self.neg {
+            Self::add_mag_at(&mut self.acc, mant, bit_pos);
+        } else {
+            let mut tmp = [0u64; 36];
+            Self::add_mag_at(&mut tmp, mant, bit_pos);
+            match Self::cmp_mag(&self.acc, &tmp) {
+                std::cmp::Ordering::Greater => {
+                    let cur = self.acc;
+                    Self::sub_mag(&mut self.acc, &cur, &tmp);
+                }
+                std::cmp::Ordering::Less => {
+                    let cur = self.acc;
+                    Self::sub_mag(&mut self.acc, &tmp, &cur);
+                    self.neg = x_neg;
+                }
+                std::cmp::Ordering::Equal => {
+                    self.acc = [0u64; 36];
+                    self.neg = false;
+                }
+            }
+        }
+    }
+
+    fn get_bit(&self, pos: usize) -> u64 {
+        (self.acc[pos / 64] >> (pos % 64)) & 1
+    }
+
+    fn any_bit_below(&self, pos: usize) -> bool {
+        let full_words = pos / 64;
+        for i in 0..full_words {
+            if self.acc[i] != 0 {
+                return true;
+            }
+        }
+        let rem = pos % 64;
+        if rem > 0 {
+            let mask = (1u64 << rem) - 1;
+            if (self.acc[full_words] & mask) != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn finish(self) -> f64 {
+        if self.has_nan || (self.has_pos_inf && self.has_neg_inf) {
+            return f64::NAN;
+        }
+        if self.has_pos_inf {
+            return f64::INFINITY;
+        }
+        if self.has_neg_inf {
+            return f64::NEG_INFINITY;
+        }
+        if self.all_neg_zero {
+            return -0.0;
+        }
+        let mut top_word = 35usize;
+        while top_word > 0 && self.acc[top_word] == 0 {
+            top_word -= 1;
+        }
+        if self.acc[top_word] == 0 {
+            return 0.0;
+        }
+        let msb = top_word * 64 + (63 - self.acc[top_word].leading_zeros() as usize);
+        let sign_bit = if self.neg { 1u64 << 63 } else { 0u64 };
+        if msb < 52 {
+            let frac = self.acc[0] & ((1u64 << 52) - 1);
+            return f64::from_bits(sign_bit | frac);
+        }
+        let shift = msb - 52;
+        let mut mant = 0u64;
+        for b in 0..53 {
+            mant |= self.get_bit(shift + b) << b;
+        }
+        let round_up = if shift > 0 {
+            let half = self.get_bit(shift - 1);
+            let sticky = self.any_bit_below(shift - 1);
+            half == 1 && (sticky || (mant & 1) == 1)
+        } else {
+            false
+        };
+        let mut exp_unbiased = shift + 1;
+        if round_up {
+            mant += 1;
+            if mant == (1u64 << 53) {
+                mant >>= 1;
+                exp_unbiased += 1;
+            }
+        }
+        if exp_unbiased >= 0x7FF {
+            return f64::from_bits(sign_bit | (0x7FFu64 << 52));
+        }
+        let frac = mant & ((1u64 << 52) - 1);
+        f64::from_bits(sign_bit | ((exp_unbiased as u64) << 52) | frac)
+    }
 }
 
 fn f64_to_f16_round(x: f64) -> f64 {
@@ -826,19 +1112,16 @@ fn init_boolean(rt: &mut JsRuntime) {
             Ok(JsValue::String(if b { "true" } else { "false" }.into()))
         }),
     );
-    let ctor = rt.create_native_constructor(
+    let ctor = rt.create_spec_constructor(
         "Boolean",
         1,
         proto,
-        Rc::new(|rt, this, args| {
-            let is_new = matches!(
-                this,
-                JsValue::Object(oid) if rt.heap.get_obj(oid).prototype == Some(rt.intrinsics.boolean_proto)
-            );
+        Rc::new(|rt, _, args| {
             let b = args.first().map(|v| v.to_boolean()).unwrap_or(false);
-            if is_new {
+            if matches!(rt.native_new_target, Some(JsValue::Object(_))) {
+                let obj_proto = rt.get_prototype_from_new_target(rt.intrinsics.boolean_proto)?;
                 let obj = rt.heap.alloc_object(JsObject::new(
-                    Some(rt.intrinsics.boolean_proto),
+                    Some(obj_proto),
                     ObjectKind::BooleanObj(b),
                 ));
                 Ok(JsValue::Object(obj))

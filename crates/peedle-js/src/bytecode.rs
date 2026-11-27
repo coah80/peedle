@@ -54,6 +54,7 @@ pub enum ConstValue {
     Class(Rc<ClassTemplate>),
     Names(Vec<String>),
     TemplateStrings {
+        site_id: u64,
         raw: Vec<String>,
         cooked: Vec<Option<String>>,
     },
@@ -113,6 +114,7 @@ pub enum Op {
     ArrayPushHole,
     ArraySpread,
     ObjectSetProp(u32),
+    ObjectSetOwnProp(u32),
     ObjectSetComputed,
     ObjectSetGetter(u32),
     ObjectSetSetter(u32),
@@ -127,6 +129,10 @@ pub enum Op {
     Unary(UnaryOp),
     Binary(BinaryOp),
     ToNumber,
+    ToString,
+    ToPropertyKey,
+    ToPropertyKeyOnly,
+    RequireObjectCoercible,
     Inc,
     Dec,
 
@@ -142,6 +148,7 @@ pub enum Op {
     CallSpread,
     CallMethodSpread,
     CallDirectEval(u32),
+    CallDirectEvalSpread,
     New(u32),
     NewSpread,
 
@@ -152,6 +159,7 @@ pub enum Op {
         finally_ip: Option<u32>,
     },
     TryPop,
+    FinallyStart,
     FinallyEnd,
     Break {
         target: u32,
@@ -165,7 +173,9 @@ pub enum Op {
     GetIterator(bool),
     IteratorNext(u32),
     IteratorNextValue,
+    IteratorNextValueAt(u32),
     IteratorRest,
+    IteratorRestAt(u32),
     IteratorClose,
 
     Yield,
@@ -278,6 +288,7 @@ pub struct TryHandler {
     pub in_catch: bool,
     pub in_finally: bool,
     pub pending: PendingCompletion,
+    pub saved_last_value: Option<JsValue>,
 }
 
 #[derive(Clone)]

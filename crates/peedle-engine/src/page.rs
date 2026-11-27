@@ -656,6 +656,8 @@ impl Page {
                         el.checked = Some(true);
                         st.mark_dirty();
                         act = 1;
+                    } else if itype == "submit" {
+                        act = 3;
                     } else {
                         el.focused = true;
                         st.focused_node = Some(nid);
@@ -667,6 +669,29 @@ impl Page {
                     st.focused_node = Some(nid);
                     st.dirty_style = true;
                     act = 2;
+                }
+            }
+            if act == 0 {
+                if let Some(btn_id) = find_ancestor_tag(&st.doc, nid, "button") {
+                    if let Some(bel) = st.doc.element(btn_id) {
+                        let btype = bel.get_attr("type").unwrap_or("submit").to_ascii_lowercase();
+                        if btype == "submit" {
+                            act = 3;
+                        }
+                    }
+                }
+            }
+            if act == 0 {
+                if let Some(details_id) = find_ancestor_details_from_summary(&st.doc, nid) {
+                    if let Some(det) = st.doc.element_mut(details_id) {
+                        if det.has_attr("open") {
+                            det.remove_attr("open");
+                        } else {
+                            det.set_attr("open", "");
+                        }
+                        st.mark_dirty();
+                        act = 4;
+                    }
                 }
             }
             act
@@ -682,6 +707,23 @@ impl Page {
         if input_action == 2 {
             let _ = self.js_env.dispatch_dom_event(Some(nid), "focus", false, false);
             self.sync_console_from_js();
+            self.recompute_if_needed();
+            return None;
+        }
+        if input_action == 3 {
+            let form_opt = {
+                let st = self.js_env.dom.borrow();
+                find_ancestor_tag(&st.doc, nid, "form")
+            };
+            if let Some(form_id) = form_opt {
+                if let Some(dest) = self.submit_form(form_id) {
+                    return Some(dest);
+                }
+            }
+            self.recompute_if_needed();
+            return None;
+        }
+        if input_action == 4 {
             self.recompute_if_needed();
             return None;
         }
@@ -710,12 +752,17 @@ impl Page {
     }
 
     pub fn on_text_input(&mut self, ch: char) -> bool {
-        let fid_opt = {
+        let (fid_opt, submit_form_id) = {
             let mut st = self.js_env.dom.borrow_mut();
             let Some(fid) = st.focused_node else {
                 return false;
             };
-            if let Some(el) = st.doc.element_mut(fid) {
+            let is_input_enter = ch == '\n'
+                && st.doc.element(fid).map_or(false, |e| e.is_html() && e.tag_is("input"));
+            if is_input_enter {
+                let form_id = find_ancestor_tag(&st.doc, fid, "form");
+                (Some(fid), form_id)
+            } else if let Some(el) = st.doc.element_mut(fid) {
                 let mut val = el.current_value();
                 if ch == '\u{0008}' {
                     val.pop();
@@ -724,11 +771,15 @@ impl Page {
                 }
                 el.input_value = Some(val);
                 st.dirty_layout = true;
-                Some(fid)
+                (Some(fid), None)
             } else {
-                None
+                (None, None)
             }
         };
+        if let Some(form_id) = submit_form_id {
+            let _ = self.submit_form(form_id);
+            return true;
+        }
         if let Some(fid) = fid_opt {
             let _ = self.js_env.dispatch_dom_event(Some(fid), "input", true, false);
             self.sync_console_from_js();
@@ -737,6 +788,163 @@ impl Page {
         }
         false
     }
+
+    pub fn submit_form(&mut self, form_id: NodeId) -> Option<String> {
+        let allow = self
+            .js_env
+            .dispatch_dom_event(Some(form_id), "submit", true, true)
+            .unwrap_or(true);
+        self.sync_console_from_js();
+        if !allow {
+            self.recompute_if_needed();
+            return None;
+        }
+        let (action, method, pairs) = {
+            let st = self.js_env.dom.borrow();
+            let Some(form_el) = st.doc.element(form_id) else {
+                return None;
+            };
+            let action = form_el.get_attr("action").unwrap_or("").to_string();
+            let method = form_el
+                .get_attr("method")
+                .unwrap_or("get")
+                .to_ascii_lowercase();
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for desc in st.doc.descendants(form_id) {
+                let Some(el) = st.doc.element(desc) else {
+                    continue;
+                };
+                if !el.is_html() || el.is_disabled() {
+                    continue;
+                }
+                let Some(name) = el.get_attr("name") else {
+                    continue;
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                if el.tag_is("input") {
+                    let ty = el.get_attr("type").unwrap_or("text").to_ascii_lowercase();
+                    if matches!(ty.as_str(), "submit" | "button" | "reset" | "image" | "file") {
+                        continue;
+                    }
+                    if matches!(ty.as_str(), "checkbox" | "radio") && !el.is_checked() {
+                        continue;
+                    }
+                    pairs.push((name.to_string(), el.current_value()));
+                } else if el.tag_is("textarea") {
+                    pairs.push((name.to_string(), el.current_value()));
+                } else if el.tag_is("select") {
+                    let mut chosen = None;
+                    for opt_id in st.doc.descendants(desc) {
+                        if let Some(opt) = st.doc.element(opt_id) {
+                            if opt.tag_is("option") {
+                                let v = opt
+                                    .get_attr("value")
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| st.doc.text_content(opt_id).trim().to_string());
+                                if opt.has_attr("selected") {
+                                    chosen = Some(v);
+                                    break;
+                                }
+                                if chosen.is_none() {
+                                    chosen = Some(v);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(v) = chosen {
+                        pairs.push((name.to_string(), v));
+                    }
+                }
+            }
+            (action, method, pairs)
+        };
+
+        let encoded = encode_form_urlencoded(&pairs);
+        let base_target = if action.is_empty() {
+            self.url.clone()
+        } else {
+            self.resolve_subresource_url(&action).unwrap_or(action)
+        };
+        if method == "post" {
+            let Ok(parsed_url) = Url::parse(&base_target) else {
+                return None;
+            };
+            let req = peedle_net::HttpRequest {
+                method: peedle_net::HttpMethod::Post,
+                url: parsed_url,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "application/x-www-form-urlencoded".to_string(),
+                )],
+                body: Some(encoded.into_bytes()),
+                max_redirects: 10,
+            };
+            if let Ok(resp) = self.client.send(req) {
+                let final_url = resp.url.href();
+                self.url = final_url.clone();
+                self.base_url = Some(resp.url.clone());
+                self.load_html_string(&resp.text(), &final_url);
+                self.push_history_entry();
+                return Some(final_url);
+            }
+            return None;
+        }
+        let dest = if encoded.is_empty() {
+            base_target
+        } else if base_target.contains('?') {
+            format!("{}&{}", base_target, encoded)
+        } else {
+            format!("{}?{}", base_target, encoded)
+        };
+        let _ = self.navigate(&dest);
+        Some(dest)
+    }
+}
+
+fn find_ancestor_tag(doc: &Document, start: NodeId, tag: &str) -> Option<NodeId> {
+    let mut cur = Some(start);
+    while let Some(id) = cur {
+        if let Some(el) = doc.element(id) {
+            if el.is_html() && el.tag_is(tag) {
+                return Some(id);
+            }
+        }
+        cur = doc.node(id).parent;
+    }
+    None
+}
+
+fn find_ancestor_details_from_summary(doc: &Document, start: NodeId) -> Option<NodeId> {
+    let summary_id = find_ancestor_tag(doc, start, "summary")?;
+    let parent = doc.node(summary_id).parent?;
+    if doc.element(parent).map_or(false, |e| e.is_html() && e.tag_is("details")) {
+        Some(parent)
+    } else {
+        None
+    }
+}
+
+fn encode_form_urlencoded(pairs: &[(String, String)]) -> String {
+    let enc = |s: &str| -> String {
+        let mut out = String::new();
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+                    out.push(b as char);
+                }
+                b' ' => out.push('+'),
+                _ => out.push_str(&format!("%{:02X}", b)),
+            }
+        }
+        out
+    };
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", enc(k), enc(v)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn find_ancestor_href(doc: &Document, start: NodeId) -> Option<String> {

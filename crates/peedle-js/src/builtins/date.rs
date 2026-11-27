@@ -7,6 +7,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Time
 use std::rc::Rc;
 
 const MAX_TIME: f64 = 8.64e15;
+const MS_PER_DAY: f64 = 86_400_000.0;
 
 fn time_clip(t: f64) -> f64 {
     if !t.is_finite() || t.abs() > MAX_TIME {
@@ -14,6 +15,230 @@ fn time_clip(t: f64) -> f64 {
     } else {
         let v = t.trunc();
         if v == 0.0 { 0.0 } else { v }
+    }
+}
+
+fn day_from_year(y: f64) -> f64 {
+    365.0 * (y - 1970.0)
+        + ((y - 1969.0) / 4.0).floor()
+        - ((y - 1901.0) / 100.0).floor()
+        + ((y - 1601.0) / 400.0).floor()
+}
+
+fn in_leap_year(y: f64) -> bool {
+    let yi = y as i64;
+    (yi % 4 == 0 && yi % 100 != 0) || (yi % 400 == 0)
+}
+
+fn day_within_year_for_month(y: f64, m: usize) -> f64 {
+    const NORM: [f64; 12] = [0.0, 31.0, 59.0, 90.0, 120.0, 151.0, 181.0, 212.0, 243.0, 273.0, 304.0, 334.0];
+    const LEAP: [f64; 12] = [0.0, 31.0, 60.0, 91.0, 121.0, 152.0, 182.0, 213.0, 244.0, 274.0, 305.0, 335.0];
+    if in_leap_year(y) { LEAP[m] } else { NORM[m] }
+}
+
+fn make_day_f64(year: f64, month: f64, date: f64) -> f64 {
+    if !year.is_finite() || !month.is_finite() || !date.is_finite() {
+        return f64::NAN;
+    }
+    let y = year.trunc();
+    let m = month.trunc();
+    let dt = date.trunc();
+    let ym = y + (m / 12.0).floor();
+    if !ym.is_finite() {
+        return f64::NAN;
+    }
+    let mn = m.rem_euclid(12.0) as usize;
+    let day = day_from_year(ym) + day_within_year_for_month(ym, mn);
+    day + dt - 1.0
+}
+
+fn make_time_f64(hour: f64, min: f64, sec: f64, ms: f64) -> f64 {
+    if !hour.is_finite() || !min.is_finite() || !sec.is_finite() || !ms.is_finite() {
+        return f64::NAN;
+    }
+    let h = hour.trunc();
+    let m = min.trunc();
+    let s = sec.trunc();
+    let milli = ms.trunc();
+    ((h * 3_600_000.0 + m * 60_000.0) + s * 1_000.0) + milli
+}
+
+fn make_date_f64(day: f64, time: f64) -> f64 {
+    if !day.is_finite() || !time.is_finite() {
+        return f64::NAN;
+    }
+    let tv = day * MS_PER_DAY + time;
+    if !tv.is_finite() { f64::NAN } else { tv }
+}
+
+fn decompose_utc_ms(ms: f64) -> Option<(i32, u32, u32, u32, u32, u32, u32)> {
+    if !ms.is_finite() || ms.abs() > MAX_TIME {
+        return None;
+    }
+    let t = ms.trunc() as i64;
+    let day = t.div_euclid(86_400_000);
+    let rem = t.rem_euclid(86_400_000) as u32;
+    let hour = rem / 3_600_000;
+    let min = (rem % 3_600_000) / 60_000;
+    let sec = (rem % 60_000) / 1_000;
+    let milli = rem % 1_000;
+    let z = day + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    Some((y as i32, m as u32, d as u32, hour, min, sec, milli))
+}
+
+fn format_iso_utc(ms: f64) -> Option<String> {
+    let (y, m, d, h, min, s, milli) = decompose_utc_ms(ms)?;
+    let y_str = if y < 0 {
+        format!("-{:06}", -y)
+    } else if y > 9999 {
+        format!("+{:06}", y)
+    } else {
+        format!("{:04}", y)
+    };
+    Some(format!(
+        "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y_str, m, d, h, min, s, milli
+    ))
+}
+
+fn parse_es_iso_date(s: &str) -> Option<f64> {
+    let bytes = s.as_bytes();
+    let mut i: usize;
+    let (year, neg_zero_year) = if bytes.first() == Some(&b'+') || bytes.first() == Some(&b'-') {
+        let neg = bytes[0] == b'-';
+        if bytes.len() < 7 || !bytes[1..7].iter().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let yv: i64 = s[1..7].parse().ok()?;
+        i = 7;
+        if neg && yv == 0 {
+            (0i64, true)
+        } else {
+            (if neg { -yv } else { yv }, false)
+        }
+    } else {
+        if bytes.len() < 4 || !bytes[0..4].iter().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let yv: i64 = s[0..4].parse().ok()?;
+        i = 4;
+        (yv, false)
+    };
+    if neg_zero_year {
+        return Some(f64::NAN);
+    }
+    let mut month: i64 = 1;
+    let mut day: i64 = 1;
+    if i < bytes.len() && bytes[i] == b'-' {
+        if i + 3 > bytes.len() || !bytes[i + 1..i + 3].iter().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        month = s[i + 1..i + 3].parse().ok()?;
+        if !(1..=12).contains(&month) {
+            return Some(f64::NAN);
+        }
+        i += 3;
+        if i < bytes.len() && bytes[i] == b'-' {
+            if i + 3 > bytes.len() || !bytes[i + 1..i + 3].iter().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            day = s[i + 1..i + 3].parse().ok()?;
+            if !(1..=31).contains(&day) {
+                return Some(f64::NAN);
+            }
+            i += 3;
+        }
+    }
+    if i == bytes.len() {
+        let d = make_day_f64(year as f64, (month - 1) as f64, day as f64);
+        return Some(time_clip(make_date_f64(d, 0.0)));
+    }
+    if bytes[i] != b'T' {
+        return None;
+    }
+    i += 1;
+    if i + 5 > bytes.len()
+        || !bytes[i..i + 2].iter().all(|b| b.is_ascii_digit())
+        || bytes[i + 2] != b':'
+        || !bytes[i + 3..i + 5].iter().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let hour: i64 = s[i..i + 2].parse().ok()?;
+    let min: i64 = s[i + 3..i + 5].parse().ok()?;
+    i += 5;
+    let mut sec: i64 = 0;
+    let mut milli: i64 = 0;
+    if i < bytes.len() && bytes[i] == b':' {
+        if i + 3 > bytes.len() || !bytes[i + 1..i + 3].iter().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        sec = s[i + 1..i + 3].parse().ok()?;
+        i += 3;
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            let frac_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == frac_start {
+                return None;
+            }
+            let frac = &s[frac_start..i];
+            let mut ms_str = String::new();
+            for ch in frac.chars().take(3) {
+                ms_str.push(ch);
+            }
+            while ms_str.len() < 3 {
+                ms_str.push('0');
+            }
+            milli = ms_str.parse().ok()?;
+        }
+    }
+    if hour > 24 || min > 59 || sec > 59 || (hour == 24 && (min != 0 || sec != 0 || milli != 0)) {
+        return Some(f64::NAN);
+    }
+    let tz_offset_ms: Option<f64> = if i == bytes.len() {
+        None
+    } else if bytes[i] == b'Z' && i + 1 == bytes.len() {
+        Some(0.0)
+    } else if (bytes[i] == b'+' || bytes[i] == b'-') && i + 6 == bytes.len() && bytes[i + 3] == b':'
+        && bytes[i + 1..i + 3].iter().all(|b| b.is_ascii_digit())
+        && bytes[i + 4..i + 6].iter().all(|b| b.is_ascii_digit())
+    {
+        let sign = if bytes[i] == b'-' { -1.0 } else { 1.0 };
+        let th: f64 = s[i + 1..i + 3].parse().ok()?;
+        let tm: f64 = s[i + 4..i + 6].parse().ok()?;
+        if th > 23.0 || tm > 59.0 {
+            return Some(f64::NAN);
+        }
+        Some(sign * (th * 3_600_000.0 + tm * 60_000.0))
+    } else {
+        return None;
+    };
+    let d = make_day_f64(year as f64, (month - 1) as f64, day as f64);
+    let tm = make_time_f64(hour as f64, min as f64, sec as f64, milli as f64);
+    let utc = make_date_f64(d, tm);
+    if let Some(off) = tz_offset_ms {
+        Some(time_clip(utc - off))
+    } else {
+        if let Some(dt) = dt_from_ms(utc) {
+            let off = Local.offset_from_utc_datetime(&dt.naive_utc());
+            Some(time_clip(utc - (off.local_minus_utc() as f64) * 1000.0))
+        } else {
+            Some(time_clip(utc))
+        }
     }
 }
 
@@ -46,24 +271,22 @@ fn make_local_ms(y: i32, m: i32, d: i32, h: i32, min: i32, s: i32, ms: i32) -> f
 }
 
 fn make_utc_ms(y: i32, m: i32, d: i32, h: i32, min: i32, s: i32, ms: i32) -> f64 {
-    let total_months = y as i64 * 12 + m as i64;
-    let year = total_months.div_euclid(12) as i32;
-    let month = total_months.rem_euclid(12) as u32 + 1;
-    let Some(base_date) = NaiveDate::from_ymd_opt(year, month, 1) else {
-        return f64::NAN;
-    };
-    let day_offset = (d as i64) - 1;
-    let total_ms = day_offset * 86_400_000
-        + (h as i64) * 3_600_000
-        + (min as i64) * 60_000
-        + (s as i64) * 1_000
-        + (ms as i64);
-    let base_dt = base_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-    time_clip((base_dt.timestamp_millis() + total_ms) as f64)
+    let day = make_day_f64(y as f64, m as f64, d as f64);
+    let time = make_time_f64(h as f64, min as f64, s as f64, ms as f64);
+    time_clip(make_date_f64(day, time))
 }
 
 fn parse_date_string(s: &str) -> f64 {
     let trimmed = s.trim();
+    if let Some(iso_ms) = parse_es_iso_date(trimmed) {
+        return iso_ms;
+    }
+    if let Ok(dt) = DateTime::parse_from_str(trimmed, "%a %b %d %Y %H:%M:%S GMT%z") {
+        return time_clip(dt.timestamp_millis() as f64);
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, "%a, %d %b %Y %H:%M:%S GMT") {
+        return time_clip(ndt.and_utc().timestamp_millis() as f64);
+    }
     if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
         return time_clip(dt.timestamp_millis() as f64);
     }
@@ -377,7 +600,10 @@ pub fn init(rt: &mut JsRuntime) {
         Rc::new(|rt, this, _| {
             let ms = this_time(rt, &this)?;
             let off = local_dt_from_ms(ms)
-                .map(|d| -(d.offset().local_minus_utc() as f64) / 60.0)
+                .map(|d| {
+                    let v = -(d.offset().local_minus_utc() as f64) / 60.0;
+                    if v == 0.0 { 0.0 } else { v }
+                })
                 .unwrap_or(f64::NAN);
             Ok(JsValue::Number(off))
         }),
@@ -390,10 +616,10 @@ pub fn init(rt: &mut JsRuntime) {
         0,
         Rc::new(|rt, this, _| {
             let ms = this_time(rt, &this)?;
-            let Some(dt) = dt_from_ms(ms) else {
+            let Some(s) = format_iso_utc(ms) else {
                 return Err(JsError::range("Invalid time value"));
             };
-            Ok(JsValue::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
+            Ok(JsValue::String(s))
         }),
     );
 
@@ -523,7 +749,10 @@ pub fn init(rt: &mut JsRuntime) {
         Rc::new(|rt, this, args| {
             let t = this_time(rt, &this)?;
             let ms = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
-            if !t.is_finite() || !ms.is_finite() {
+            if !t.is_finite() {
+                return Ok(JsValue::Number(f64::NAN));
+            }
+            if !ms.is_finite() {
                 return set_this_time(rt, &this, f64::NAN);
             }
             let Some(dt) = local_dt_from_ms(t) else {
@@ -549,7 +778,10 @@ pub fn init(rt: &mut JsRuntime) {
         Rc::new(|rt, this, args| {
             let t = this_time(rt, &this)?;
             let ms = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
-            if !t.is_finite() || !ms.is_finite() {
+            if !t.is_finite() {
+                return Ok(JsValue::Number(f64::NAN));
+            }
+            if !ms.is_finite() {
                 return set_this_time(rt, &this, f64::NAN);
             }
             let Some(dt) = dt_from_ms(t) else {
@@ -579,7 +811,10 @@ pub fn init(rt: &mut JsRuntime) {
                 Some(v) => Some(rt.to_number(v)?),
                 None => None,
             };
-            if !t.is_finite() || !sec.is_finite() || ms_arg.is_some_and(|m| !m.is_finite()) {
+            if !t.is_finite() {
+                return Ok(JsValue::Number(f64::NAN));
+            }
+            if !sec.is_finite() || ms_arg.is_some_and(|m| !m.is_finite()) {
                 return set_this_time(rt, &this, f64::NAN);
             }
             let Some(dt) = local_dt_from_ms(t) else {
@@ -602,7 +837,10 @@ pub fn init(rt: &mut JsRuntime) {
                 Some(v) => Some(rt.to_number(v)?),
                 None => None,
             };
-            if !t.is_finite() || !sec.is_finite() || ms_arg.is_some_and(|m| !m.is_finite()) {
+            if !t.is_finite() {
+                return Ok(JsValue::Number(f64::NAN));
+            }
+            if !sec.is_finite() || ms_arg.is_some_and(|m| !m.is_finite()) {
                 return set_this_time(rt, &this, f64::NAN);
             }
             let Some(dt) = dt_from_ms(t) else {
@@ -623,7 +861,10 @@ pub fn init(rt: &mut JsRuntime) {
             let min = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
             let sec_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
             let ms_arg = match args.get(2) { Some(v) => Some(rt.to_number(v)?), None => None };
-            if !t.is_finite() || !min.is_finite() || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
+            if !t.is_finite() {
+                return Ok(JsValue::Number(f64::NAN));
+            }
+            if !min.is_finite() || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
                 return set_this_time(rt, &this, f64::NAN);
             }
             let Some(dt) = local_dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
@@ -643,7 +884,10 @@ pub fn init(rt: &mut JsRuntime) {
             let min = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
             let sec_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
             let ms_arg = match args.get(2) { Some(v) => Some(rt.to_number(v)?), None => None };
-            if !t.is_finite() || !min.is_finite() || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
+            if !t.is_finite() {
+                return Ok(JsValue::Number(f64::NAN));
+            }
+            if !min.is_finite() || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
                 return set_this_time(rt, &this, f64::NAN);
             }
             let Some(dt) = dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
@@ -664,7 +908,10 @@ pub fn init(rt: &mut JsRuntime) {
             let min_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
             let sec_arg = match args.get(2) { Some(v) => Some(rt.to_number(v)?), None => None };
             let ms_arg = match args.get(3) { Some(v) => Some(rt.to_number(v)?), None => None };
-            if !t.is_finite() || !hr.is_finite() || min_arg.is_some_and(|x| !x.is_finite()) || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
+            if !t.is_finite() {
+                return Ok(JsValue::Number(f64::NAN));
+            }
+            if !hr.is_finite() || min_arg.is_some_and(|x| !x.is_finite()) || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
                 return set_this_time(rt, &this, f64::NAN);
             }
             let Some(dt) = local_dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
@@ -686,7 +933,10 @@ pub fn init(rt: &mut JsRuntime) {
             let min_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
             let sec_arg = match args.get(2) { Some(v) => Some(rt.to_number(v)?), None => None };
             let ms_arg = match args.get(3) { Some(v) => Some(rt.to_number(v)?), None => None };
-            if !t.is_finite() || !hr.is_finite() || min_arg.is_some_and(|x| !x.is_finite()) || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
+            if !t.is_finite() {
+                return Ok(JsValue::Number(f64::NAN));
+            }
+            if !hr.is_finite() || min_arg.is_some_and(|x| !x.is_finite()) || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
                 return set_this_time(rt, &this, f64::NAN);
             }
             let Some(dt) = dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
@@ -705,7 +955,8 @@ pub fn init(rt: &mut JsRuntime) {
         Rc::new(|rt, this, args| {
             let t = this_time(rt, &this)?;
             let d = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
-            if !t.is_finite() || !d.is_finite() { return set_this_time(rt, &this, f64::NAN); }
+            if !t.is_finite() { return Ok(JsValue::Number(f64::NAN)); }
+            if !d.is_finite() { return set_this_time(rt, &this, f64::NAN); }
             let Some(dt) = local_dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
             let new_t = make_local_ms(dt.year(), dt.month0() as i32, d.trunc() as i32, dt.hour() as i32, dt.minute() as i32, dt.second() as i32, (dt.timestamp_subsec_millis() % 1000) as i32);
             set_this_time(rt, &this, new_t)
@@ -719,7 +970,8 @@ pub fn init(rt: &mut JsRuntime) {
         Rc::new(|rt, this, args| {
             let t = this_time(rt, &this)?;
             let d = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
-            if !t.is_finite() || !d.is_finite() { return set_this_time(rt, &this, f64::NAN); }
+            if !t.is_finite() { return Ok(JsValue::Number(f64::NAN)); }
+            if !d.is_finite() { return set_this_time(rt, &this, f64::NAN); }
             let Some(dt) = dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
             let new_t = make_utc_ms(dt.year(), dt.month0() as i32, d.trunc() as i32, dt.hour() as i32, dt.minute() as i32, dt.second() as i32, (dt.timestamp_subsec_millis() % 1000) as i32);
             set_this_time(rt, &this, new_t)
@@ -734,7 +986,8 @@ pub fn init(rt: &mut JsRuntime) {
             let t = this_time(rt, &this)?;
             let m = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
             let d_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
-            if !t.is_finite() || !m.is_finite() || d_arg.is_some_and(|x| !x.is_finite()) { return set_this_time(rt, &this, f64::NAN); }
+            if !t.is_finite() { return Ok(JsValue::Number(f64::NAN)); }
+            if !m.is_finite() || d_arg.is_some_and(|x| !x.is_finite()) { return set_this_time(rt, &this, f64::NAN); }
             let Some(dt) = local_dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
             let d = d_arg.map(|x| x.trunc() as i32).unwrap_or(dt.day() as i32);
             let new_t = make_local_ms(dt.year(), m.trunc() as i32, d, dt.hour() as i32, dt.minute() as i32, dt.second() as i32, (dt.timestamp_subsec_millis() % 1000) as i32);
@@ -750,7 +1003,8 @@ pub fn init(rt: &mut JsRuntime) {
             let t = this_time(rt, &this)?;
             let m = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
             let d_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
-            if !t.is_finite() || !m.is_finite() || d_arg.is_some_and(|x| !x.is_finite()) { return set_this_time(rt, &this, f64::NAN); }
+            if !t.is_finite() { return Ok(JsValue::Number(f64::NAN)); }
+            if !m.is_finite() || d_arg.is_some_and(|x| !x.is_finite()) { return set_this_time(rt, &this, f64::NAN); }
             let Some(dt) = dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
             let d = d_arg.map(|x| x.trunc() as i32).unwrap_or(dt.day() as i32);
             let new_t = make_utc_ms(dt.year(), m.trunc() as i32, d, dt.hour() as i32, dt.minute() as i32, dt.second() as i32, (dt.timestamp_subsec_millis() % 1000) as i32);
@@ -982,17 +1236,15 @@ pub fn init(rt: &mut JsRuntime) {
             {
                 return Ok(JsValue::Number(f64::NAN));
             }
-            let yi = y.trunc() as i32;
-            let full_y = if (0..=99).contains(&yi) { 1900 + yi } else { yi };
-            Ok(JsValue::Number(make_utc_ms(
-                full_y,
-                m.trunc() as i32,
-                d.trunc() as i32,
-                h.trunc() as i32,
-                min.trunc() as i32,
-                s.trunc() as i32,
-                ms_v.trunc() as i32,
-            )))
+            let y_trunc = y.trunc();
+            let full_y = if y_trunc >= 0.0 && y_trunc <= 99.0 {
+                1900.0 + y_trunc
+            } else {
+                y_trunc
+            };
+            let day = make_day_f64(full_y, m, d);
+            let time = make_time_f64(h, min, s, ms_v);
+            Ok(JsValue::Number(time_clip(make_date_f64(day, time))))
         }),
     );
 

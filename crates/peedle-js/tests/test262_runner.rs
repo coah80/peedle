@@ -191,7 +191,7 @@ fn run_single_test(
     harness_cache: &HashMap<String, String>,
 ) -> Result<(), String> {
     let mut rt = JsRuntime::new();
-    rt.max_steps = Some(10_000_000);
+    rt.max_steps = Some(100_000_000);
     rt.max_call_depth = 128;
 
     let is_async = meta.flags.iter().any(|f| f == "async");
@@ -292,9 +292,20 @@ fn error_matches_type(rt: &mut JsRuntime, err: &JsError, expected: &str) -> bool
         }
         JsError::Thrown(JsValue::Object(oid)) => {
             if let Ok(name_v) = rt.get_property(*oid, "name") {
-                if let Ok(name) = rt.to_string(&name_v) {
-                    if name == expected {
-                        return true;
+                if !name_v.is_undefined() {
+                    if let Ok(name) = rt.to_string(&name_v) {
+                        if name == expected {
+                            return true;
+                        }
+                    }
+                }
+            }
+            if let Ok(JsValue::Object(ctor)) = rt.get_property(*oid, "constructor") {
+                if let Ok(name_v) = rt.get_property(ctor, "name") {
+                    if let Ok(name) = rt.to_string(&name_v) {
+                        if name == expected {
+                            return true;
+                        }
                     }
                 }
             }
@@ -323,32 +334,99 @@ fn test262_broad_suite() {
         }
     }
 
-    let suites: [(&str, usize); 29] = [
+    let suites: &[(&str, usize)] = &[
         ("language/types", 200),
-        ("language/expressions", 400),
-        ("language/statements", 400),
-        ("language/block-scope", 150),
+        ("language/literals", 600),
+        ("language/identifiers", 300),
+        ("language/identifier-resolution", 50),
+        ("language/white-space", 100),
+        ("language/line-terminators", 100),
+        ("language/comments", 100),
+        ("language/asi", 150),
+        ("language/keywords", 50),
+        ("language/reserved-words", 50),
+        ("language/future-reserved-words", 100),
+        ("language/punctuators", 50),
+        ("language/directive-prologue", 100),
+        ("language/statementList", 100),
+        ("language/global-code", 100),
+        ("language/function-code", 250),
+        ("language/arguments-object", 300),
+        ("language/eval-code", 350),
+        ("language/block-scope", 200),
+        ("language/computed-property-names", 100),
         ("language/destructuring", 50),
         ("language/rest-parameters", 50),
-        ("built-ins/Object", 350),
-        ("built-ins/Array", 350),
-        ("built-ins/String", 300),
-        ("built-ins/Number", 250),
-        ("built-ins/Math", 250),
+        ("language/expressions", 400),
+        ("language/expressions/template-literal", 100),
+        ("language/expressions/tagged-template", 50),
+        ("language/expressions/optional-chaining", 50),
+        ("language/expressions/coalesce", 50),
+        ("language/expressions/logical-assignment", 100),
+        ("language/expressions/call", 100),
+        ("language/expressions/new", 100),
+        ("language/expressions/assignment", 200),
+        ("language/expressions/object", 200),
+        ("language/expressions/function", 200),
+        ("language/expressions/generators", 200),
+        ("language/statements", 400),
+        ("language/statements/const", 150),
+        ("language/statements/let", 150),
+        ("language/statements/variable", 200),
+        ("language/statements/for", 200),
+        ("language/statements/for-in", 150),
+        ("language/statements/for-of", 200),
+        ("language/statements/try", 250),
+        ("language/statements/switch", 150),
+        ("language/statements/if", 100),
+        ("language/statements/while", 50),
+        ("language/statements/do-while", 50),
+        ("language/statements/function", 200),
+        ("language/statements/generators", 200),
+        ("built-ins/global", 50),
+        ("built-ins/Infinity", 20),
+        ("built-ins/NaN", 20),
+        ("built-ins/undefined", 20),
+        ("built-ins/isFinite", 30),
+        ("built-ins/isNaN", 30),
+        ("built-ins/parseFloat", 100),
+        ("built-ins/parseInt", 100),
+        ("built-ins/decodeURI", 100),
+        ("built-ins/decodeURIComponent", 100),
+        ("built-ins/encodeURI", 50),
+        ("built-ins/encodeURIComponent", 50),
+        ("built-ins/eval", 50),
+        ("built-ins/Object", 600),
+        ("built-ins/Array", 600),
+        ("built-ins/String", 500),
+        ("built-ins/Number", 350),
+        ("built-ins/Math", 350),
         ("built-ins/JSON", 200),
         ("built-ins/Map", 250),
-        ("built-ins/Set", 250),
-        ("built-ins/Promise", 250),
-        ("built-ins/Proxy", 250),
+        ("built-ins/Set", 400),
+        ("built-ins/Promise", 400),
+        ("built-ins/Proxy", 350),
         ("built-ins/Reflect", 200),
-        ("built-ins/RegExp", 250),
-        ("built-ins/TypedArray", 250),
-        ("built-ins/Function", 250),
+        ("built-ins/RegExp", 400),
+        ("built-ins/TypedArray", 400),
+        ("built-ins/TypedArrayConstructors", 300),
+        ("built-ins/Function", 400),
+        ("built-ins/GeneratorFunction", 50),
+        ("built-ins/GeneratorPrototype", 100),
+        ("built-ins/AsyncFunction", 50),
+        ("built-ins/ArrayIteratorPrototype", 50),
+        ("built-ins/StringIteratorPrototype", 20),
+        ("built-ins/MapIteratorPrototype", 20),
+        ("built-ins/SetIteratorPrototype", 20),
+        ("built-ins/RegExpStringIteratorPrototype", 30),
         ("built-ins/Symbol", 150),
         ("built-ins/Error", 150),
+        ("built-ins/NativeErrors", 150),
+        ("built-ins/AggregateError", 50),
+        ("built-ins/ThrowTypeError", 30),
         ("built-ins/ArrayBuffer", 250),
-        ("built-ins/DataView", 250),
-        ("built-ins/Date", 250),
+        ("built-ins/DataView", 400),
+        ("built-ins/Date", 400),
         ("built-ins/BigInt", 100),
         ("built-ins/Boolean", 100),
         ("built-ins/WeakMap", 150),
@@ -358,7 +436,7 @@ fn test262_broad_suite() {
     let filter = std::env::var("TEST262_FILTER").ok();
     let trace = std::env::var("TEST262_TRACE").is_ok();
     let mut suite_files: Vec<(&str, Vec<PathBuf>)> = Vec::new();
-    for (suite, limit) in suites {
+    for &(suite, limit) in suites {
         if let Some(ref flt) = filter {
             if !suite.contains(flt.as_str()) {
                 continue;
@@ -487,9 +565,13 @@ fn test262_broad_suite() {
         eprintln!("  FAIL: {}", s);
     }
     if filter.is_none() {
-        assert!(grand >= 5000, "Expected at least 5000 Test262 tests run, got {}", grand);
         assert!(
-            grand_pct >= 95.0,
+            grand >= 10000,
+            "Expected at least 10000 Test262 tests run, got {}",
+            grand
+        );
+        assert!(
+            grand_pct >= 99.0,
             "Test262 pass rate too low: {:.1}% ({}/{})",
             grand_pct,
             total_pass,

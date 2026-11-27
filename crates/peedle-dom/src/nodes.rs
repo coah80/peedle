@@ -1366,7 +1366,10 @@ pub fn define_element_proto(
                     && ((e.tag_is("iframe") && name.eq_ignore_ascii_case("src"))
                         || (e.tag_is("object") && name.eq_ignore_ascii_case("data")))
             });
+            let old_val = st.doc.element(nid).and_then(|e| e.get_attr(&name).map(|s| s.to_string()));
+            let attr_name = name.clone();
             st.doc.set_attribute(nid, name, val);
+            st.record_mutation("attributes", nid, Some(attr_name), old_val);
             if is_embed_url {
                 st.sub_documents.remove(&nid);
                 if st.doc.is_ancestor(st.doc.root, nid) && !st.pending_subdoc_loads.contains(&nid) {
@@ -1389,7 +1392,9 @@ pub fn define_element_proto(
             };
             let name = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
             let mut st = d.borrow_mut();
+            let old_val = st.doc.element(nid).and_then(|e| e.get_attr(&name).map(|s| s.to_string()));
             st.doc.remove_attribute(nid, &name);
+            st.record_mutation("attributes", nid, Some(name), old_val);
             st.mark_dirty_for(nid);
             Ok(JsValue::Undefined)
         }),
@@ -1423,7 +1428,10 @@ pub fn define_element_proto(
             let name = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
             let val = args.get(2).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
             let mut st = d.borrow_mut();
+            let old_val = st.doc.element(nid).and_then(|e| e.get_attr(&name).map(|s| s.to_string()));
+            let attr_name = name.clone();
             st.doc.set_attribute(nid, name, val);
+            st.record_mutation("attributes", nid, Some(attr_name), old_val);
             st.mark_dirty();
             Ok(JsValue::Undefined)
         }),
@@ -1440,7 +1448,9 @@ pub fn define_element_proto(
             };
             let name = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
             let mut st = d.borrow_mut();
+            let old_val = st.doc.element(nid).and_then(|e| e.get_attr(&name).map(|s| s.to_string()));
             st.doc.remove_attribute(nid, &name);
+            st.record_mutation("attributes", nid, Some(name), old_val);
             st.mark_dirty_for(nid);
             Ok(JsValue::Undefined)
         }),

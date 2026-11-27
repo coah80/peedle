@@ -210,7 +210,7 @@ pub enum PropKey {
 pub enum ArrayElem {
     Hole,
     Expr(Expr),
-    Spread(Expr),
+    Spread(Expr, bool),
 }
 
 #[derive(Debug, Clone)]
@@ -219,13 +219,14 @@ pub enum ObjectProp {
         key: PropKey,
         value: Expr,
         shorthand: bool,
+        is_cover_init: bool,
     },
     Method {
         key: PropKey,
         kind: MethodKind,
         func: Rc<FuncNode>,
     },
-    Spread(Expr),
+    Spread(Expr, bool),
 }
 
 #[derive(Debug, Clone)]

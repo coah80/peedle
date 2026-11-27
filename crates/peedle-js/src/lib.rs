@@ -8,6 +8,7 @@ pub mod heap;
 pub mod lexer;
 pub mod parser;
 pub mod regexp;
+pub mod unicode_id;
 pub mod value;
 pub mod vm;
 

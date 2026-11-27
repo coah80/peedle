@@ -996,8 +996,8 @@ pub fn init(rt: &mut JsRuntime) {
                         if rt.has_property(oid, &fk)? {
                             let v = rt.get_property_key(oid, &fk)?;
                             rt.set_property_key_strict(oid, tk, v, true)?;
-                        } else {
-                            rt.delete_property(oid, &tk)?;
+                        } else if !rt.delete_property(oid, &tk)? {
+                            return Err(JsError::type_err("Cannot delete property"));
                         }
                     }
                 } else {
@@ -1007,8 +1007,8 @@ pub fn init(rt: &mut JsRuntime) {
                         if rt.has_property(oid, &fk)? {
                             let v = rt.get_property_key(oid, &fk)?;
                             rt.set_property_key_strict(oid, tk, v, true)?;
-                        } else {
-                            rt.delete_property(oid, &tk)?;
+                        } else if !rt.delete_property(oid, &tk)? {
+                            return Err(JsError::type_err("Cannot delete property"));
                         }
                         from += 1;
                         to += 1;

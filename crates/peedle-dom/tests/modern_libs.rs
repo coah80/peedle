@@ -279,3 +279,53 @@ fn real_marked_renders_markdown_into_dom() {
         .unwrap();
     assert_eq!(check.as_str(), Some("Peedle|2|Fast"));
 }
+
+#[test]
+fn real_vue3_computed_todo_workflow() {
+    let v_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/libs/vue.global.prod.js");
+    if !v_path.exists() {
+        return;
+    }
+    let vue_src = std::fs::read_to_string(&v_path).unwrap();
+    let mut env = new_env(r#"<!DOCTYPE html><html><body><div id="vtodo"></div></body></html>"#);
+    env.eval(&vue_src).unwrap();
+    env.eval(
+        r#"
+        const { createApp, ref, computed, h } = Vue;
+        const app = createApp({
+            setup() {
+                const tasks = ref([
+                    { id: 1, title: 'Parse HTML5', done: true },
+                    { id: 2, title: 'Pass Acid2', done: false }
+                ]);
+                const pending = computed(() => tasks.value.filter(t => !t.done).length);
+                const addTask = () => tasks.value.push({ id: 3, title: 'Pass Acid3', done: false });
+                const finishSecond = () => { tasks.value[1].done = true; };
+                return () => h('div', { id: 'vt' }, [
+                    h('span', { id: 'vpending' }, pending.value + ' pending'),
+                    h('button', { id: 'vadd', onClick: addTask }, 'Add'),
+                    h('button', { id: 'vdone', onClick: finishSecond }, 'Done'),
+                    h('ul', { id: 'vlist' }, tasks.value.map(t => h('li', { key: t.id }, t.title)))
+                ]);
+            }
+        });
+        app.mount('#vtodo');
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        env.eval("document.getElementById('vpending').textContent").unwrap().as_str(),
+        Some("1 pending")
+    );
+    env.eval("document.getElementById('vadd').click();").unwrap();
+    assert_eq!(
+        env.eval("document.getElementById('vpending').textContent + ':' + document.querySelectorAll('#vlist li').length").unwrap().as_str(),
+        Some("2 pending:3")
+    );
+    env.eval("document.getElementById('vdone').click();").unwrap();
+    assert_eq!(
+        env.eval("document.getElementById('vpending').textContent").unwrap().as_str(),
+        Some("1 pending")
+    );
+}

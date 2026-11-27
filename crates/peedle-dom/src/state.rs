@@ -33,9 +33,18 @@ pub struct TimerEntry {
 }
 
 #[derive(Clone, Debug)]
+pub struct MutationRecordData {
+    pub kind: &'static str,
+    pub target: NodeId,
+    pub attribute_name: Option<String>,
+    pub old_value: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct MutationObserverEntry {
     pub callback: JsValue,
     pub targets: Vec<MutationTarget>,
+    pub records: Vec<MutationRecordData>,
 }
 
 #[derive(Clone, Debug)]
@@ -449,6 +458,45 @@ impl DomState {
             }
             if r.end_container == parent && r.end_offset > index {
                 r.end_offset += count;
+            }
+        }
+        self.record_mutation("childList", parent, None, None);
+    }
+
+    pub fn record_mutation(
+        &mut self,
+        kind: &'static str,
+        target: NodeId,
+        attribute_name: Option<String>,
+        old_value: Option<String>,
+    ) {
+        if self.mutation_observers.is_empty() {
+            return;
+        }
+        for obs in &mut self.mutation_observers {
+            let mut matched = false;
+            for t in &obs.targets {
+                let kind_ok = match kind {
+                    "childList" => t.child_list,
+                    "attributes" => t.attributes,
+                    "characterData" => t.character_data,
+                    _ => false,
+                };
+                if !kind_ok {
+                    continue;
+                }
+                if t.node == target || (t.subtree && self.doc.is_ancestor(t.node, target)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                obs.records.push(MutationRecordData {
+                    kind,
+                    target,
+                    attribute_name: attribute_name.clone(),
+                    old_value: old_value.clone(),
+                });
             }
         }
     }

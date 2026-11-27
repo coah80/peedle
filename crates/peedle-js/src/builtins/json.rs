@@ -214,7 +214,11 @@ fn stringify_prop(
         }
         JsValue::BigInt(_) => {
             let bi_proto = rt.intrinsics.bigint_proto;
-            let to_json = rt.get_property(bi_proto, "toJSON")?;
+            let to_json = rt.get_property_key_receiver(
+                bi_proto,
+                &PropertyKey::from("toJSON"),
+                val.clone(),
+            )?;
             if rt.is_callable(&to_json) {
                 val = rt.call_function(to_json, val, &[JsValue::String(key.to_string())])?;
             }

@@ -177,7 +177,7 @@ pub fn init(rt: &mut JsRuntime) {
                 &[JsValue::Object(resolve_fn), JsValue::Object(reject_fn)],
             ) {
                 let ev = rt.error_to_js_value(e);
-                rt.reject_promise(promise, ev);
+                let _ = rt.call_function(JsValue::Object(reject_fn), JsValue::Undefined, &[ev]);
             }
             Ok(JsValue::Object(promise))
         }),
@@ -513,9 +513,27 @@ pub fn init(rt: &mut JsRuntime) {
                 let mut index = 0usize;
                 while let Some(item) = rt.iterator_step(&iter)? {
                     errors.borrow_mut().push(JsValue::Undefined);
-                    let next_p = rt.call_function(resolve_fn.clone(), this.clone(), &[item])?;
-                    let next_oid = rt.to_object(&next_p)?;
-                    let then_fn = rt.get_property(next_oid, "then")?;
+                    let next_p = match rt.call_function(resolve_fn.clone(), this.clone(), &[item]) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            rt.iterator_close(&iter);
+                            return Err(e);
+                        }
+                    };
+                    let next_oid = match rt.to_object(&next_p) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            rt.iterator_close(&iter);
+                            return Err(e);
+                        }
+                    };
+                    let then_fn = match rt.get_property(next_oid, "then") {
+                        Ok(f) => f,
+                        Err(e) => {
+                            rt.iterator_close(&iter);
+                            return Err(e);
+                        }
+                    };
                     let called = Rc::new(Cell::new(false));
                     let errs_ref = errors.clone();
                     let rem_ref = remaining.clone();
@@ -549,7 +567,14 @@ pub fn init(rt: &mut JsRuntime) {
                         }),
                     );
                     remaining.set(remaining.get() + 1);
-                    rt.call_function(then_fn, next_p, &[cap.resolve.clone(), JsValue::Object(on_err)])?;
+                    if let Err(e) = rt.call_function(
+                        then_fn,
+                        next_p,
+                        &[cap.resolve.clone(), JsValue::Object(on_err)],
+                    ) {
+                        rt.iterator_close(&iter);
+                        return Err(e);
+                    }
                     index += 1;
                 }
                 let left = remaining.get() - 1;
@@ -562,6 +587,163 @@ pub fn init(rt: &mut JsRuntime) {
                     let arr = rt.create_array(errors.borrow().clone());
                     let _ = rt.set_property(err, "errors", JsValue::Object(arr));
                     rt.call_function(cap.reject.clone(), JsValue::Undefined, &[JsValue::Object(err)])?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = res {
+                let ev = rt.error_to_js_value(e);
+                let _ = rt.call_function(cap.reject, JsValue::Undefined, &[ev]);
+            }
+            Ok(cap.promise)
+        }),
+    );
+
+    set_method(
+        rt,
+        ctor,
+        "allSettledKeyed",
+        1,
+        Rc::new(|rt, this, args| {
+            let JsValue::Object(cid) = this else {
+                return Err(JsError::type_err(
+                    "Promise.allSettledKeyed called on non-object",
+                ));
+            };
+            let cap = new_promise_capability(rt, this.clone())?;
+            let res = (|| -> Result<(), JsError> {
+                let resolve_fn = get_promise_resolve(rt, cid)?;
+                let input = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let JsValue::Object(pid) = input else {
+                    return Err(JsError::type_err(
+                        "Promise.allSettledKeyed argument must be an object",
+                    ));
+                };
+                let all_keys = rt.own_keys(pid)?;
+                let mut pairs: Vec<(PropertyKey, JsValue)> = Vec::new();
+                for k in all_keys {
+                    if let Some(desc) = rt.get_own_property_descriptor(pid, &k)? {
+                        if desc.enumerable.unwrap_or(false) {
+                            let v = rt.get_property_key(pid, &k)?;
+                            pairs.push((k, v));
+                        }
+                    }
+                }
+                let keys: Rc<Vec<PropertyKey>> =
+                    Rc::new(pairs.iter().map(|(k, _)| k.clone()).collect());
+                let results = Rc::new(RefCell::new(vec![JsValue::Undefined; pairs.len()]));
+                let remaining = Rc::new(Cell::new(1usize));
+                for (cur_idx, (_, item)) in pairs.into_iter().enumerate() {
+                    let next_p = rt.call_function(resolve_fn.clone(), this.clone(), &[item])?;
+                    let next_oid = rt.to_object(&next_p)?;
+                    let then_fn = rt.get_property(next_oid, "then")?;
+                    let called = Rc::new(Cell::new(false));
+                    let called2 = called.clone();
+                    let res1 = results.clone();
+                    let res2 = results.clone();
+                    let keys1 = keys.clone();
+                    let keys2 = keys.clone();
+                    let rem1 = remaining.clone();
+                    let rem2 = remaining.clone();
+                    let cr1 = cap.resolve.clone();
+                    let cr2 = cap.resolve.clone();
+                    let on_ok = rt.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, a| {
+                            if called.replace(true) {
+                                return Ok(JsValue::Undefined);
+                            }
+                            let v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let entry = rt.create_object();
+                            let _ = rt.set_property(
+                                entry,
+                                "status",
+                                JsValue::String("fulfilled".into()),
+                            );
+                            let _ = rt.set_property(entry, "value", v);
+                            res1.borrow_mut()[cur_idx] = JsValue::Object(entry);
+                            let left = rem1.get() - 1;
+                            rem1.set(left);
+                            if left == 0 {
+                                let out = rt.create_object_with_proto(None);
+                                let vals = res1.borrow();
+                                for (k, val) in keys1.iter().zip(vals.iter()) {
+                                    let _ = rt.define_property(
+                                        out,
+                                        k.clone(),
+                                        PropertyDescriptor::data(val.clone(), true, true, true),
+                                    );
+                                }
+                                rt.call_function(
+                                    cr1.clone(),
+                                    JsValue::Undefined,
+                                    &[JsValue::Object(out)],
+                                )?;
+                            }
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    let on_err = rt.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, a| {
+                            if called2.replace(true) {
+                                return Ok(JsValue::Undefined);
+                            }
+                            let r = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let entry = rt.create_object();
+                            let _ = rt.set_property(
+                                entry,
+                                "status",
+                                JsValue::String("rejected".into()),
+                            );
+                            let _ = rt.set_property(entry, "reason", r);
+                            res2.borrow_mut()[cur_idx] = JsValue::Object(entry);
+                            let left = rem2.get() - 1;
+                            rem2.set(left);
+                            if left == 0 {
+                                let out = rt.create_object_with_proto(None);
+                                let vals = res2.borrow();
+                                for (k, val) in keys2.iter().zip(vals.iter()) {
+                                    let _ = rt.define_property(
+                                        out,
+                                        k.clone(),
+                                        PropertyDescriptor::data(val.clone(), true, true, true),
+                                    );
+                                }
+                                rt.call_function(
+                                    cr2.clone(),
+                                    JsValue::Undefined,
+                                    &[JsValue::Object(out)],
+                                )?;
+                            }
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    remaining.set(remaining.get() + 1);
+                    rt.call_function(
+                        then_fn,
+                        next_p,
+                        &[JsValue::Object(on_ok), JsValue::Object(on_err)],
+                    )?;
+                }
+                let left = remaining.get() - 1;
+                remaining.set(left);
+                if left == 0 {
+                    let out = rt.create_object_with_proto(None);
+                    let vals = results.borrow();
+                    for (k, val) in keys.iter().zip(vals.iter()) {
+                        let _ = rt.define_property(
+                            out,
+                            k.clone(),
+                            PropertyDescriptor::data(val.clone(), true, true, true),
+                        );
+                    }
+                    rt.call_function(
+                        cap.resolve.clone(),
+                        JsValue::Undefined,
+                        &[JsValue::Object(out)],
+                    )?;
                 }
                 Ok(())
             })();

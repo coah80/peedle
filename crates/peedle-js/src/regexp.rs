@@ -139,6 +139,15 @@ enum Node {
         index: Option<usize>,
         body: Box<Node>,
     },
+    ModifiedGroup {
+        add_i: bool,
+        add_m: bool,
+        add_s: bool,
+        rem_i: bool,
+        rem_m: bool,
+        rem_s: bool,
+        body: Box<Node>,
+    },
     Backref(usize),
     NamedBackref(String),
     Quantifier {
@@ -172,13 +181,20 @@ impl CompiledRegExp {
         let mut parser = RegexParser {
             chars: &chars,
             pos: 0,
+            flags,
             capture_count: 0,
             named_groups: Vec::new(),
         };
-        let root = parser.parse_alt()?;
+        let (root, _) = parser.parse_alt()?;
         if parser.pos < chars.len() {
             return Err(JsError::syntax("Unexpected ')' in regular expression"));
         }
+        validate_regexp_refs(
+            &root,
+            parser.capture_count,
+            &parser.named_groups,
+            flags.unicode,
+        )?;
         Ok(CompiledRegExp {
             source: if pattern.is_empty() {
                 "(?:)".to_string()
@@ -279,6 +295,7 @@ impl CompiledRegExp {
 struct RegexParser<'a> {
     chars: &'a [char],
     pos: usize,
+    flags: RegExpFlags,
     capture_count: usize,
     named_groups: Vec<(String, usize)>,
 }
@@ -294,152 +311,354 @@ impl<'a> RegexParser<'a> {
         Some(c)
     }
 
-    fn parse_alt(&mut self) -> Result<Node, JsError> {
-        let mut branches = vec![self.parse_seq()?];
+    fn parse_alt(&mut self) -> Result<(Node, std::collections::HashSet<String>), JsError> {
+        let (first, mut all_names) = self.parse_seq()?;
+        let mut branches = vec![first];
         while self.peek() == Some('|') {
             self.pos += 1;
-            branches.push(self.parse_seq()?);
+            let (b, b_names) = self.parse_seq()?;
+            all_names.extend(b_names);
+            branches.push(b);
         }
-        if branches.len() == 1 {
-            Ok(branches.pop().unwrap())
+        let node = if branches.len() == 1 {
+            branches.pop().unwrap()
         } else {
-            Ok(Node::Alt(branches))
-        }
+            Node::Alt(branches)
+        };
+        Ok((node, all_names))
     }
 
-    fn parse_seq(&mut self) -> Result<Node, JsError> {
+    fn parse_seq(&mut self) -> Result<(Node, std::collections::HashSet<String>), JsError> {
         let mut items = Vec::new();
+        let mut seq_names = std::collections::HashSet::new();
         while let Some(c) = self.peek() {
             if c == '|' || c == ')' {
                 break;
             }
             let cap_before = self.capture_count;
-            let atom = self.parse_atom()?;
+            let (atom, atom_names) = self.parse_atom()?;
+            for n in atom_names {
+                if !seq_names.insert(n.clone()) {
+                    return Err(JsError::syntax(format!(
+                        "Duplicate capture group name '{}'",
+                        n
+                    )));
+                }
+            }
             let cap_after = self.capture_count;
             let node = self.parse_quantifier(atom, cap_before + 1, cap_after)?;
             items.push(node);
         }
-        if items.len() == 1 {
-            Ok(items.pop().unwrap())
+        let node = if items.len() == 1 {
+            items.pop().unwrap()
         } else {
-            Ok(Node::Seq(items))
-        }
+            Node::Seq(items)
+        };
+        Ok((node, seq_names))
     }
 
-    fn parse_atom(&mut self) -> Result<Node, JsError> {
+    fn parse_atom(&mut self) -> Result<(Node, std::collections::HashSet<String>), JsError> {
         let Some(c) = self.next() else {
             return Err(JsError::syntax("Unexpected end of regular expression"));
         };
+        let empty = std::collections::HashSet::new();
         match c {
-            '^' => Ok(Node::AnchorStart),
-            '$' => Ok(Node::AnchorEnd),
-            '.' => Ok(Node::Dot),
-            '[' => self.parse_char_class(),
+            '^' => Ok((Node::AnchorStart, empty)),
+            '$' => Ok((Node::AnchorEnd, empty)),
+            '.' => Ok((Node::Dot, empty)),
+            '[' => Ok((self.parse_char_class()?, empty)),
             '(' => self.parse_group(),
-            '\\' => self.parse_escape(false),
+            '\\' => Ok((self.parse_escape(false)?, empty)),
             '*' | '+' | '?' => Err(JsError::syntax("Nothing to repeat in regular expression")),
             '{' => {
                 self.pos -= 1;
                 if self.try_parse_brace_quantifier()?.is_some() {
                     return Err(JsError::syntax("Nothing to repeat in regular expression"));
                 }
+                if self.flags.unicode {
+                    return Err(JsError::syntax("Lone quantifier bracket in Unicode regex"));
+                }
                 self.pos += 1;
-                Ok(Node::Literal('{' as u32))
+                Ok((Node::Literal('{' as u32), empty))
             }
-            other => Ok(Node::Literal(other as u32)),
+            '}' | ']' if self.flags.unicode => {
+                Err(JsError::syntax("Lone bracket in Unicode regex"))
+            }
+            other => Ok((Node::Literal(other as u32), empty)),
         }
     }
 
-    fn parse_group(&mut self) -> Result<Node, JsError> {
+    fn parse_group_name(&mut self) -> Result<String, JsError> {
+        let mut name = String::new();
+        let mut closed = false;
+        let mut first = true;
+        while let Some(ch) = self.next() {
+            if ch == '>' {
+                closed = true;
+                break;
+            }
+            let decoded = if ch == '\\' {
+                if self.next() != Some('u') {
+                    return Err(JsError::syntax("Invalid escape in regex group name"));
+                }
+                let cp = if self.peek() == Some('{') {
+                    self.pos += 1;
+                    let mut val = 0u32;
+                    let mut count = 0usize;
+                    let mut end_brace = false;
+                    while let Some(hc) = self.next() {
+                        if hc == '}' {
+                            end_brace = true;
+                            break;
+                        }
+                        let Some(d) = hc.to_digit(16) else {
+                            return Err(JsError::syntax("Invalid hex in regex group name"));
+                        };
+                        val = val.saturating_mul(16).saturating_add(d);
+                        count += 1;
+                        if val > 0x10FFFF {
+                            return Err(JsError::syntax("Code point out of range in group name"));
+                        }
+                    }
+                    if !end_brace || count == 0 {
+                        return Err(JsError::syntax("Invalid unicode escape in group name"));
+                    }
+                    val
+                } else {
+                    let Some(hi) = self.try_read_hex(4) else {
+                        return Err(JsError::syntax("Invalid unicode escape in group name"));
+                    };
+                    if (0xD800..=0xDBFF).contains(&hi)
+                        && self.chars.get(self.pos) == Some(&'\\')
+                        && self.chars.get(self.pos + 1) == Some(&'u')
+                    {
+                        let saved = self.pos;
+                        self.pos += 2;
+                        if let Some(lo) = self.try_read_hex(4) {
+                            if (0xDC00..=0xDFFF).contains(&lo) {
+                                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                            } else {
+                                self.pos = saved;
+                                return Err(JsError::syntax("Lone surrogate in group name"));
+                            }
+                        } else {
+                            self.pos = saved;
+                            return Err(JsError::syntax("Lone surrogate in group name"));
+                        }
+                    } else {
+                        hi
+                    }
+                };
+                if (0xD800..=0xDFFF).contains(&cp) {
+                    return Err(JsError::syntax("Lone surrogate in group name"));
+                }
+                char::from_u32(cp)
+                    .ok_or_else(|| JsError::syntax("Invalid code point in group name"))?
+            } else {
+                ch
+            };
+            if (first && !crate::lexer::is_ident_start(decoded))
+                || (!first && !crate::lexer::is_ident_continue(decoded))
+            {
+                return Err(JsError::syntax("Invalid character in regex group name"));
+            }
+            name.push(decoded);
+            first = false;
+        }
+        if !closed || name.is_empty() {
+            return Err(JsError::syntax("Invalid or unterminated group name in regex"));
+        }
+        Ok(name)
+    }
+
+    fn parse_group(&mut self) -> Result<(Node, std::collections::HashSet<String>), JsError> {
         if self.peek() == Some('?') {
             self.pos += 1;
             match self.peek() {
                 Some(':') => {
                     self.pos += 1;
-                    let body = self.parse_alt()?;
+                    let (body, names) = self.parse_alt()?;
                     self.expect_char(')')?;
-                    Ok(Node::Group {
-                        index: None,
-                        body: Box::new(body),
-                    })
+                    Ok((
+                        Node::Group {
+                            index: None,
+                            body: Box::new(body),
+                        },
+                        names,
+                    ))
                 }
                 Some('=') => {
                     self.pos += 1;
-                    let body = self.parse_alt()?;
+                    let (body, names) = self.parse_alt()?;
                     self.expect_char(')')?;
-                    Ok(Node::Lookaround {
-                        body: Box::new(body),
-                        positive: true,
-                        behind: false,
-                    })
+                    Ok((
+                        Node::Lookaround {
+                            body: Box::new(body),
+                            positive: true,
+                            behind: false,
+                        },
+                        names,
+                    ))
                 }
                 Some('!') => {
                     self.pos += 1;
-                    let body = self.parse_alt()?;
+                    let (body, names) = self.parse_alt()?;
                     self.expect_char(')')?;
-                    Ok(Node::Lookaround {
-                        body: Box::new(body),
-                        positive: false,
-                        behind: false,
-                    })
+                    Ok((
+                        Node::Lookaround {
+                            body: Box::new(body),
+                            positive: false,
+                            behind: false,
+                        },
+                        names,
+                    ))
                 }
                 Some('<') => {
                     self.pos += 1;
                     match self.peek() {
                         Some('=') => {
                             self.pos += 1;
-                            let body = self.parse_alt()?;
+                            let (body, names) = self.parse_alt()?;
                             self.expect_char(')')?;
-                            Ok(Node::Lookaround {
-                                body: Box::new(body),
-                                positive: true,
-                                behind: true,
-                            })
+                            Ok((
+                                Node::Lookaround {
+                                    body: Box::new(body),
+                                    positive: true,
+                                    behind: true,
+                                },
+                                names,
+                            ))
                         }
                         Some('!') => {
                             self.pos += 1;
-                            let body = self.parse_alt()?;
+                            let (body, names) = self.parse_alt()?;
                             self.expect_char(')')?;
-                            Ok(Node::Lookaround {
-                                body: Box::new(body),
-                                positive: false,
-                                behind: true,
-                            })
+                            Ok((
+                                Node::Lookaround {
+                                    body: Box::new(body),
+                                    positive: false,
+                                    behind: true,
+                                },
+                                names,
+                            ))
                         }
                         _ => {
-                            let mut name = String::new();
-                            while let Some(ch) = self.next() {
-                                if ch == '>' {
-                                    break;
-                                }
-                                name.push(ch);
-                            }
-                            if name.is_empty() {
-                                return Err(JsError::syntax("Empty group name in regex"));
-                            }
+                            let name = self.parse_group_name()?;
                             self.capture_count += 1;
                             let idx = self.capture_count;
-                            self.named_groups.push((name, idx));
-                            let body = self.parse_alt()?;
+                            self.named_groups.push((name.clone(), idx));
+                            let (body, mut names) = self.parse_alt()?;
                             self.expect_char(')')?;
-                            Ok(Node::Group {
-                                index: Some(idx),
-                                body: Box::new(body),
-                            })
+                            if !names.insert(name.clone()) {
+                                return Err(JsError::syntax(format!(
+                                    "Duplicate capture group name '{}'",
+                                    name
+                                )));
+                            }
+                            Ok((
+                                Node::Group {
+                                    index: Some(idx),
+                                    body: Box::new(body),
+                                },
+                                names,
+                            ))
                         }
                     }
+                }
+                Some('i' | 'm' | 's' | '-') => {
+                    let mut add_i = false;
+                    let mut add_m = false;
+                    let mut add_s = false;
+                    let mut rem_i = false;
+                    let mut rem_m = false;
+                    let mut rem_s = false;
+                    let mut in_rem = false;
+                    let mut any_flag = false;
+                    loop {
+                        match self.next() {
+                            Some(':') => break,
+                            Some('-') if !in_rem => {
+                                in_rem = true;
+                            }
+                            Some('i') => {
+                                any_flag = true;
+                                if in_rem {
+                                    if rem_i || add_i {
+                                        return Err(JsError::syntax("Invalid regex modifier"));
+                                    }
+                                    rem_i = true;
+                                } else {
+                                    if add_i {
+                                        return Err(JsError::syntax("Duplicate regex modifier"));
+                                    }
+                                    add_i = true;
+                                }
+                            }
+                            Some('m') => {
+                                any_flag = true;
+                                if in_rem {
+                                    if rem_m || add_m {
+                                        return Err(JsError::syntax("Invalid regex modifier"));
+                                    }
+                                    rem_m = true;
+                                } else {
+                                    if add_m {
+                                        return Err(JsError::syntax("Duplicate regex modifier"));
+                                    }
+                                    add_m = true;
+                                }
+                            }
+                            Some('s') => {
+                                any_flag = true;
+                                if in_rem {
+                                    if rem_s || add_s {
+                                        return Err(JsError::syntax("Invalid regex modifier"));
+                                    }
+                                    rem_s = true;
+                                } else {
+                                    if add_s {
+                                        return Err(JsError::syntax("Duplicate regex modifier"));
+                                    }
+                                    add_s = true;
+                                }
+                            }
+                            _ => {
+                                return Err(JsError::syntax("Invalid group modifier in regex"));
+                            }
+                        }
+                    }
+                    if !any_flag {
+                        return Err(JsError::syntax("Empty regex modifier group"));
+                    }
+                    let (body, names) = self.parse_alt()?;
+                    self.expect_char(')')?;
+                    Ok((
+                        Node::ModifiedGroup {
+                            add_i,
+                            add_m,
+                            add_s,
+                            rem_i,
+                            rem_m,
+                            rem_s,
+                            body: Box::new(body),
+                        },
+                        names,
+                    ))
                 }
                 _ => Err(JsError::syntax("Invalid group specifier in regex")),
             }
         } else {
             self.capture_count += 1;
             let idx = self.capture_count;
-            let body = self.parse_alt()?;
+            let (body, names) = self.parse_alt()?;
             self.expect_char(')')?;
-            Ok(Node::Group {
-                index: Some(idx),
-                body: Box::new(body),
-            })
+            Ok((
+                Node::Group {
+                    index: Some(idx),
+                    body: Box::new(body),
+                },
+                names,
+            ))
         }
     }
 
@@ -474,26 +693,26 @@ impl<'a> RegexParser<'a> {
             'f' => Ok(Node::Literal(0x0C)),
             'v' => Ok(Node::Literal(0x0B)),
             '0' => {
-                if !in_class
-                    && self
-                        .peek()
-                        .is_some_and(|ch| ('0'..='7').contains(&ch))
-                {
-                    let mut val = 0u32;
-                    for _ in 0..2 {
-                        if let Some(ch) = self.peek() {
-                            if ('0'..='7').contains(&ch) {
-                                self.pos += 1;
-                                val = val * 8 + (ch as u32 - '0' as u32);
-                            } else {
-                                break;
+                if self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+                    if self.flags.unicode {
+                        return Err(JsError::syntax("Invalid octal escape in Unicode regex"));
+                    }
+                    if !in_class && self.peek().is_some_and(|ch| ('0'..='7').contains(&ch)) {
+                        let mut val = 0u32;
+                        for _ in 0..2 {
+                            if let Some(ch) = self.peek() {
+                                if ('0'..='7').contains(&ch) {
+                                    self.pos += 1;
+                                    val = val * 8 + (ch as u32 - '0' as u32);
+                                } else {
+                                    break;
+                                }
                             }
                         }
+                        return Ok(Node::Literal(val));
                     }
-                    Ok(Node::Literal(val))
-                } else {
-                    Ok(Node::Literal(0))
                 }
+                Ok(Node::Literal(0))
             }
             '1'..='9' if !in_class => {
                 let mut num = (c as usize) - ('0' as usize);
@@ -507,20 +726,25 @@ impl<'a> RegexParser<'a> {
                 }
                 Ok(Node::Backref(num))
             }
-            'k' if !in_class && self.peek() == Some('<') => {
-                self.pos += 1;
-                let mut name = String::new();
-                while let Some(ch) = self.next() {
-                    if ch == '>' {
-                        break;
-                    }
-                    name.push(ch);
+            '1'..='9' if in_class && self.flags.unicode => {
+                Err(JsError::syntax("Invalid decimal escape in Unicode character class"))
+            }
+            'k' if !in_class => {
+                if self.peek() == Some('<') {
+                    self.pos += 1;
+                    let name = self.parse_group_name()?;
+                    Ok(Node::NamedBackref(name))
+                } else if self.flags.unicode {
+                    Err(JsError::syntax("Invalid named backreference in Unicode regex"))
+                } else {
+                    Ok(Node::Literal('k' as u32))
                 }
-                Ok(Node::NamedBackref(name))
             }
             'x' => {
                 if let Some(val) = self.try_read_hex(2) {
                     Ok(Node::Literal(val))
+                } else if self.flags.unicode {
+                    Err(JsError::syntax("Invalid hex escape in Unicode regex"))
                 } else {
                     Ok(Node::Literal('x' as u32))
                 }
@@ -531,12 +755,14 @@ impl<'a> RegexParser<'a> {
                     self.pos += 1;
                     let mut val = 0u32;
                     let mut ok = false;
+                    let mut digits = 0usize;
                     while let Some(ch) = self.next() {
                         if ch == '}' {
-                            ok = true;
+                            ok = digits > 0;
                             break;
                         }
                         if let Some(d) = ch.to_digit(16) {
+                            digits += 1;
                             val = val.saturating_mul(16).saturating_add(d);
                         } else {
                             ok = false;
@@ -545,12 +771,16 @@ impl<'a> RegexParser<'a> {
                     }
                     if ok && val <= 0x10FFFF {
                         Ok(Node::Literal(val))
+                    } else if self.flags.unicode {
+                        Err(JsError::syntax("Invalid Unicode escape in regex"))
                     } else {
                         self.pos = saved;
                         Ok(Node::Literal('u' as u32))
                     }
                 } else if let Some(val) = self.try_read_hex(4) {
                     Ok(Node::Literal(val))
+                } else if self.flags.unicode {
+                    Err(JsError::syntax("Invalid Unicode escape in regex"))
                 } else {
                     Ok(Node::Literal('u' as u32))
                 }
@@ -561,6 +791,9 @@ impl<'a> RegexParser<'a> {
                         self.pos += 1;
                         return Ok(Node::Literal((ch as u32) % 32));
                     }
+                }
+                if self.flags.unicode {
+                    return Err(JsError::syntax("Invalid control escape in Unicode regex"));
                 }
                 Ok(Node::Literal('c' as u32))
             }
@@ -576,7 +809,34 @@ impl<'a> RegexParser<'a> {
                 }
                 Ok(Node::UnicodeProp(prop, negated))
             }
-            other => Ok(Node::Literal(other as u32)),
+            other => {
+                if self.flags.unicode
+                    && !matches!(
+                        other,
+                        '^' | '$'
+                            | '\\'
+                            | '.'
+                            | '*'
+                            | '+'
+                            | '?'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '|'
+                            | '/'
+                    )
+                    && !(in_class && other == '-')
+                {
+                    return Err(JsError::syntax(format!(
+                        "Invalid escape '\\{}' in Unicode regex",
+                        other
+                    )));
+                }
+                Ok(Node::Literal(other as u32))
+            }
         }
     }
 
@@ -616,12 +876,16 @@ impl<'a> RegexParser<'a> {
                             return Err(JsError::syntax("Range out of order in character class"));
                         }
                         atoms.push(ClassAtom::Range(start, end));
+                    } else if self.flags.unicode {
+                        return Err(JsError::syntax("Invalid character class range in Unicode regex"));
                     } else {
                         atoms.push(ClassAtom::Char(start));
                         atoms.push(ClassAtom::Char('-' as u32));
                         atoms.push(second);
                     }
                     continue;
+                } else if self.flags.unicode {
+                    return Err(JsError::syntax("Invalid character class range in Unicode regex"));
                 }
             }
             atoms.push(first);
@@ -681,6 +945,16 @@ impl<'a> RegexParser<'a> {
         } else {
             true
         };
+        if matches!(
+            atom,
+            Node::Lookaround { behind: true, .. }
+                | Node::AnchorStart
+                | Node::AnchorEnd
+                | Node::WordBoundary(_)
+        ) || (self.flags.unicode && matches!(atom, Node::Lookaround { .. }))
+        {
+            return Err(JsError::syntax("Nothing to repeat in regular expression"));
+        }
         if matches!(self.peek(), Some('*' | '+' | '?')) {
             return Err(JsError::syntax("Nothing to repeat in regular expression"));
         }
@@ -757,6 +1031,42 @@ impl<'a> RegexParser<'a> {
         }
         if count > 0 { Some(val) } else { None }
     }
+}
+
+fn validate_regexp_refs(
+    node: &Node,
+    capture_count: usize,
+    named_groups: &[(String, usize)],
+    unicode: bool,
+) -> Result<(), JsError> {
+    match node {
+        Node::Seq(items) | Node::Alt(items) => {
+            for it in items {
+                validate_regexp_refs(it, capture_count, named_groups, unicode)?;
+            }
+        }
+        Node::Group { body, .. }
+        | Node::ModifiedGroup { body, .. }
+        | Node::Quantifier { body, .. }
+        | Node::Lookaround { body, .. } => {
+            validate_regexp_refs(body, capture_count, named_groups, unicode)?;
+        }
+        Node::Backref(n) => {
+            if unicode && *n > capture_count {
+                return Err(JsError::syntax("Invalid decimal escape in Unicode regex"));
+            }
+        }
+        Node::NamedBackref(name) => {
+            if !named_groups.iter().any(|(gn, _)| gn == name) {
+                return Err(JsError::syntax(format!(
+                    "Invalid named backreference '{}'",
+                    name
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 struct MatchState<'a> {
@@ -900,6 +1210,44 @@ impl<'a> MatchState<'a> {
                     self.match_with_cont(body, pos, rev, cont)
                 }
             }
+            Node::ModifiedGroup {
+                add_i,
+                add_m,
+                add_s,
+                rem_i,
+                rem_m,
+                rem_s,
+                body,
+            } => {
+                let saved_flags = self.flags;
+                if *add_i {
+                    self.flags.ignore_case = true;
+                }
+                if *rem_i {
+                    self.flags.ignore_case = false;
+                }
+                if *add_m {
+                    self.flags.multiline = true;
+                }
+                if *rem_m {
+                    self.flags.multiline = false;
+                }
+                if *add_s {
+                    self.flags.dot_all = true;
+                }
+                if *rem_s {
+                    self.flags.dot_all = false;
+                }
+                let res = self.match_with_cont(body, pos, rev, &mut |st, end| {
+                    let inner_flags = st.flags;
+                    st.flags = saved_flags;
+                    let r = cont(st, end);
+                    st.flags = inner_flags;
+                    r
+                });
+                self.flags = saved_flags;
+                res
+            }
             Node::Backref(idx) => {
                 let cap = self.captures.get(*idx).copied().flatten();
                 self.match_backref(cap, pos, rev, cont)
@@ -999,6 +1347,43 @@ impl<'a> MatchState<'a> {
         }
     }
 
+    fn is_simple_atom(node: &Node) -> bool {
+        matches!(
+            node,
+            Node::Literal(_)
+                | Node::Dot
+                | Node::Digit(_)
+                | Node::Word(_)
+                | Node::Space(_)
+                | Node::UnicodeProp(_, _)
+                | Node::CharClass { .. }
+        )
+    }
+
+    fn match_simple_atom(&self, node: &Node, pos: usize, rev: bool) -> Option<usize> {
+        let (next_pos, unit) = self.read_unit(pos, rev)?;
+        let ok = match node {
+            Node::Literal(ch) => chars_equal(unit, *ch, self.flags.ignore_case),
+            Node::Dot => self.flags.dot_all || !is_line_term_u32(unit),
+            Node::Digit(neg) => (unit >= '0' as u32 && unit <= '9' as u32) ^ *neg,
+            Node::Word(neg) => is_word_char(unit) ^ *neg,
+            Node::Space(neg) => is_space_u32(unit) ^ *neg,
+            Node::UnicodeProp(prop, neg) => match_unicode_prop(unit, prop) ^ *neg,
+            Node::CharClass { negated, atoms } => {
+                let mut matched = false;
+                for atom in atoms {
+                    if match_class_atom(unit, atom, self.flags.ignore_case) {
+                        matched = true;
+                        break;
+                    }
+                }
+                matched ^ *negated
+            }
+            _ => false,
+        };
+        if ok { Some(next_pos) } else { None }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn match_quant(
         &mut self,
@@ -1013,6 +1398,48 @@ impl<'a> MatchState<'a> {
         rev: bool,
         cont: &mut dyn FnMut(&mut Self, usize) -> Option<usize>,
     ) -> Option<usize> {
+        if count == 0 && Self::is_simple_atom(body) {
+            let mut positions = Vec::new();
+            positions.push(pos);
+            let mut cur = pos;
+            let limit = max.unwrap_or(usize::MAX);
+            while positions.len() - 1 < limit {
+                if let Some(next_pos) = self.match_simple_atom(body, cur, rev) {
+                    if next_pos == cur {
+                        break;
+                    }
+                    positions.push(next_pos);
+                    cur = next_pos;
+                } else {
+                    break;
+                }
+            }
+            let max_matched = positions.len() - 1;
+            if max_matched < min {
+                return None;
+            }
+            if greedy {
+                for k in (min..=max_matched).rev() {
+                    let saved = self.captures.clone();
+                    if let Some(res) = cont(self, positions[k]) {
+                        return Some(res);
+                    }
+                    self.captures = saved;
+                }
+            } else {
+                for k in min..=max_matched {
+                    let saved = self.captures.clone();
+                    if let Some(res) = cont(self, positions[k]) {
+                        return Some(res);
+                    }
+                    self.captures = saved;
+                }
+            }
+            return None;
+        }
+        if count > 4096 {
+            return None;
+        }
         self.steps += 1;
         if self.steps > MAX_REGEX_STEPS {
             return None;

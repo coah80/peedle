@@ -14,20 +14,41 @@ pub struct Parser<'a> {
     in_class: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct EvalValidationCtx {
+    pub allow_super_call: bool,
+    pub allow_super_prop: bool,
+    pub allow_new_target: bool,
+    pub allow_private: bool,
+}
+
 impl<'a> Parser<'a> {
     pub fn parse_script(src: &'a str) -> Result<Program, JsError> {
-        Self::parse_inner(src, false, false)
+        Self::parse_inner(src, false, false, EvalValidationCtx::default())
     }
 
     pub fn parse_module(src: &'a str) -> Result<Program, JsError> {
-        Self::parse_inner(src, true, true)
+        Self::parse_inner(src, true, true, EvalValidationCtx::default())
     }
 
     pub fn parse_script_with_strict(src: &'a str, strict: bool) -> Result<Program, JsError> {
-        Self::parse_inner(src, false, strict)
+        Self::parse_inner(src, false, strict, EvalValidationCtx::default())
     }
 
-    fn parse_inner(src: &'a str, is_module: bool, initial_strict: bool) -> Result<Program, JsError> {
+    pub fn parse_eval(
+        src: &'a str,
+        strict: bool,
+        eval_ctx: EvalValidationCtx,
+    ) -> Result<Program, JsError> {
+        Self::parse_inner(src, false, strict, eval_ctx)
+    }
+
+    fn parse_inner(
+        src: &'a str,
+        is_module: bool,
+        initial_strict: bool,
+        eval_ctx: EvalValidationCtx,
+    ) -> Result<Program, JsError> {
         let mut lexer = Lexer::new(src);
         let cur = lexer.next_token(true)?;
         let mut parser = Parser {
@@ -42,12 +63,17 @@ impl<'a> Parser<'a> {
         };
         let mut body = Vec::new();
         let mut checking_directives = true;
+        let mut prologue_strict_err: Option<&'static str> = None;
         while parser.cur.kind != TokenKind::Eof {
             if checking_directives {
                 if let TokenKind::String(ref s, has_escape) = parser.cur.kind {
+                    let cur_strict_err = parser.cur.strict_error;
                     if s == "use strict" && !has_escape {
                         let stmt = parser.parse_module_item()?;
                         if matches!(stmt, Stmt::Expr(Expr::String(ref st)) if st == "use strict") {
+                            if let Some(err) = prologue_strict_err {
+                                return Err(JsError::syntax(err));
+                            }
                             parser.strict = true;
                         } else {
                             checking_directives = false;
@@ -55,6 +81,14 @@ impl<'a> Parser<'a> {
                         body.push(stmt);
                         continue;
                     }
+                    if prologue_strict_err.is_none() {
+                        prologue_strict_err = cur_strict_err;
+                    }
+                }
+            }
+            if parser.strict {
+                if let Some(err) = parser.cur.strict_error {
+                    return Err(JsError::syntax(err));
                 }
             }
             let stmt = parser.parse_module_item()?;
@@ -68,11 +102,16 @@ impl<'a> Parser<'a> {
             is_module,
             strict: parser.strict,
         };
-        validate_program_early_errors(&program)?;
+        validate_program_early_errors(&program, eval_ctx)?;
         Ok(program)
     }
 
     fn advance(&mut self, allow_regexp: bool) -> Result<Token, JsError> {
+        if self.strict {
+            if let Some(err) = self.cur.strict_error {
+                return Err(JsError::syntax(err));
+            }
+        }
         let prev = std::mem::replace(&mut self.cur, self.lexer.next_token(allow_regexp)?);
         Ok(prev)
     }
@@ -288,6 +327,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, JsError> {
+        self.parse_stmt_inner(true)
+    }
+
+    fn parse_stmt_inner(&mut self, allow_lexical: bool) -> Result<Stmt, JsError> {
         match &self.cur.kind {
             TokenKind::LBrace => self.parse_block(),
             TokenKind::Semi => {
@@ -297,21 +340,21 @@ impl<'a> Parser<'a> {
             TokenKind::KwVar => self.parse_var_decl(VarKind::Var, true),
             TokenKind::KwConst => self.parse_var_decl(VarKind::Const, true),
             TokenKind::Ident(s, false) if s == "let" => {
-                if self.is_let_decl_start()? {
+                if allow_lexical && self.is_let_decl_start()? {
                     self.parse_var_decl(VarKind::Let, true)
                 } else {
                     self.parse_expr_or_label_stmt()
                 }
             }
             TokenKind::Ident(s, false) if s == "using" => {
-                if self.is_using_decl_start()? {
+                if allow_lexical && self.is_using_decl_start()? {
                     self.parse_var_decl(VarKind::Using, true)
                 } else {
                     self.parse_expr_or_label_stmt()
                 }
             }
             TokenKind::KwAwait if self.in_async => {
-                if self.is_await_using_decl_start()? {
+                if allow_lexical && self.is_await_using_decl_start()? {
                     self.advance(true)?;
                     self.parse_var_decl(VarKind::AwaitUsing, true)
                 } else {
@@ -362,10 +405,22 @@ impl<'a> Parser<'a> {
                     "Lexical declaration cannot appear in a single-statement context",
                 ));
             }
-            TokenKind::Ident(s, false) if s == "let" && self.is_let_decl_start()? => {
-                return Err(JsError::syntax(
-                    "Lexical declaration cannot appear in a single-statement context",
-                ));
+            TokenKind::Ident(s, false) if s == "let" => {
+                let next = self.peek_next(true)?;
+                let forbidden = next.kind == TokenKind::LBracket
+                    || (!next.preceded_by_newline
+                        && matches!(
+                            next.kind,
+                            TokenKind::Ident(_, _)
+                                | TokenKind::LBrace
+                                | TokenKind::KwYield
+                                | TokenKind::KwAwait
+                        ));
+                if forbidden {
+                    return Err(JsError::syntax(
+                        "Lexical declaration cannot appear in a single-statement context",
+                    ));
+                }
             }
             TokenKind::Ident(s, false) if s == "using" && self.is_using_decl_start()? => {
                 return Err(JsError::syntax(
@@ -396,7 +451,13 @@ impl<'a> Parser<'a> {
             }
             _ => {}
         }
-        self.parse_stmt()
+        let stmt = self.parse_stmt_inner(false)?;
+        if is_labeled_func_decl(&stmt) {
+            return Err(JsError::syntax(
+                "Labelled function declaration cannot appear in a single-statement context",
+            ));
+        }
+        Ok(stmt)
     }
 
     fn is_using_decl_start(&self) -> Result<bool, JsError> {
@@ -435,6 +496,12 @@ impl<'a> Parser<'a> {
             if self.in_async && matches!(next.kind, TokenKind::KwAwait) {
                 return Ok(true);
             }
+            if self.in_generator && matches!(next.kind, TokenKind::KwYield) {
+                return Ok(true);
+            }
+            if matches!(&next.kind, TokenKind::Ident(s, false) if s == "let") {
+                return Ok(true);
+            }
             return Ok(matches!(
                 next.kind,
                 TokenKind::LBrace | TokenKind::LBracket
@@ -470,6 +537,14 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            if init.is_none()
+                && (matches!(kind, VarKind::Const | VarKind::Using | VarKind::AwaitUsing)
+                    || !matches!(pattern, Pattern::Ident(_)))
+            {
+                return Err(JsError::syntax(
+                    "Missing initializer in const or destructuring declaration",
+                ));
+            }
             decls.push(VarDeclarator { pattern, init });
             if !self.eat(&TokenKind::Comma, true)? {
                 break;
@@ -829,6 +904,7 @@ impl<'a> Parser<'a> {
         if let Some(label) = self.peek_label_ident()? {
             if (label == "await" && self.in_async)
                 || (label == "yield" && (self.in_generator || self.strict))
+                || is_reserved_word(&label, self.strict)
             {
                 return Err(JsError::syntax(format!(
                     "Invalid label identifier '{}'",
@@ -922,12 +998,17 @@ impl<'a> Parser<'a> {
         let mut strict = self.strict;
         let mut has_use_strict = false;
         let prev_strict = self.strict;
+        let mut prologue_strict_err: Option<&'static str> = None;
         while self.cur.kind != TokenKind::RBrace && self.cur.kind != TokenKind::Eof {
             if checking {
                 if let TokenKind::String(ref s, has_escape) = self.cur.kind {
+                    let cur_strict_err = self.cur.strict_error;
                     if s == "use strict" && !has_escape {
                         let st = self.parse_stmt()?;
                         if matches!(st, Stmt::Expr(Expr::String(ref v)) if v == "use strict") {
+                            if let Some(err) = prologue_strict_err {
+                                return Err(JsError::syntax(err));
+                            }
                             strict = true;
                             has_use_strict = true;
                             self.strict = true;
@@ -936,6 +1017,9 @@ impl<'a> Parser<'a> {
                         }
                         stmts.push(st);
                         continue;
+                    }
+                    if prologue_strict_err.is_none() {
+                        prologue_strict_err = cur_strict_err;
                     }
                 }
             }
@@ -1530,6 +1614,8 @@ impl<'a> Parser<'a> {
             self.parse_unary_expr()?
         };
 
+        let mut saw_coalesce = false;
+        let mut saw_logical_and_or = false;
         loop {
             let Some((prec, right_assoc)) = binary_prec(&self.cur.kind, allow_in) else {
                 break;
@@ -1538,8 +1624,52 @@ impl<'a> Parser<'a> {
                 break;
             }
             let op_tok = self.advance(true)?;
-            let next_min = if right_assoc { prec } else { prec + 1 };
+            match op_tok.kind {
+                TokenKind::QuestionQuestion => {
+                    if saw_logical_and_or {
+                        return Err(JsError::syntax(
+                            "Cannot mix '??' with '&&' or '||' without parentheses",
+                        ));
+                    }
+                    saw_coalesce = true;
+                }
+                TokenKind::AmpAmp | TokenKind::PipePipe => {
+                    if saw_coalesce {
+                        return Err(JsError::syntax(
+                            "Cannot mix '??' with '&&' or '||' without parentheses",
+                        ));
+                    }
+                    saw_logical_and_or = true;
+                }
+                _ => {}
+            }
+            let next_min = if op_tok.kind == TokenKind::QuestionQuestion {
+                4
+            } else if right_assoc {
+                prec
+            } else {
+                prec + 1
+            };
             let right = self.parse_binary_expr(next_min, allow_in)?;
+            if op_tok.kind == TokenKind::QuestionQuestion {
+                if matches!(
+                    self.cur.kind,
+                    TokenKind::AmpAmp | TokenKind::PipePipe
+                ) && min_prec <= 2
+                {
+                    return Err(JsError::syntax(
+                        "Cannot mix '??' with '&&' or '||' without parentheses",
+                    ));
+                }
+            }
+            if matches!(op_tok.kind, TokenKind::AmpAmp | TokenKind::PipePipe)
+                && self.cur.kind == TokenKind::QuestionQuestion
+                && min_prec <= 2
+            {
+                return Err(JsError::syntax(
+                    "Cannot mix '??' with '&&' or '||' without parentheses",
+                ));
+            }
             left = match op_tok.kind {
                 TokenKind::AmpAmp => Expr::Logical {
                     op: LogicalOp::And,
@@ -1740,6 +1870,11 @@ impl<'a> Parser<'a> {
                     };
                 }
                 TokenKind::NoSubTemplate { .. } | TokenKind::TemplateHead { .. } => {
+                    if is_optional_chain {
+                        return Err(JsError::syntax(
+                            "Invalid tagged template on optional chain",
+                        ));
+                    }
                     expr = self.parse_template_literal(Some(Box::new(expr)))?;
                 }
                 _ => break,
@@ -1818,6 +1953,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::RegExp(pattern, flags) => {
                 self.advance(false)?;
+                crate::regexp::CompiledRegExp::compile(&pattern, &flags)?;
                 Ok(Expr::RegExp { pattern, flags })
             }
             TokenKind::KwThis => {
@@ -1911,12 +2047,15 @@ impl<'a> Parser<'a> {
                 elems.push(ArrayElem::Hole);
                 continue;
             }
-            if self.eat(&TokenKind::Ellipsis, true)? {
-                elems.push(ArrayElem::Spread(self.parse_assign_expr(true)?));
+            let is_spread = self.eat(&TokenKind::Ellipsis, true)?;
+            let expr = self.parse_assign_expr(true)?;
+            let has_comma = self.eat(&TokenKind::Comma, true)?;
+            if is_spread {
+                elems.push(ArrayElem::Spread(expr, has_comma));
             } else {
-                elems.push(ArrayElem::Expr(self.parse_assign_expr(true)?));
+                elems.push(ArrayElem::Expr(expr));
             }
-            if !self.eat(&TokenKind::Comma, true)? {
+            if !has_comma {
                 break;
             }
         }
@@ -1929,8 +2068,10 @@ impl<'a> Parser<'a> {
         let mut props = Vec::new();
         while self.cur.kind != TokenKind::RBrace && self.cur.kind != TokenKind::Eof {
             if self.eat(&TokenKind::Ellipsis, true)? {
-                props.push(ObjectProp::Spread(self.parse_assign_expr(true)?));
-                if !self.eat(&TokenKind::Comma, true)? {
+                let expr = self.parse_assign_expr(true)?;
+                let has_comma = self.eat(&TokenKind::Comma, true)?;
+                props.push(ObjectProp::Spread(expr, has_comma));
+                if !has_comma {
                     break;
                 }
                 continue;
@@ -1994,28 +2135,36 @@ impl<'a> Parser<'a> {
                     key,
                     value,
                     shorthand: false,
+                    is_cover_init: false,
                 });
             } else if let PropKey::Ident(ref name) = key {
-                if is_reserved_word(name, self.strict) {
+                if is_reserved_word(name, self.strict)
+                    || (self.in_generator && name == "yield")
+                    || (self.in_async && name == "await")
+                {
                     return Err(JsError::syntax(format!(
                         "Unexpected reserved word '{}' in shorthand property",
                         name
                     )));
                 }
-                let value = if self.eat(&TokenKind::Eq, true)? {
+                let (value, is_cover_init) = if self.eat(&TokenKind::Eq, true)? {
                     let right = self.parse_assign_expr(true)?;
-                    Expr::Assign {
-                        op: AssignOp::Assign,
-                        left: AssignTarget::Ident(name.clone()),
-                        right: Box::new(right),
-                    }
+                    (
+                        Expr::Assign {
+                            op: AssignOp::Assign,
+                            left: AssignTarget::Ident(name.clone()),
+                            right: Box::new(right),
+                        },
+                        true,
+                    )
                 } else {
-                    Expr::Ident(name.clone())
+                    (Expr::Ident(name.clone()), false)
                 };
                 props.push(ObjectProp::Property {
                     key,
                     value,
                     shorthand: true,
+                    is_cover_init,
                 });
             } else {
                 return Err(JsError::syntax("Expected ':' in object literal property"));
@@ -2366,10 +2515,15 @@ fn expr_to_pattern(expr: Expr) -> Result<Pattern, JsError> {
                 match el {
                     ArrayElem::Hole => elements.push(None),
                     ArrayElem::Expr(e) => elements.push(Some(expr_to_pattern(e)?)),
-                    ArrayElem::Spread(e) => {
-                        if i + 1 != len {
+                    ArrayElem::Spread(e, has_comma) => {
+                        if i + 1 != len || has_comma {
                             return Err(JsError::syntax(
                                 "Rest element must be last in destructuring pattern",
+                            ));
+                        }
+                        if matches!(e, Expr::Assign { .. }) {
+                            return Err(JsError::syntax(
+                                "Rest element may not have a default initializer",
                             ));
                         }
                         rest = Some(Box::new(expr_to_pattern(e)?));
@@ -2390,10 +2544,15 @@ fn expr_to_pattern(expr: Expr) -> Result<Pattern, JsError> {
                             value: expr_to_pattern(value)?,
                         });
                     }
-                    ObjectProp::Spread(e) => {
-                        if i + 1 != len {
+                    ObjectProp::Spread(e, has_comma) => {
+                        if i + 1 != len || has_comma {
                             return Err(JsError::syntax(
                                 "Rest element must be last in object pattern",
+                            ));
+                        }
+                        if matches!(e, Expr::Assign { .. }) {
+                            return Err(JsError::syntax(
+                                "Rest element may not have a default initializer",
                             ));
                         }
                         rest = Some(Box::new(expr_to_pattern(e)?));
@@ -2471,16 +2630,34 @@ struct ValidationCtx {
     strict: bool,
     allow_super_call: bool,
     allow_super_prop: bool,
+    in_function: bool,
+    allow_new_target: bool,
+    allow_private: bool,
     in_static_block: bool,
     forbid_yield_expr: bool,
     forbid_await_expr: bool,
 }
 
-fn validate_program_early_errors(prog: &Program) -> Result<(), JsError> {
+fn is_labeled_func_decl(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Labeled { body, .. } => {
+            matches!(body.as_ref(), Stmt::FuncDecl(_)) || is_labeled_func_decl(body)
+        }
+        _ => false,
+    }
+}
+
+fn validate_program_early_errors(
+    prog: &Program,
+    eval_ctx: EvalValidationCtx,
+) -> Result<(), JsError> {
     let ctx = ValidationCtx {
         strict: prog.strict,
-        allow_super_call: false,
-        allow_super_prop: false,
+        allow_super_call: eval_ctx.allow_super_call,
+        allow_super_prop: eval_ctx.allow_super_prop,
+        in_function: false,
+        allow_new_target: eval_ctx.allow_new_target,
+        allow_private: eval_ctx.allow_private,
         in_static_block: false,
         forbid_yield_expr: false,
         forbid_await_expr: false,
@@ -2703,6 +2880,16 @@ fn validate_stmt_list(
                 )));
             }
         }
+        if !is_top_or_fn_body {
+            for fn_name in &annex_b_funcs {
+                if pnames.contains(fn_name) {
+                    return Err(JsError::syntax(format!(
+                        "Identifier '{}' has already been declared",
+                        fn_name
+                    )));
+                }
+            }
+        }
     }
 
     for s in stmts {
@@ -2724,8 +2911,16 @@ fn validate_stmt(stmt: &Stmt, ctx: ValidationCtx) -> Result<(), JsError> {
             Ok(())
         }
         Stmt::Expr(e) | Stmt::Throw(e) => validate_expr(e, ctx),
-        Stmt::Return(Some(e)) => validate_expr(e, ctx),
-        Stmt::Return(None) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Debugger | Stmt::Empty => {
+        Stmt::Return(opt_e) => {
+            if !ctx.in_function {
+                return Err(JsError::syntax("Illegal return statement"));
+            }
+            if let Some(e) = opt_e {
+                validate_expr(e, ctx)?;
+            }
+            Ok(())
+        }
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Debugger | Stmt::Empty => {
             Ok(())
         }
         Stmt::If {
@@ -2857,9 +3052,17 @@ fn validate_stmt(stmt: &Stmt, ctx: ValidationCtx) -> Result<(), JsError> {
         } => {
             validate_expr(discriminant, ctx)?;
             let mut all_stmts = Vec::new();
+            let mut default_count = 0usize;
             for c in cases {
                 if let Some(ref t) = c.test {
                     validate_expr(t, ctx)?;
+                } else {
+                    default_count += 1;
+                    if default_count > 1 {
+                        return Err(JsError::syntax(
+                            "More than one default clause in switch statement",
+                        ));
+                    }
                 }
                 all_stmts.extend(c.consequent.iter().cloned());
             }
@@ -2954,6 +3157,13 @@ fn validate_function(
         } else {
             allow_super_prop
         },
+        in_function: true,
+        allow_new_target: if func.is_arrow {
+            outer_ctx.allow_new_target
+        } else {
+            true
+        },
+        allow_private: outer_ctx.allow_private,
         in_static_block: if func.is_arrow {
             outer_ctx.in_static_block
         } else {
@@ -2998,6 +3208,13 @@ fn validate_function(
         } else {
             allow_super_prop
         },
+        in_function: true,
+        allow_new_target: if func.is_arrow {
+            outer_ctx.allow_new_target
+        } else {
+            true
+        },
+        allow_private: outer_ctx.allow_private,
         in_static_block: false,
         forbid_yield_expr: false,
         forbid_await_expr: false,
@@ -3012,13 +3229,14 @@ fn validate_function(
 fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx) -> Result<(), JsError> {
     let cls_ctx = ValidationCtx {
         strict: true,
+        allow_private: true,
         ..outer_ctx
     };
     if let Some(ref n) = cls.name {
         check_strict_binding_name(n, true)?;
     }
     if let Some(ref sup) = cls.super_class {
-        validate_expr(sup, cls_ctx)?;
+        validate_expr(sup, ValidationCtx { strict: true, ..outer_ctx })?;
     }
     let has_super = cls.super_class.is_some();
     for el in &cls.elements {
@@ -3045,6 +3263,9 @@ fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx) -> Result<(), JsErr
                         strict: true,
                         allow_super_call: false,
                         allow_super_prop: true,
+                        in_function: false,
+                        allow_new_target: true,
+                        allow_private: true,
                         in_static_block: false,
                         forbid_yield_expr: false,
                         forbid_await_expr: false,
@@ -3057,6 +3278,9 @@ fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx) -> Result<(), JsErr
                     strict: true,
                     allow_super_call: false,
                     allow_super_prop: true,
+                    in_function: false,
+                    allow_new_target: true,
+                    allow_private: true,
                     in_static_block: true,
                     forbid_yield_expr: true,
                     forbid_await_expr: true,
@@ -3074,6 +3298,7 @@ fn validate_pattern(pat: &Pattern, ctx: ValidationCtx) -> Result<(), JsError> {
             if is_reserved_word(n, ctx.strict) {
                 return Err(JsError::syntax(format!("Unexpected reserved word '{}'", n)));
             }
+            check_strict_binding_name(n, ctx.strict)?;
             if ctx.in_static_block && n == "await" {
                 return Err(JsError::syntax("Cannot use 'await' in class static block"));
             }
@@ -3159,8 +3384,12 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
             } else {
                 validate_expr(object, ctx)?;
             }
-            if let MemberProp::Computed(e) = property {
-                validate_expr(e, ctx)?;
+            match property {
+                MemberProp::Computed(e) => validate_expr(e, ctx)?,
+                MemberProp::Private(_) if !ctx.allow_private => {
+                    return Err(JsError::syntax("Private identifier outside class"));
+                }
+                _ => {}
             }
             Ok(())
         }
@@ -3172,15 +3401,40 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
             for el in elems {
                 match el {
                     ArrayElem::Hole => {}
-                    ArrayElem::Expr(e) | ArrayElem::Spread(e) => validate_expr(e, ctx)?,
+                    ArrayElem::Expr(e) | ArrayElem::Spread(e, _) => validate_expr(e, ctx)?,
                 }
             }
             Ok(())
         }
         Expr::Object(props) => {
+            let mut has_proto = false;
             for p in props {
                 match p {
-                    ObjectProp::Property { key, value, .. } => {
+                    ObjectProp::Property {
+                        key,
+                        value,
+                        shorthand,
+                        is_cover_init,
+                    } => {
+                        if *is_cover_init {
+                            return Err(JsError::syntax(
+                                "Invalid shorthand property initializer",
+                            ));
+                        }
+                        if !*shorthand {
+                            let is_proto = match key {
+                                PropKey::Ident(s) | PropKey::String(s) => s == "__proto__",
+                                _ => false,
+                            };
+                            if is_proto {
+                                if has_proto {
+                                    return Err(JsError::syntax(
+                                        "Duplicate __proto__ fields are not allowed in object literals",
+                                    ));
+                                }
+                                has_proto = true;
+                            }
+                        }
                         if let PropKey::Computed(e) = key {
                             validate_expr(e, ctx)?;
                         }
@@ -3192,7 +3446,7 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
                         }
                         validate_function(func, ctx, false, true)?;
                     }
-                    ObjectProp::Spread(e) => validate_expr(e, ctx)?,
+                    ObjectProp::Spread(e, _) => validate_expr(e, ctx)?,
                 }
             }
             Ok(())
@@ -3209,8 +3463,13 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
         Expr::OptionalChain(e)
         | Expr::DynamicImport(e)
         | Expr::Unary { arg: e, .. }
-        | Expr::Update { arg: e, .. }
-        | Expr::PrivateIn { right: e, .. } => validate_expr(e, ctx),
+        | Expr::Update { arg: e, .. } => validate_expr(e, ctx),
+        Expr::PrivateIn { right: e, .. } => {
+            if !ctx.allow_private {
+                return Err(JsError::syntax("Private identifier outside class"));
+            }
+            validate_expr(e, ctx)
+        }
         Expr::New { callee, args } => {
             validate_expr(callee, ctx)?;
             for a in args {
@@ -3246,8 +3505,12 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
                     } else {
                         validate_expr(object, ctx)?;
                     }
-                    if let MemberProp::Computed(e) = property {
-                        validate_expr(e, ctx)?;
+                    match property {
+                        MemberProp::Computed(e) => validate_expr(e, ctx)?,
+                        MemberProp::Private(_) if !ctx.allow_private => {
+                            return Err(JsError::syntax("Private identifier outside class"));
+                        }
+                        _ => {}
                     }
                 }
                 AssignTarget::Pattern(p) => validate_pattern(p, ctx)?,
@@ -3260,6 +3523,12 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
             }
             Ok(())
         }
+        Expr::NewTarget => {
+            if !ctx.allow_new_target {
+                return Err(JsError::syntax("new.target expression is not allowed here"));
+            }
+            Ok(())
+        }
         Expr::Undefined
         | Expr::Null
         | Expr::Bool(_)
@@ -3268,7 +3537,6 @@ fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
         | Expr::String(_)
         | Expr::RegExp { .. }
         | Expr::This
-        | Expr::NewTarget
         | Expr::ImportMeta => Ok(()),
     }
 }

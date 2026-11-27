@@ -60,9 +60,22 @@ pub struct Intrinsics {
     pub typed_array_proto: ObjectId,
     pub typed_array_protos: [ObjectId; 11],
     pub iterator_proto: ObjectId,
+    pub array_iterator_proto: ObjectId,
+    pub string_iterator_proto: ObjectId,
+    pub map_iterator_proto: ObjectId,
+    pub set_iterator_proto: ObjectId,
+    pub regexp_string_iterator_proto: ObjectId,
     pub generator_proto: ObjectId,
     pub async_generator_proto: ObjectId,
+    pub generator_function_proto: ObjectId,
+    pub generator_function_ctor: ObjectId,
+    pub async_function_proto: ObjectId,
+    pub async_function_ctor: ObjectId,
+    pub async_generator_function_proto: ObjectId,
+    pub async_generator_function_ctor: ObjectId,
+    pub throw_type_error: ObjectId,
     pub eval_fn: ObjectId,
+    pub function_ctor: ObjectId,
     pub object_ctor: ObjectId,
     pub array_ctor: ObjectId,
     pub promise_ctor: ObjectId,
@@ -108,6 +121,7 @@ pub struct JsRuntime {
     pub step_count: usize,
     pub native_new_target: Option<JsValue>,
     pub call_stack_callees: Vec<ObjectId>,
+    pub template_cache: HashMap<(usize, u64), ObjectId>,
 }
 
 fn alloc_realm_parts(heap: &mut Heap) -> Realm {
@@ -179,10 +193,50 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
     }
     let iterator_proto =
         heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
+    let array_iterator_proto =
+        heap.alloc_object(JsObject::new(Some(iterator_proto), ObjectKind::Ordinary));
+    let string_iterator_proto =
+        heap.alloc_object(JsObject::new(Some(iterator_proto), ObjectKind::Ordinary));
+    let map_iterator_proto =
+        heap.alloc_object(JsObject::new(Some(iterator_proto), ObjectKind::Ordinary));
+    let set_iterator_proto =
+        heap.alloc_object(JsObject::new(Some(iterator_proto), ObjectKind::Ordinary));
+    let regexp_string_iterator_proto =
+        heap.alloc_object(JsObject::new(Some(iterator_proto), ObjectKind::Ordinary));
     let generator_proto =
         heap.alloc_object(JsObject::new(Some(iterator_proto), ObjectKind::Ordinary));
     let async_generator_proto =
         heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
+    let generator_function_proto =
+        heap.alloc_object(JsObject::new(Some(function_proto), ObjectKind::Ordinary));
+    let async_function_proto =
+        heap.alloc_object(JsObject::new(Some(function_proto), ObjectKind::Ordinary));
+    let async_generator_function_proto =
+        heap.alloc_object(JsObject::new(Some(function_proto), ObjectKind::Ordinary));
+    let mut tte_obj = JsObject::new(
+        Some(function_proto),
+        ObjectKind::NativeFunction(NativeFn {
+            name: String::new(),
+            length: 0,
+            callback: Rc::new(|_, _, _| {
+                Err(JsError::type_err(
+                    "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+                ))
+            }),
+            is_constructor: false,
+            handles_new_target: false,
+        }),
+    );
+    tte_obj.set_own_prop(
+        PropertyKey::from("length"),
+        PropEntry::data(JsValue::Number(0.0), false, false, false),
+    );
+    tte_obj.set_own_prop(
+        PropertyKey::from("name"),
+        PropEntry::data(JsValue::String(String::new()), false, false, false),
+    );
+    tte_obj.extensible = false;
+    let throw_type_error = heap.alloc_object(tte_obj);
 
     let global_object =
         heap.alloc_object(JsObject::new(Some(object_proto), ObjectKind::Ordinary));
@@ -221,9 +275,22 @@ fn alloc_realm_parts(heap: &mut Heap) -> Realm {
         typed_array_proto,
         typed_array_protos,
         iterator_proto,
+        array_iterator_proto,
+        string_iterator_proto,
+        map_iterator_proto,
+        set_iterator_proto,
+        regexp_string_iterator_proto,
         generator_proto,
         async_generator_proto,
+        generator_function_proto,
+        generator_function_ctor: function_proto,
+        async_function_proto,
+        async_function_ctor: function_proto,
+        async_generator_function_proto,
+        async_generator_function_ctor: function_proto,
+        throw_type_error,
         eval_fn: function_proto,
+        function_ctor: function_proto,
         object_ctor: function_proto,
         array_ctor: function_proto,
         promise_ctor: function_proto,
@@ -284,6 +351,7 @@ impl JsRuntime {
             step_count: 0,
             native_new_target: None,
             call_stack_callees: Vec::new(),
+            template_cache: HashMap::new(),
         };
 
         crate::builtins::init_builtins(&mut rt);
@@ -333,8 +401,11 @@ impl JsRuntime {
 
     pub fn eval_in_realm(&mut self, realm_id: usize, src: &str) -> Result<JsValue, JsError> {
         let prev = self.switch_realm(realm_id);
-        let env = self.global_env;
-        let res = self.eval_in_env(src, env, false);
+        let res = (|| {
+            let program = Parser::parse_script(src)?;
+            let chunk = Compiler::compile_program(&program)?;
+            self.exec_script_chunk(chunk, self.global_env, program.strict)
+        })();
         self.switch_realm(prev);
         res
     }
@@ -409,8 +480,16 @@ impl JsRuntime {
         if default_proto == cur.data_view_proto { return tgt.data_view_proto; }
         if default_proto == cur.typed_array_proto { return tgt.typed_array_proto; }
         if default_proto == cur.iterator_proto { return tgt.iterator_proto; }
+        if default_proto == cur.array_iterator_proto { return tgt.array_iterator_proto; }
+        if default_proto == cur.string_iterator_proto { return tgt.string_iterator_proto; }
+        if default_proto == cur.map_iterator_proto { return tgt.map_iterator_proto; }
+        if default_proto == cur.set_iterator_proto { return tgt.set_iterator_proto; }
+        if default_proto == cur.regexp_string_iterator_proto { return tgt.regexp_string_iterator_proto; }
         if default_proto == cur.generator_proto { return tgt.generator_proto; }
         if default_proto == cur.async_generator_proto { return tgt.async_generator_proto; }
+        if default_proto == cur.generator_function_proto { return tgt.generator_function_proto; }
+        if default_proto == cur.async_function_proto { return tgt.async_function_proto; }
+        if default_proto == cur.async_generator_function_proto { return tgt.async_generator_function_proto; }
         for i in 0..11 {
             if default_proto == cur.typed_array_protos[i] {
                 return tgt.typed_array_protos[i];
@@ -444,9 +523,190 @@ impl JsRuntime {
     }
 
     pub fn eval_in_env(&mut self, src: &str, env: EnvId, strict: bool) -> Result<JsValue, JsError> {
-        let program = Parser::parse_script_with_strict(src, strict)?;
+        let mut eval_ctx = crate::parser::EvalValidationCtx::default();
+        let mut cur_e = Some(env);
+        let mut found_this_env = false;
+        while let Some(eid) = cur_e {
+            let rec = self.heap.get_env(eid);
+            if rec.allow_private {
+                eval_ctx.allow_private = true;
+            }
+            if !found_this_env && rec.this_binding.is_some() {
+                found_this_env = true;
+                eval_ctx.allow_super_call = rec.allow_super_call;
+                eval_ctx.allow_super_prop = rec.allow_super_prop;
+                eval_ctx.allow_new_target = rec.allow_new_target;
+            }
+            cur_e = rec.parent;
+        }
+        let program = Parser::parse_eval(src, strict, eval_ctx)?;
         let chunk = Compiler::compile_program(&program)?;
-        self.exec_script_chunk(chunk, env, program.strict)
+        let eval_strict = strict || program.strict;
+        if eval_strict {
+            let eval_env = self.heap.alloc_env(EnvRecord::new(Some(env), true, true));
+            return self.exec_script_chunk(chunk, eval_env, true);
+        }
+
+        let mut var_env = env;
+        loop {
+            let rec = self.heap.get_env(var_env);
+            if rec.is_function_scope {
+                break;
+            }
+            match rec.parent {
+                Some(p) => var_env = p,
+                None => break,
+            }
+        }
+
+        let mut eval_var_names: Vec<&str> = Vec::new();
+        for vn in &chunk.hoisted_vars {
+            eval_var_names.push(vn.as_str());
+        }
+        for (fn_name, _) in &chunk.hoisted_funcs {
+            eval_var_names.push(fn_name.as_str());
+        }
+
+        for &vn in &eval_var_names {
+            let mut cur = env;
+            loop {
+                let rec = self.heap.get_env(cur);
+                if cur == var_env {
+                    if rec.lex_names.contains(vn) {
+                        return Err(JsError::syntax(format!(
+                            "Identifier '{}' has already been declared",
+                            vn
+                        )));
+                    }
+                    break;
+                }
+                if rec.object_env.is_none() && rec.bindings.contains_key(vn) {
+                    return Err(JsError::syntax(format!(
+                        "Identifier '{}' has already been declared",
+                        vn
+                    )));
+                }
+                match rec.parent {
+                    Some(p) => cur = p,
+                    None => break,
+                }
+            }
+        }
+
+        let is_global_var = self.heap.get_env(var_env).object_env == Some(self.global_object);
+        if is_global_var {
+            for (name, _) in &chunk.hoisted_funcs {
+                let key = PropertyKey::String(name.clone());
+                let existing = self.heap.get_obj(self.global_object).get_own_prop(&key).cloned();
+                if let Some(ex) = existing {
+                    if !ex.configurable
+                        && (matches!(ex.value, PropValue::Accessor { .. })
+                            || !ex.writable
+                            || !ex.enumerable)
+                    {
+                        return Err(JsError::type_err("Cannot redefine global function"));
+                    }
+                } else if !self.heap.get_obj(self.global_object).extensible {
+                    return Err(JsError::type_err(
+                        "Cannot define global function on non-extensible object",
+                    ));
+                }
+            }
+            for name in &chunk.hoisted_vars {
+                let key = PropertyKey::String(name.clone());
+                if !self.has_own_property(self.global_object, &key)?
+                    && !self.heap.get_obj(self.global_object).extensible
+                {
+                    return Err(JsError::type_err(
+                        "Cannot define global var on non-extensible object",
+                    ));
+                }
+            }
+        }
+        for name in &chunk.hoisted_vars {
+            if is_global_var {
+                let key = PropertyKey::String(name.clone());
+                if !self.has_own_property(self.global_object, &key)? {
+                    self.heap.get_obj_mut(self.global_object).set_own_prop(
+                        key,
+                        PropEntry::data(JsValue::Undefined, true, true, true),
+                    );
+                }
+            } else {
+                let e = self.heap.get_env_mut(var_env);
+                e.bindings.entry(name.clone()).or_insert(Binding {
+                    value: JsValue::Undefined,
+                    mutable: true,
+                    initialized: true,
+                    deletable: true,
+                    strict_immutable: false,
+                });
+            }
+        }
+        for (name, tmpl) in &chunk.hoisted_funcs {
+            let fn_id = self.create_js_function(tmpl, var_env);
+            if is_global_var {
+                let key = PropertyKey::String(name.clone());
+                let existing = self.heap.get_obj(self.global_object).get_own_prop(&key).cloned();
+                if let Some(ex) = existing {
+                    if !ex.configurable {
+                        self.set_property(self.global_object, name, JsValue::Object(fn_id))?;
+                    } else {
+                        self.heap.get_obj_mut(self.global_object).set_own_prop(
+                            key,
+                            PropEntry::data(JsValue::Object(fn_id), true, true, true),
+                        );
+                    }
+                } else {
+                    self.heap.get_obj_mut(self.global_object).set_own_prop(
+                        key,
+                        PropEntry::data(JsValue::Object(fn_id), true, true, true),
+                    );
+                }
+            } else {
+                let e = self.heap.get_env_mut(var_env);
+                if let Some(existing) = e.bindings.get_mut(name) {
+                    existing.value = JsValue::Object(fn_id);
+                    existing.initialized = true;
+                } else {
+                    e.bindings.insert(
+                        name.clone(),
+                        Binding {
+                            value: JsValue::Object(fn_id),
+                            mutable: true,
+                            initialized: true,
+                            deletable: true,
+                            strict_immutable: false,
+                        },
+                    );
+                }
+            }
+        }
+
+        let eval_lex_env = self.heap.alloc_env(EnvRecord::new(Some(env), false, false));
+        for (name, is_const) in &chunk.lex_names {
+            let e = self.heap.get_env_mut(eval_lex_env);
+            e.lex_names.insert(name.clone());
+            e.bindings.insert(
+                name.clone(),
+                Binding {
+                    value: JsValue::Undefined,
+                    mutable: !is_const,
+                    initialized: false,
+                    deletable: false,
+                    strict_immutable: *is_const,
+                },
+            );
+        }
+
+        let mut frame = CallFrame::new(chunk, eval_lex_env, None);
+        self.active_frames.push(eval_lex_env);
+        let res = self.run_frame(&mut frame);
+        self.active_frames.pop();
+        match res? {
+            crate::exec::FrameOutcome::Return(v) => Ok(v),
+            _ => Ok(JsValue::Undefined),
+        }
     }
 
     pub fn eval_module(&mut self, specifier: &str, src: &str) -> Result<JsValue, JsError> {
@@ -749,10 +1009,42 @@ impl JsRuntime {
         Ok(obj)
     }
 
+    pub fn create_realm_error_object(
+        &mut self,
+        realm_id: usize,
+        kind: ErrorKind,
+        message: &str,
+    ) -> ObjectId {
+        let intr = if realm_id < self.realms.len() {
+            &self.realms[realm_id].intrinsics
+        } else {
+            &self.intrinsics
+        };
+        let proto = match kind {
+            ErrorKind::Error | ErrorKind::InternalError => intr.error_proto,
+            ErrorKind::TypeError => intr.type_error_proto,
+            ErrorKind::ReferenceError => intr.reference_error_proto,
+            ErrorKind::SyntaxError => intr.syntax_error_proto,
+            ErrorKind::RangeError => intr.range_error_proto,
+            ErrorKind::UriError => intr.uri_error_proto,
+            ErrorKind::EvalError => intr.eval_error_proto,
+            ErrorKind::AggregateError => intr.aggregate_error_proto,
+        };
+        self.create_error_object_with_proto(kind, message, !message.is_empty(), proto)
+    }
+
     pub fn create_js_function(&mut self, tmpl: &Rc<FuncTemplate>, env: EnvId) -> ObjectId {
         let name = tmpl.name.clone().unwrap_or_default();
         let param_len = compute_func_length(&tmpl.params);
-        let proto = self.intrinsics.function_proto;
+        let proto = if tmpl.is_async && tmpl.is_generator {
+            self.intrinsics.async_generator_function_proto
+        } else if tmpl.is_generator {
+            self.intrinsics.generator_function_proto
+        } else if tmpl.is_async {
+            self.intrinsics.async_function_proto
+        } else {
+            self.intrinsics.function_proto
+        };
         let obj = self.heap.alloc_object(JsObject::new(
             Some(proto),
             ObjectKind::Function(JsFunction {
@@ -777,15 +1069,17 @@ impl JsRuntime {
             }),
         ));
         self.heap.get_obj_mut(obj).set_own_prop(
-            PropertyKey::from("name"),
-            PropEntry::data(JsValue::String(name), false, false, true),
-        );
-        self.heap.get_obj_mut(obj).set_own_prop(
             PropertyKey::from("length"),
             PropEntry::data(JsValue::Number(param_len as f64), false, false, true),
         );
-        if !tmpl.is_arrow && !tmpl.is_async {
-            let fn_proto = if tmpl.is_generator {
+        self.heap.get_obj_mut(obj).set_own_prop(
+            PropertyKey::from("name"),
+            PropEntry::data(JsValue::String(name), false, false, true),
+        );
+        if !tmpl.is_arrow && (!tmpl.is_async || tmpl.is_generator) {
+            let fn_proto = if tmpl.is_async && tmpl.is_generator {
+                self.create_object_with_proto(Some(self.intrinsics.async_generator_proto))
+            } else if tmpl.is_generator {
                 self.create_object_with_proto(Some(self.intrinsics.generator_proto))
             } else {
                 let p = self.create_object();
@@ -866,9 +1160,22 @@ impl JsRuntime {
             self.intrinsics.data_view_proto,
             self.intrinsics.typed_array_proto,
             self.intrinsics.iterator_proto,
+            self.intrinsics.array_iterator_proto,
+            self.intrinsics.string_iterator_proto,
+            self.intrinsics.map_iterator_proto,
+            self.intrinsics.set_iterator_proto,
+            self.intrinsics.regexp_string_iterator_proto,
             self.intrinsics.generator_proto,
             self.intrinsics.async_generator_proto,
+            self.intrinsics.generator_function_proto,
+            self.intrinsics.generator_function_ctor,
+            self.intrinsics.async_function_proto,
+            self.intrinsics.async_function_ctor,
+            self.intrinsics.async_generator_function_proto,
+            self.intrinsics.async_generator_function_ctor,
+            self.intrinsics.throw_type_error,
             self.intrinsics.eval_fn,
+            self.intrinsics.function_ctor,
             self.intrinsics.object_ctor,
             self.intrinsics.array_ctor,
             self.intrinsics.promise_ctor,
@@ -880,6 +1187,9 @@ impl JsRuntime {
         root_objs.extend_from_slice(&self.intrinsics.typed_array_ctors);
         for &m in self.module_cache.values() {
             root_objs.push(m);
+        }
+        for &t in self.template_cache.values() {
+            root_objs.push(t);
         }
         root_objs.extend_from_slice(&self.current_module_exports);
         for mt in &self.microtasks {
@@ -922,9 +1232,22 @@ impl JsRuntime {
             root_objs.push(r.intrinsics.data_view_proto);
             root_objs.push(r.intrinsics.typed_array_proto);
             root_objs.push(r.intrinsics.iterator_proto);
+            root_objs.push(r.intrinsics.array_iterator_proto);
+            root_objs.push(r.intrinsics.string_iterator_proto);
+            root_objs.push(r.intrinsics.map_iterator_proto);
+            root_objs.push(r.intrinsics.set_iterator_proto);
+            root_objs.push(r.intrinsics.regexp_string_iterator_proto);
             root_objs.push(r.intrinsics.generator_proto);
             root_objs.push(r.intrinsics.async_generator_proto);
+            root_objs.push(r.intrinsics.generator_function_proto);
+            root_objs.push(r.intrinsics.generator_function_ctor);
+            root_objs.push(r.intrinsics.async_function_proto);
+            root_objs.push(r.intrinsics.async_function_ctor);
+            root_objs.push(r.intrinsics.async_generator_function_proto);
+            root_objs.push(r.intrinsics.async_generator_function_ctor);
+            root_objs.push(r.intrinsics.throw_type_error);
             root_objs.push(r.intrinsics.eval_fn);
+            root_objs.push(r.intrinsics.function_ctor);
             root_objs.push(r.intrinsics.object_ctor);
             root_objs.push(r.intrinsics.array_ctor);
             root_objs.push(r.intrinsics.promise_ctor);
@@ -1176,6 +1499,52 @@ impl JsRuntime {
                 return self.get_property_key_receiver(target, key, receiver);
             }
 
+            if cur_id == obj {
+                if let PropertyKey::String(ref k) = key {
+                    if k == "caller" || k == "arguments" {
+                        let is_sloppy_plain = match &self.heap.get_obj(cur_id).kind {
+                            ObjectKind::Function(f) => {
+                                !f.strict
+                                    && !f.is_arrow
+                                    && !f.is_generator
+                                    && !f.is_async
+                                    && !f.is_class_ctor
+                                    && f.bound_target.is_none()
+                            }
+                            _ => false,
+                        };
+                        if is_sloppy_plain && self.heap.get_obj(cur_id).get_own_prop(key).is_none() {
+                            if k == "arguments" {
+                                return Ok(JsValue::Null);
+                            }
+                            if let Some(pos) =
+                                self.call_stack_callees.iter().rposition(|&id| id == cur_id)
+                            {
+                                if pos > 0 {
+                                    let caller_id = self.call_stack_callees[pos - 1];
+                                    let caller_restricted = match &self.heap.get_obj(caller_id).kind {
+                                        ObjectKind::Function(f) => {
+                                            f.strict
+                                                || f.is_async
+                                                || f.is_generator
+                                                || f.is_class_ctor
+                                        }
+                                        _ => true,
+                                    };
+                                    if caller_restricted {
+                                        return Err(JsError::type_err(
+                                            "'caller' property cannot be accessed when caller is a strict function",
+                                        ));
+                                    }
+                                    return Ok(JsValue::Object(caller_id));
+                                }
+                            }
+                            return Ok(JsValue::Null);
+                        }
+                    }
+                }
+            }
+
             if let Some(val) = self.get_exotic_own_prop(cur_id, key)? {
                 return Ok(val);
             }
@@ -1234,13 +1603,21 @@ impl JsRuntime {
             }
             ObjectKind::Arguments(args) => {
                 if let Some(idx) = parse_array_index(k) {
+                    let idx_u = idx as usize;
+                    if let Some(env_id) = args.mapped_env {
+                        if let Some(Some(ref pname)) = args.mapped_params.get(idx_u) {
+                            if let Some(b) = self.heap.get_env(env_id).bindings.get(pname) {
+                                return Ok(Some(b.value.clone()));
+                            }
+                        }
+                    }
                     let deleted = self
                         .heap
                         .deleted_arg_indices
                         .get(&obj)
-                        .is_some_and(|s| s.contains(&(idx as usize)));
+                        .is_some_and(|s| s.contains(&idx_u));
                     if !deleted && o.get_own_prop(key).is_none() {
-                        if let Some(v) = args.values.get(idx as usize) {
+                        if let Some(v) = args.values.get(idx_u) {
                             return Ok(Some(v.clone()));
                         }
                     }
@@ -1377,20 +1754,38 @@ impl JsRuntime {
                     }
                     if (!has_custom || self.heap.get_obj(obj).get_own_prop(&key).is_none())
                         && idx_u < 65_536
+                        && receiver == JsValue::Object(obj)
                     {
-                        if !self.heap.get_obj(obj).extensible {
-                            let exists = match &self.heap.get_obj(obj).kind {
-                                ObjectKind::Array(a) => a.get(idx_u).is_some(),
-                                _ => false,
-                            };
-                            if !exists {
+                        let exists = match &self.heap.get_obj(obj).kind {
+                            ObjectKind::Array(a) => a.get(idx_u).is_some(),
+                            _ => false,
+                        };
+                        let proto_intercepts = if !exists {
+                            let mut p = self.heap.get_obj(obj).prototype;
+                            let mut hit = false;
+                            while let Some(pid) = p {
+                                let po = self.heap.get_obj(pid);
+                                if matches!(po.kind, ObjectKind::Proxy(_))
+                                    || po.get_own_prop(&key).is_some()
+                                {
+                                    hit = true;
+                                    break;
+                                }
+                                p = po.prototype;
+                            }
+                            hit
+                        } else {
+                            false
+                        };
+                        if !proto_intercepts {
+                            if !self.heap.get_obj(obj).extensible && !exists {
                                 return Ok(false);
                             }
+                            if let ObjectKind::Array(ref mut arr) = self.heap.get_obj_mut(obj).kind {
+                                arr.set(idx_u, val);
+                            }
+                            return Ok(true);
                         }
-                        if let ObjectKind::Array(ref mut arr) = self.heap.get_obj_mut(obj).kind {
-                            arr.set(idx_u, val);
-                        }
-                        return Ok(true);
                     }
                     if idx_u >= 65_536 {
                         if let ObjectKind::Array(ref mut arr) = self.heap.get_obj_mut(obj).kind {
@@ -1405,16 +1800,57 @@ impl JsRuntime {
             if kind_tag == 2 {
                 if let Some(idx) = parse_array_index(k) {
                     let idx_u = idx as usize;
-                    let deleted = self
-                        .heap
-                        .deleted_arg_indices
-                        .get(&obj)
-                        .is_some_and(|s| s.contains(&idx_u));
-                    if !deleted {
-                        if let ObjectKind::Arguments(ref mut a) = self.heap.get_obj_mut(obj).kind {
-                            if idx_u < a.values.len() {
-                                a.values[idx_u] = val;
-                                return Ok(true);
+                    let mapped_target = match &self.heap.get_obj(obj).kind {
+                        ObjectKind::Arguments(a) => a.mapped_env.and_then(|eid| {
+                            a.mapped_params
+                                .get(idx_u)
+                                .and_then(|p| p.clone())
+                                .map(|pn| (eid, pn))
+                        }),
+                        _ => None,
+                    };
+                    if let Some((eid, pname)) = mapped_target {
+                        if receiver == JsValue::Object(obj) {
+                            let writable = self
+                                .heap
+                                .get_obj(obj)
+                                .get_own_prop(&key)
+                                .map(|e| e.writable)
+                                .unwrap_or(true);
+                            if !writable {
+                                return Ok(false);
+                            }
+                            if let Some(b) = self.heap.get_env_mut(eid).bindings.get_mut(&pname) {
+                                b.value = val.clone();
+                            }
+                            if let ObjectKind::Arguments(ref mut a) =
+                                self.heap.get_obj_mut(obj).kind
+                            {
+                                if idx_u < a.values.len() {
+                                    a.values[idx_u] = val.clone();
+                                }
+                            }
+                            if let Some(e) = self.heap.get_obj_mut(obj).get_own_prop_mut(&key) {
+                                e.value = PropValue::Data(val);
+                            }
+                            return Ok(true);
+                        }
+                    } else if self.heap.get_obj(obj).get_own_prop(&key).is_none()
+                        && receiver == JsValue::Object(obj)
+                    {
+                        let deleted = self
+                            .heap
+                            .deleted_arg_indices
+                            .get(&obj)
+                            .is_some_and(|s| s.contains(&idx_u));
+                        if !deleted {
+                            if let ObjectKind::Arguments(ref mut a) =
+                                self.heap.get_obj_mut(obj).kind
+                            {
+                                if idx_u < a.values.len() {
+                                    a.values[idx_u] = val;
+                                    return Ok(true);
+                                }
                             }
                         }
                     }
@@ -1452,29 +1888,8 @@ impl JsRuntime {
             }
         }
 
-        let mut proto = self.heap.get_obj(obj).prototype;
-        while let Some(pid) = proto {
-            let p_entry = self.heap.get_obj(pid).get_own_prop(&key).cloned();
-            if let Some(entry) = p_entry {
-                match entry.value {
-                    PropValue::Accessor { set, .. } => {
-                        if let Some(setter) = set {
-                            if !setter.is_undefined() {
-                                self.call_function(setter, receiver, &[val])?;
-                                return Ok(true);
-                            }
-                        }
-                        return Ok(false);
-                    }
-                    PropValue::Data(_) => {
-                        if !entry.writable {
-                            return Ok(false);
-                        }
-                        break;
-                    }
-                }
-            }
-            proto = self.heap.get_obj(pid).prototype;
+        if let Some(pid) = self.heap.get_obj(obj).prototype {
+            return self.set_property_key_receiver(pid, key, val, receiver);
         }
 
         if let JsValue::Object(recv_id) = receiver {
@@ -1587,8 +2002,13 @@ impl JsRuntime {
                     {
                         return Ok(false);
                     }
+                    let obj_extensible = self.heap.get_obj(obj).extensible;
                     let (is_plain_data, existing_val) = match &mut self.heap.get_obj_mut(obj).kind {
                         ObjectKind::Array(ref mut arr) => {
+                            let exists = arr.get(idx as usize).is_some();
+                            if !obj_extensible && !exists {
+                                return Ok(false);
+                            }
                             let plain = !desc.is_accessor()
                                 && desc.writable.unwrap_or(true)
                                 && desc.enumerable.unwrap_or(true)
@@ -1618,6 +2038,104 @@ impl JsRuntime {
                             o.set_own_prop(key.clone(), PropEntry::data(ev, true, true, true));
                         }
                     }
+                }
+            }
+            if matches!(self.heap.get_obj(obj).kind, ObjectKind::Arguments(_)) {
+                if let Some(idx) = parse_array_index(k) {
+                    let idx_u = idx as usize;
+                    let (mapped_target, arg_val, deleted) = {
+                        let del = self
+                            .heap
+                            .deleted_arg_indices
+                            .get(&obj)
+                            .is_some_and(|s| s.contains(&idx_u));
+                        match &self.heap.get_obj(obj).kind {
+                            ObjectKind::Arguments(a) => {
+                                let mt = a.mapped_env.and_then(|eid| {
+                                    a.mapped_params
+                                        .get(idx_u)
+                                        .and_then(|p| p.clone())
+                                        .map(|pn| (eid, pn))
+                                });
+                                let av = a.values.get(idx_u).cloned();
+                                (mt, av, del)
+                            }
+                            _ => (None, None, del),
+                        }
+                    };
+                    let live_val = mapped_target.as_ref().and_then(|(eid, pn)| {
+                        self.heap
+                            .get_env(*eid)
+                            .bindings
+                            .get(pn)
+                            .map(|b| b.value.clone())
+                    });
+                    if !deleted && self.heap.get_obj(obj).get_own_prop(&key).is_none() {
+                        if let Some(v) = live_val.clone().or(arg_val) {
+                            self.heap.get_obj_mut(obj).set_own_prop(
+                                key.clone(),
+                                PropEntry::data(v, true, true, true),
+                            );
+                        }
+                    } else if let Some(ref lv) = live_val {
+                        if let Some(e) = self.heap.get_obj_mut(obj).get_own_prop_mut(&key) {
+                            if matches!(e.value, PropValue::Data(_)) {
+                                e.value = PropValue::Data(lv.clone());
+                            }
+                        }
+                    }
+                    let mut new_arg_desc = desc.clone();
+                    if mapped_target.is_some()
+                        && !desc.is_accessor()
+                        && desc.value.is_none()
+                        && desc.writable == Some(false)
+                    {
+                        if let Some(lv) = live_val {
+                            new_arg_desc.value = Some(lv);
+                        }
+                    }
+                    let allowed = self.ordinary_define_own_property(obj, key.clone(), new_arg_desc)?;
+                    if !allowed {
+                        return Ok(false);
+                    }
+                    if let Some(set) = self.heap.deleted_arg_indices.get_mut(&obj) {
+                        set.remove(&idx_u);
+                    }
+                    if let Some((eid, pname)) = mapped_target {
+                        if desc.is_accessor() {
+                            if let ObjectKind::Arguments(ref mut a) =
+                                self.heap.get_obj_mut(obj).kind
+                            {
+                                if idx_u < a.mapped_params.len() {
+                                    a.mapped_params[idx_u] = None;
+                                }
+                            }
+                        } else {
+                            if let Some(v) = desc.value {
+                                if let Some(b) = self.heap.get_env_mut(eid).bindings.get_mut(&pname)
+                                {
+                                    b.value = v.clone();
+                                }
+                                if let ObjectKind::Arguments(ref mut a) =
+                                    self.heap.get_obj_mut(obj).kind
+                                {
+                                    if idx_u < a.values.len() {
+                                        a.values[idx_u] = v;
+                                    }
+                                }
+                            }
+                            if desc.writable == Some(false) {
+                                if let ObjectKind::Arguments(ref mut a) =
+                                    self.heap.get_obj_mut(obj).kind
+                                {
+                                    if idx_u < a.mapped_params.len() {
+                                        a.mapped_params[idx_u] = None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(true);
                 }
             }
             let str_cur = match &self.heap.get_obj(obj).kind {
@@ -1653,6 +2171,15 @@ impl JsRuntime {
             }
         }
 
+        self.ordinary_define_own_property(obj, key, desc)
+    }
+
+    fn ordinary_define_own_property(
+        &mut self,
+        obj: ObjectId,
+        key: PropertyKey,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, JsError> {
         let current = self.heap.get_obj(obj).get_own_prop(&key).cloned();
         let extensible = self.heap.get_obj(obj).extensible;
 
@@ -1861,12 +2388,19 @@ impl JsRuntime {
 
         if let PropertyKey::String(ref k) = key {
             match &mut self.heap.get_obj_mut(obj).kind {
-                ObjectKind::Array(ref mut arr) => {
+                ObjectKind::Array(_) => {
                     if k == "length" {
                         return Ok(false);
                     }
                     if let Some(idx) = parse_array_index(k) {
-                        arr.delete(idx as usize);
+                        if let Some(entry) = self.heap.get_obj(obj).get_own_prop(key) {
+                            if !entry.configurable {
+                                return Ok(false);
+                            }
+                        }
+                        if let ObjectKind::Array(ref mut arr) = self.heap.get_obj_mut(obj).kind {
+                            arr.delete(idx as usize);
+                        }
                         self.heap.get_obj_mut(obj).remove_own_prop(key);
                         return Ok(true);
                     }
@@ -1882,14 +2416,28 @@ impl JsRuntime {
                     }
                 }
                 ObjectKind::Arguments(args) => {
+                    let arg_len = args.values.len();
                     if let Some(idx) = parse_array_index(k) {
-                        if (idx as usize) < args.values.len() {
+                        let idx_u = idx as usize;
+                        if idx_u < arg_len {
+                            if let Some(entry) = self.heap.get_obj(obj).get_own_prop(key) {
+                                if !entry.configurable {
+                                    return Ok(false);
+                                }
+                            }
                             self.heap
                                 .deleted_arg_indices
                                 .entry(obj)
                                 .or_default()
-                                .insert(idx as usize);
+                                .insert(idx_u);
                             self.heap.get_obj_mut(obj).remove_own_prop(key);
+                            if let ObjectKind::Arguments(ref mut a) =
+                                self.heap.get_obj_mut(obj).kind
+                            {
+                                if idx_u < a.mapped_params.len() {
+                                    a.mapped_params[idx_u] = None;
+                                }
+                            }
                             return Ok(true);
                         }
                     }
@@ -2071,7 +2619,19 @@ impl JsRuntime {
 
         let o = self.heap.get_obj(obj);
         if let Some(entry) = o.get_own_prop(key) {
-            return Ok(Some(entry.to_descriptor()));
+            let mut desc = entry.to_descriptor();
+            if let (PropertyKey::String(k), ObjectKind::Arguments(args)) = (key, &o.kind) {
+                if let Some(idx) = parse_array_index(k) {
+                    if let Some(env_id) = args.mapped_env {
+                        if let Some(Some(ref pname)) = args.mapped_params.get(idx as usize) {
+                            if let Some(b) = self.heap.get_env(env_id).bindings.get(pname) {
+                                desc.value = Some(b.value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(Some(desc));
         }
         if let PropertyKey::String(ref k) = key {
             match &o.kind {
@@ -2113,13 +2673,26 @@ impl JsRuntime {
                 }
                 ObjectKind::Arguments(args) => {
                     if let Some(idx) = parse_array_index(k) {
+                        let idx_u = idx as usize;
+                        if let Some(env_id) = args.mapped_env {
+                            if let Some(Some(ref pname)) = args.mapped_params.get(idx_u) {
+                                if let Some(b) = self.heap.get_env(env_id).bindings.get(pname) {
+                                    return Ok(Some(PropertyDescriptor::data(
+                                        b.value.clone(),
+                                        true,
+                                        true,
+                                        true,
+                                    )));
+                                }
+                            }
+                        }
                         let deleted = self
                             .heap
                             .deleted_arg_indices
                             .get(&obj)
-                            .is_some_and(|s| s.contains(&(idx as usize)));
+                            .is_some_and(|s| s.contains(&idx_u));
                         if !deleted {
-                            if let Some(v) = args.values.get(idx as usize) {
+                            if let Some(v) = args.values.get(idx_u) {
                                 return Ok(Some(PropertyDescriptor::data(v.clone(), true, true, true)));
                             }
                         }
@@ -2708,6 +3281,14 @@ impl JsRuntime {
         index: usize,
         converted: &JsValue,
     ) -> Result<(), JsError> {
+        if self
+            .heap
+            .buffer_meta
+            .get(&ta.buffer)
+            .is_some_and(|m| m.immutable)
+        {
+            return Err(JsError::type_err("TypedArray buffer is immutable"));
+        }
         let es = ta.kind.element_size();
         let off = ta.byte_offset + index * es;
         let ObjectKind::ArrayBuffer(ref mut ab) = self.heap.get_obj_mut(ta.buffer).kind else {
@@ -2878,13 +3459,48 @@ impl JsRuntime {
     }
 
     pub fn iterator_close(&mut self, iter: &JsValue) {
-        if let JsValue::Object(oid) = iter {
-            if let Ok(ret_fn) = self.get_property(*oid, "return") {
-                if self.is_callable(&ret_fn) {
-                    let _ = self.call_function(ret_fn, iter.clone(), &[]);
+        let _ = self.iterator_close_checked(iter, true);
+    }
+
+    pub fn iterator_close_checked(
+        &mut self,
+        iter: &JsValue,
+        suppress_err: bool,
+    ) -> Result<(), JsError> {
+        let JsValue::Object(oid) = iter else {
+            return Ok(());
+        };
+        let ret_fn = match self.get_property(*oid, "return") {
+            Ok(v) => v,
+            Err(e) => {
+                if suppress_err {
+                    return Ok(());
                 }
+                return Err(e);
             }
+        };
+        if ret_fn.is_nullish() {
+            return Ok(());
         }
+        if !self.is_callable(&ret_fn) {
+            if suppress_err {
+                return Ok(());
+            }
+            return Err(JsError::type_err("Iterator return is not callable"));
+        }
+        let res = match self.call_function(ret_fn, iter.clone(), &[]) {
+            Ok(v) => v,
+            Err(e) => {
+                if suppress_err {
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        };
+        if !suppress_err && !res.is_object() {
+            return Err(JsError::type_err("Iterator result is not an object"));
+        }
+        Ok(())
     }
 
     pub fn collect_iterable(&mut self, val: &JsValue) -> Result<Vec<JsValue>, JsError> {
@@ -2976,7 +3592,11 @@ impl JsRuntime {
                             &[JsValue::Object(res_cb), JsValue::Object(rej_cb)],
                         ) {
                             let ev = rt.error_to_js_value(e);
-                            rt.reject_promise(pid, ev);
+                            let _ = rt.call_function(
+                                JsValue::Object(rej_cb),
+                                JsValue::Undefined,
+                                &[ev],
+                            );
                         }
                     });
                     return;
@@ -3097,8 +3717,18 @@ impl JsRuntime {
     }
 
     pub fn create_builtin_iterator(&mut self, kind: BuiltinIteratorKind) -> ObjectId {
+        let proto = match &kind {
+            BuiltinIteratorKind::Array { .. } => self.intrinsics.array_iterator_proto,
+            BuiltinIteratorKind::String { .. } => self.intrinsics.string_iterator_proto,
+            BuiltinIteratorKind::Map { .. } => self.intrinsics.map_iterator_proto,
+            BuiltinIteratorKind::Set { .. } => self.intrinsics.set_iterator_proto,
+            BuiltinIteratorKind::RegExpMatchAll { .. } => {
+                self.intrinsics.regexp_string_iterator_proto
+            }
+            BuiltinIteratorKind::Keys(_) => self.intrinsics.iterator_proto,
+        };
         self.heap.alloc_object(JsObject::new(
-            Some(self.intrinsics.iterator_proto),
+            Some(proto),
             ObjectKind::Iterator(IteratorData { kind, index: 0 }),
         ))
     }

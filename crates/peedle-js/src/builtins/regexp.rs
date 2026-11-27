@@ -464,14 +464,29 @@ pub fn init(rt: &mut JsRuntime) {
         }),
     );
 
-    let ctor = rt.create_native_constructor(
+    let ctor = rt.create_spec_constructor(
         "RegExp",
         2,
         proto,
         Rc::new(|rt, _, args| {
             let pat_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
             let flags_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-            if let JsValue::Object(pid) = pat_arg {
+            let is_new = matches!(&rt.native_new_target, Some(nt) if !nt.is_undefined());
+            let pat_is_regexp = is_regexp_val(rt, &pat_arg)?;
+            if !is_new && pat_is_regexp && flags_arg.is_undefined() {
+                if let JsValue::Object(pid) = pat_arg {
+                    let pat_ctor = rt.get_property(pid, "constructor")?;
+                    if pat_ctor == JsValue::Object(rt.intrinsics.regexp_ctor) {
+                        return Ok(pat_arg);
+                    }
+                }
+            }
+            let obj_proto = if is_new {
+                rt.get_prototype_from_new_target(rt.intrinsics.regexp_proto)?
+            } else {
+                rt.intrinsics.regexp_proto
+            };
+            let (pat, fl) = if let JsValue::Object(pid) = pat_arg {
                 if let ObjectKind::RegExp(ref re) = rt.heap.get_obj(pid).kind {
                     let orig = re.original_source.clone();
                     let orig_flags = re.compiled.flags.canonical_string();
@@ -480,20 +495,50 @@ pub fn init(rt: &mut JsRuntime) {
                     } else {
                         rt.to_string(&flags_arg)?
                     };
-                    return Ok(JsValue::Object(rt.create_regexp_object(&orig, &fl)?));
+                    (orig, fl)
+                } else if pat_is_regexp {
+                    let p_v = rt.get_property(pid, "source")?;
+                    let f_v = if flags_arg.is_undefined() {
+                        rt.get_property(pid, "flags")?
+                    } else {
+                        flags_arg.clone()
+                    };
+                    let p = if p_v.is_undefined() {
+                        String::new()
+                    } else {
+                        rt.to_string(&p_v)?
+                    };
+                    let f = if f_v.is_undefined() {
+                        String::new()
+                    } else {
+                        rt.to_string(&f_v)?
+                    };
+                    (p, f)
+                } else {
+                    let p = rt.to_string(&pat_arg)?;
+                    let f = if flags_arg.is_undefined() {
+                        String::new()
+                    } else {
+                        rt.to_string(&flags_arg)?
+                    };
+                    (p, f)
                 }
-            }
-            let pat = if pat_arg.is_undefined() {
-                String::new()
             } else {
-                rt.to_string(&pat_arg)?
+                let p = if pat_arg.is_undefined() {
+                    String::new()
+                } else {
+                    rt.to_string(&pat_arg)?
+                };
+                let f = if flags_arg.is_undefined() {
+                    String::new()
+                } else {
+                    rt.to_string(&flags_arg)?
+                };
+                (p, f)
             };
-            let fl = if flags_arg.is_undefined() {
-                String::new()
-            } else {
-                rt.to_string(&flags_arg)?
-            };
-            Ok(JsValue::Object(rt.create_regexp_object(&pat, &fl)?))
+            let oid = rt.create_regexp_object(&pat, &fl)?;
+            rt.heap.get_obj_mut(oid).prototype = Some(obj_proto);
+            Ok(JsValue::Object(oid))
         }),
     );
     rt.intrinsics.regexp_ctor = ctor;
@@ -514,7 +559,19 @@ pub fn init(rt: &mut JsRuntime) {
     set_global(rt, "RegExp", JsValue::Object(ctor));
 }
 
-fn regexp_exec(rt: &mut JsRuntime, oid: ObjectId, input: &str) -> Result<JsValue, JsError> {
+fn is_regexp_val(rt: &mut JsRuntime, val: &JsValue) -> Result<bool, JsError> {
+    let JsValue::Object(oid) = val else {
+        return Ok(false);
+    };
+    let sym_match = PropertyKey::Symbol(rt.symbols.match_sym);
+    let m = rt.get_property_key(*oid, &sym_match)?;
+    if !m.is_undefined() {
+        return Ok(m.to_boolean());
+    }
+    Ok(matches!(rt.heap.get_obj(*oid).kind, ObjectKind::RegExp(_)))
+}
+
+pub(crate) fn regexp_exec(rt: &mut JsRuntime, oid: ObjectId, input: &str) -> Result<JsValue, JsError> {
     let compiled = match &rt.heap.get_obj(oid).kind {
         ObjectKind::RegExp(re) => re.compiled.clone(),
         _ => return Err(JsError::type_err("Method RegExp.prototype.exec called on non-RegExp")),

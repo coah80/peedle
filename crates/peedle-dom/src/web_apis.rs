@@ -571,6 +571,31 @@ fn define_url_apis(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {
             Ok(JsValue::Undefined)
         }),
     );
+    let usp_sort = rt.create_native_function(
+        "sort",
+        0,
+        Rc::new(|rt, this, _| {
+            if let Some(o) = this.as_object() {
+                if let Some(p) = rt.get_host_data_mut::<UrlSearchParams>(o) {
+                    p.sort();
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let usp_get_all = rt.create_native_function(
+        "getAll",
+        1,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let vals: Vec<JsValue> = this
+                .as_object()
+                .and_then(|o| rt.get_host_data::<UrlSearchParams>(o))
+                .map(|p| p.get_all(&k).into_iter().map(|s| JsValue::String(s.to_string())).collect())
+                .unwrap_or_default();
+            Ok(JsValue::Object(rt.create_array(vals)))
+        }),
+    );
     let usp_to_string = rt.create_native_function(
         "toString",
         0,
@@ -584,10 +609,12 @@ fn define_url_apis(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {
         }),
     );
     let _ = rt.set_property(usp_proto, "get", JsValue::Object(usp_get));
+    let _ = rt.set_property(usp_proto, "getAll", JsValue::Object(usp_get_all));
     let _ = rt.set_property(usp_proto, "set", JsValue::Object(usp_set));
     let _ = rt.set_property(usp_proto, "append", JsValue::Object(usp_append));
     let _ = rt.set_property(usp_proto, "has", JsValue::Object(usp_has));
     let _ = rt.set_property(usp_proto, "delete", JsValue::Object(usp_delete));
+    let _ = rt.set_property(usp_proto, "sort", JsValue::Object(usp_sort));
     let _ = rt.set_property(usp_proto, "toString", JsValue::Object(usp_to_string));
 
     let usp_ctor = rt.create_native_constructor(
@@ -777,16 +804,61 @@ fn define_fetch_and_xhr(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {
             let sig = rt.create_object();
             let _ = rt.set_property(sig, "aborted", JsValue::Boolean(false));
             let _ = rt.set_property(sig, "reason", JsValue::Undefined);
-            let noop = rt.create_native_function("noop", 0, Rc::new(|_, _, _| Ok(JsValue::Undefined)));
-            let _ = rt.set_property(sig, "addEventListener", JsValue::Object(noop));
-            let _ = rt.set_property(sig, "removeEventListener", JsValue::Object(noop));
+            let sig_listeners: Rc<std::cell::RefCell<Vec<JsValue>>> =
+                Rc::new(std::cell::RefCell::new(Vec::new()));
+            let sl_add = sig_listeners.clone();
+            let add_el = rt.create_native_function(
+                "addEventListener",
+                2,
+                Rc::new(move |rt, _, args| {
+                    let ev = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+                    if ev == "abort" {
+                        if let Some(cb) = args.get(1) {
+                            sl_add.borrow_mut().push(cb.clone());
+                        }
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+            let sl_rem = sig_listeners.clone();
+            let rem_el = rt.create_native_function(
+                "removeEventListener",
+                2,
+                Rc::new(move |rt, _, args| {
+                    let ev = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+                    if ev == "abort" {
+                        if let Some(cb) = args.get(1) {
+                            sl_rem.borrow_mut().retain(|f| f != cb);
+                        }
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+            let _ = rt.set_property(sig, "addEventListener", JsValue::Object(add_el));
+            let _ = rt.set_property(sig, "removeEventListener", JsValue::Object(rem_el));
+            let sl_fire = sig_listeners.clone();
             let abort_fn = rt.create_native_function(
                 "abort",
                 1,
                 Rc::new(move |rt, _, args| {
+                    if rt.get_property(sig, "aborted").map_or(false, |v| rt.to_boolean(&v)) {
+                        return Ok(JsValue::Undefined);
+                    }
                     let _ = rt.set_property(sig, "aborted", JsValue::Boolean(true));
                     let reason = args.first().cloned().unwrap_or(JsValue::String("AbortError".into()));
                     let _ = rt.set_property(sig, "reason", reason);
+                    let ev_obj = rt.create_object();
+                    let _ = rt.set_property(ev_obj, "type", JsValue::String("abort".into()));
+                    let _ = rt.set_property(ev_obj, "target", JsValue::Object(sig));
+                    let cbs = sl_fire.borrow().clone();
+                    for cb in cbs {
+                        let _ = rt.call_function(cb, JsValue::Object(sig), &[JsValue::Object(ev_obj)]);
+                    }
+                    if let Ok(onabort) = rt.get_property(sig, "onabort") {
+                        if rt.is_callable(&onabort) {
+                            let _ = rt.call_function(onabort, JsValue::Object(sig), &[JsValue::Object(ev_obj)]);
+                        }
+                    }
                     Ok(JsValue::Undefined)
                 }),
             );
@@ -796,6 +868,222 @@ fn define_fetch_and_xhr(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {
         }),
     );
     let _ = rt.set_property(global, "AbortController", JsValue::Object(ac_ctor));
+
+    define_headers_and_formdata(rt, global);
+}
+
+struct HeadersData(Vec<(String, String)>);
+struct FormDataStore(Vec<(String, JsValue)>);
+
+fn define_headers_and_formdata(rt: &mut JsRuntime, global: ObjectId) {
+    let h_proto = rt.create_object();
+    let h_append = rt.create_native_function(
+        "append",
+        2,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default().to_ascii_lowercase();
+            let v = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            if let Some(o) = this.as_object() {
+                if let Some(hd) = rt.get_host_data_mut::<HeadersData>(o) {
+                    if let Some(existing) = hd.0.iter_mut().find(|(ek, _)| ek == &k) {
+                        existing.1.push_str(", ");
+                        existing.1.push_str(&v);
+                    } else {
+                        hd.0.push((k, v));
+                    }
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let h_set = rt.create_native_function(
+        "set",
+        2,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default().to_ascii_lowercase();
+            let v = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            if let Some(o) = this.as_object() {
+                if let Some(hd) = rt.get_host_data_mut::<HeadersData>(o) {
+                    if let Some(existing) = hd.0.iter_mut().find(|(ek, _)| ek == &k) {
+                        existing.1 = v;
+                    } else {
+                        hd.0.push((k, v));
+                    }
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let h_get = rt.create_native_function(
+        "get",
+        1,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default().to_ascii_lowercase();
+            let found = this
+                .as_object()
+                .and_then(|o| rt.get_host_data::<HeadersData>(o))
+                .and_then(|hd| hd.0.iter().find(|(ek, _)| ek == &k).map(|(_, v)| v.clone()));
+            Ok(match found {
+                Some(s) => JsValue::String(s),
+                None => JsValue::Null,
+            })
+        }),
+    );
+    let h_has = rt.create_native_function(
+        "has",
+        1,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default().to_ascii_lowercase();
+            let ok = this
+                .as_object()
+                .and_then(|o| rt.get_host_data::<HeadersData>(o))
+                .map_or(false, |hd| hd.0.iter().any(|(ek, _)| ek == &k));
+            Ok(JsValue::Boolean(ok))
+        }),
+    );
+    let h_del = rt.create_native_function(
+        "delete",
+        1,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default().to_ascii_lowercase();
+            if let Some(o) = this.as_object() {
+                if let Some(hd) = rt.get_host_data_mut::<HeadersData>(o) {
+                    hd.0.retain(|(ek, _)| ek != &k);
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let _ = rt.set_property(h_proto, "append", JsValue::Object(h_append));
+    let _ = rt.set_property(h_proto, "set", JsValue::Object(h_set));
+    let _ = rt.set_property(h_proto, "get", JsValue::Object(h_get));
+    let _ = rt.set_property(h_proto, "has", JsValue::Object(h_has));
+    let _ = rt.set_property(h_proto, "delete", JsValue::Object(h_del));
+
+    let h_ctor = rt.create_native_constructor(
+        "Headers",
+        0,
+        h_proto,
+        Rc::new(move |rt, _, args| {
+            let obj = rt.create_object_with_proto(Some(h_proto));
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            if let Some(init_oid) = args.first().and_then(|v| v.as_object()) {
+                if let Ok(keys) = rt.own_keys(init_oid) {
+                    for pk in keys {
+                        if let peedle_js::PropertyKey::String(k) = pk {
+                            if let Ok(v) = rt.get_property(init_oid, &k) {
+                                if let Ok(vs) = rt.to_string(&v) {
+                                    pairs.push((k.to_ascii_lowercase(), vs));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            rt.set_host_data(obj, HeadersData(pairs));
+            Ok(JsValue::Object(obj))
+        }),
+    );
+    let _ = rt.set_property(global, "Headers", JsValue::Object(h_ctor));
+
+    let fd_proto = rt.create_object();
+    let fd_append = rt.create_native_function(
+        "append",
+        2,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let v = args.get(1).cloned().unwrap_or(JsValue::String(String::new()));
+            if let Some(o) = this.as_object() {
+                if let Some(fd) = rt.get_host_data_mut::<FormDataStore>(o) {
+                    fd.0.push((k, v));
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let fd_set = rt.create_native_function(
+        "set",
+        2,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let v = args.get(1).cloned().unwrap_or(JsValue::String(String::new()));
+            if let Some(o) = this.as_object() {
+                if let Some(fd) = rt.get_host_data_mut::<FormDataStore>(o) {
+                    fd.0.retain(|(ek, _)| ek != &k);
+                    fd.0.push((k, v));
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let fd_get = rt.create_native_function(
+        "get",
+        1,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let found = this
+                .as_object()
+                .and_then(|o| rt.get_host_data::<FormDataStore>(o))
+                .and_then(|fd| fd.0.iter().find(|(ek, _)| ek == &k).map(|(_, v)| v.clone()));
+            Ok(found.unwrap_or(JsValue::Null))
+        }),
+    );
+    let fd_get_all = rt.create_native_function(
+        "getAll",
+        1,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let vals: Vec<JsValue> = this
+                .as_object()
+                .and_then(|o| rt.get_host_data::<FormDataStore>(o))
+                .map(|fd| fd.0.iter().filter(|(ek, _)| ek == &k).map(|(_, v)| v.clone()).collect())
+                .unwrap_or_default();
+            Ok(JsValue::Object(rt.create_array(vals)))
+        }),
+    );
+    let fd_has = rt.create_native_function(
+        "has",
+        1,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let ok = this
+                .as_object()
+                .and_then(|o| rt.get_host_data::<FormDataStore>(o))
+                .map_or(false, |fd| fd.0.iter().any(|(ek, _)| ek == &k));
+            Ok(JsValue::Boolean(ok))
+        }),
+    );
+    let fd_del = rt.create_native_function(
+        "delete",
+        1,
+        Rc::new(|rt, this, args| {
+            let k = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            if let Some(o) = this.as_object() {
+                if let Some(fd) = rt.get_host_data_mut::<FormDataStore>(o) {
+                    fd.0.retain(|(ek, _)| ek != &k);
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let _ = rt.set_property(fd_proto, "append", JsValue::Object(fd_append));
+    let _ = rt.set_property(fd_proto, "set", JsValue::Object(fd_set));
+    let _ = rt.set_property(fd_proto, "get", JsValue::Object(fd_get));
+    let _ = rt.set_property(fd_proto, "getAll", JsValue::Object(fd_get_all));
+    let _ = rt.set_property(fd_proto, "has", JsValue::Object(fd_has));
+    let _ = rt.set_property(fd_proto, "delete", JsValue::Object(fd_del));
+
+    let fd_ctor = rt.create_native_constructor(
+        "FormData",
+        0,
+        fd_proto,
+        Rc::new(move |rt, _, _| {
+            let obj = rt.create_object_with_proto(Some(fd_proto));
+            rt.set_host_data(obj, FormDataStore(Vec::new()));
+            Ok(JsValue::Object(obj))
+        }),
+    );
+    let _ = rt.set_property(global, "FormData", JsValue::Object(fd_ctor));
 }
 
 fn define_observers_and_misc(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {
@@ -911,6 +1199,7 @@ fn define_observers_and_misc(rt: &mut JsRuntime, dom: SharedDom, global: ObjectI
                 st.mutation_observers.push(MutationObserverEntry {
                     callback: cb,
                     targets: Vec::new(),
+                    records: Vec::new(),
                 });
                 i
             };
@@ -955,10 +1244,47 @@ fn define_observers_and_misc(rt: &mut JsRuntime, dom: SharedDom, global: ObjectI
                     Ok(JsValue::Undefined)
                 }),
             );
+            let d3 = d.clone();
             let take_fn = rt.create_native_function(
                 "takeRecords",
                 0,
-                Rc::new(|rt, _, _| Ok(JsValue::Object(rt.create_array(Vec::new())))),
+                Rc::new(move |rt, _, _| {
+                    let raw = d3
+                        .borrow_mut()
+                        .mutation_observers
+                        .get_mut(idx)
+                        .map(|e| std::mem::take(&mut e.records))
+                        .unwrap_or_default();
+                    let mut out = Vec::with_capacity(raw.len());
+                    for rec in raw {
+                        let ro = rt.create_object();
+                        let _ = rt.set_property(ro, "type", JsValue::String(rec.kind.to_string()));
+                        let target_val = crate::nodes::wrap_node(rt, &d3, rec.target);
+                        let _ = rt.set_property(ro, "target", JsValue::Object(target_val));
+                        let _ = rt.set_property(
+                            ro,
+                            "attributeName",
+                            match rec.attribute_name {
+                                Some(s) => JsValue::String(s),
+                                None => JsValue::Null,
+                            },
+                        );
+                        let _ = rt.set_property(
+                            ro,
+                            "oldValue",
+                            match rec.old_value {
+                                Some(s) => JsValue::String(s),
+                                None => JsValue::Null,
+                            },
+                        );
+                        let empty1 = rt.create_array(Vec::new());
+                        let empty2 = rt.create_array(Vec::new());
+                        let _ = rt.set_property(ro, "addedNodes", JsValue::Object(empty1));
+                        let _ = rt.set_property(ro, "removedNodes", JsValue::Object(empty2));
+                        out.push(JsValue::Object(ro));
+                    }
+                    Ok(JsValue::Object(rt.create_array(out)))
+                }),
             );
             let _ = rt.set_property(obj, "observe", JsValue::Object(obs_fn));
             let _ = rt.set_property(obj, "disconnect", JsValue::Object(disc_fn));

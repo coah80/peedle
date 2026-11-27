@@ -120,6 +120,7 @@ pub struct Token {
     pub line: usize,
     pub col: usize,
     pub preceded_by_newline: bool,
+    pub strict_error: Option<&'static str>,
 }
 
 #[derive(Clone)]
@@ -130,6 +131,7 @@ pub struct Lexer<'a> {
     line: usize,
     col: usize,
     at_line_start: bool,
+    pending_strict_error: Option<&'static str>,
 }
 
 impl<'a> Lexer<'a> {
@@ -141,6 +143,7 @@ impl<'a> Lexer<'a> {
             line: 1,
             col: 1,
             at_line_start: true,
+            pending_strict_error: None,
         };
         if lex.src.starts_with("\u{FEFF}") {
             lex.pos = 3;
@@ -276,6 +279,7 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn next_token(&mut self, allow_regexp: bool) -> Result<Token, JsError> {
+        self.pending_strict_error = None;
         let preceded_by_newline = self.skip_whitespace_and_comments()?;
         self.at_line_start = false;
         let start = self.pos;
@@ -290,6 +294,7 @@ impl<'a> Lexer<'a> {
                 line,
                 col,
                 preceded_by_newline,
+                strict_error: None,
             });
         };
 
@@ -599,10 +604,12 @@ impl<'a> Lexer<'a> {
             line,
             col,
             preceded_by_newline,
+            strict_error: self.pending_strict_error.take(),
         })
     }
 
     pub fn next_template_continuation(&mut self) -> Result<Token, JsError> {
+        self.pending_strict_error = None;
         let start = self.pos;
         let line = self.line;
         let col = self.col;
@@ -614,6 +621,7 @@ impl<'a> Lexer<'a> {
             line,
             col,
             preceded_by_newline: false,
+            strict_error: None,
         })
     }
 
@@ -754,6 +762,7 @@ impl<'a> Lexer<'a> {
                     if in_template {
                         return Err(JsError::syntax("Octal escape in template"));
                     }
+                    self.pending_strict_error = Some("Octal escape sequences are not allowed in strict mode");
                     let mut val = 0u32;
                     for _ in 0..2 {
                         if let Some(b) = self.peek_byte() {
@@ -770,6 +779,7 @@ impl<'a> Lexer<'a> {
                     if in_template {
                         return Err(JsError::syntax("Invalid escape in template"));
                     }
+                    self.pending_strict_error = Some("Octal escape sequences are not allowed in strict mode");
                     '\0'
                 } else {
                     '\0'
@@ -779,6 +789,7 @@ impl<'a> Lexer<'a> {
                 if in_template {
                     return Err(JsError::syntax("Octal escape in template"));
                 }
+                self.pending_strict_error = Some("Octal escape sequences are not allowed in strict mode");
                 let mut val = (c as u32) - ('0' as u32);
                 let max_extra = if c <= '3' { 2 } else { 1 };
                 for _ in 0..max_extra {
@@ -792,6 +803,13 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 char::from_u32(val).unwrap_or('\u{FFFD}')
+            }
+            '8' | '9' => {
+                if in_template {
+                    return Err(JsError::syntax("Non-octal decimal escape in template"));
+                }
+                self.pending_strict_error = Some("Non-octal decimal escape sequences are not allowed in strict mode");
+                c
             }
             'x' => {
                 let code = self.read_hex_digits(2)?;
@@ -915,8 +933,18 @@ impl<'a> Lexer<'a> {
         Ok(TokenKind::RegExp(pattern, flags))
     }
 
+    fn check_after_numeric(&self) -> Result<(), JsError> {
+        if let Some(c) = self.peek_char() {
+            if is_ident_start(c) || c.is_ascii_digit() {
+                return Err(JsError::syntax(
+                    "Identifier or digit directly after numeric literal",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn lex_number(&mut self) -> Result<TokenKind, JsError> {
-        let start = self.pos;
         if self.peek_byte() == Some(b'0') {
             match self.peek_byte_at(1) {
                 Some(b'x' | b'X') => {
@@ -934,7 +962,12 @@ impl<'a> Lexer<'a> {
                     self.col += 2;
                     return self.lex_radix_number(8, |b| (b'0'..=b'7').contains(&b));
                 }
-                Some(b'0'..=b'7') => {
+                Some(b'_') => {
+                    return Err(JsError::syntax(
+                        "Numeric separator cannot appear after leading 0",
+                    ));
+                }
+                Some(b'0'..=b'9') => {
                     self.advance_byte();
                     let mut is_octal = true;
                     let mut digits = String::new();
@@ -945,18 +978,55 @@ impl<'a> Lexer<'a> {
                             }
                             self.advance_byte();
                             digits.push(b as char);
+                        } else if b == b'_' {
+                            return Err(JsError::syntax(
+                                "Numeric separator not allowed in legacy octal or non-octal decimal literal",
+                            ));
                         } else {
                             break;
                         }
                     }
-                    if matches!(self.peek_byte(), Some(b'.' | b'e' | b'E')) {
-                        is_octal = false;
+                    if self.peek_byte() == Some(b'n') {
+                        return Err(JsError::syntax(
+                            "BigInt literal cannot have leading zero",
+                        ));
                     }
-                    if is_octal {
+                    self.pending_strict_error = Some(if is_octal {
+                        "Legacy octal literals are not allowed in strict mode"
+                    } else {
+                        "Decimals with leading zeros are not allowed in strict mode"
+                    });
+                    if is_octal && !matches!(self.peek_byte(), Some(b'.' | b'e' | b'E')) {
                         let val = parse_radix_digits_f64(&digits, 8);
+                        self.check_after_numeric()?;
                         return Ok(TokenKind::Number(val));
                     }
-                    self.pos = start;
+                    let mut buf = format!("0{}", digits);
+                    if self.peek_byte() == Some(b'.') {
+                        self.advance_byte();
+                        buf.push('.');
+                        if self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
+                            self.read_decimal_digits(&mut buf)?;
+                        }
+                    }
+                    if matches!(self.peek_byte(), Some(b'e' | b'E')) {
+                        self.advance_byte();
+                        buf.push('e');
+                        if matches!(self.peek_byte(), Some(b'+' | b'-')) {
+                            buf.push(self.advance_byte().unwrap() as char);
+                        }
+                        if !self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
+                            return Err(JsError::syntax(
+                                "Missing exponent digits in number literal",
+                            ));
+                        }
+                        self.read_decimal_digits(&mut buf)?;
+                    }
+                    let val: f64 = buf
+                        .parse()
+                        .map_err(|_| JsError::syntax(format!("Invalid numeric literal: {}", buf)))?;
+                    self.check_after_numeric()?;
+                    return Ok(TokenKind::Number(val));
                 }
                 _ => {}
             }
@@ -993,12 +1063,14 @@ impl<'a> Lexer<'a> {
                 return Err(JsError::syntax("BigInt literal cannot have decimal or exponent"));
             }
             self.advance_byte();
+            self.check_after_numeric()?;
             return Ok(TokenKind::BigInt(buf));
         }
 
         let val: f64 = buf
             .parse()
             .map_err(|_| JsError::syntax(format!("Invalid numeric literal: {}", buf)))?;
+        self.check_after_numeric()?;
         Ok(TokenKind::Number(val))
     }
 
@@ -1028,6 +1100,7 @@ impl<'a> Lexer<'a> {
         }
         if self.peek_byte() == Some(b'n') {
             self.advance_byte();
+            self.check_after_numeric()?;
             let prefix = match radix {
                 16 => "0x",
                 8 => "0o",
@@ -1036,6 +1109,7 @@ impl<'a> Lexer<'a> {
             };
             return Ok(TokenKind::BigInt(format!("{}{}", prefix, digits)));
         }
+        self.check_after_numeric()?;
         Ok(TokenKind::Number(parse_radix_digits_f64(&digits, radix)))
     }
 
@@ -1192,7 +1266,7 @@ fn is_horizontal_whitespace(c: char) -> bool {
 }
 
 pub fn is_ident_start(c: char) -> bool {
-    c == '_' || c == '$' || c.is_alphabetic()
+    c == '_' || c == '$' || crate::unicode_id::is_unicode_id_start(c)
 }
 
 pub fn is_ident_continue(c: char) -> bool {
@@ -1200,5 +1274,5 @@ pub fn is_ident_continue(c: char) -> bool {
         || c == '$'
         || c == '\u{200C}'
         || c == '\u{200D}'
-        || c.is_alphanumeric()
+        || crate::unicode_id::is_unicode_id_continue(c)
 }

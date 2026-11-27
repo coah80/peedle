@@ -93,8 +93,9 @@ fn acid3_conformance() {
         if idx >= 100 {
             break;
         }
-        page.advance_time_ms(15);
+        page.js_env.advance_time_ms(15);
     }
+    page.recompute_if_needed();
 
     let score: usize = page
         .eval_js("score")
@@ -109,7 +110,10 @@ fn acid3_conformance() {
     let log = page.eval_js("log").unwrap_or_default();
     stop.store(true, Ordering::Relaxed);
 
+    let out_png = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../screenshots/acid3_100.png");
+    let _ = page.save_screenshot(&out_png);
+
     eprintln!("=== ACID3 RESULT: {}/100 (index={}) ===", score, idx);
     eprintln!("{}", log);
-    assert!(score >= 99, "Acid3 score too low: {}/100 (index={})\n{}", score, idx, log);
+    assert_eq!(score, 100, "Acid3 score must be 100/100 (index={})\n{}", idx, log);
 }

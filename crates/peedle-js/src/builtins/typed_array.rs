@@ -833,15 +833,15 @@ fn init_data_view(rt: &mut JsRuntime) {
                 2,
                 Rc::new(|rt, this, args| {
                     let (oid, dv) = dv_data(rt, &this)?;
+                    if is_buffer_immutable(rt, dv.buffer) {
+                        return Err(JsError::type_err("ArrayBuffer is immutable"));
+                    }
                     let off = to_index(rt, args.first())?;
                     let num = rt.to_number(args.get(1).unwrap_or(&JsValue::Undefined))?;
                     let le = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
                     let Some(view_len) = rt.data_view_effective_byte_length(oid) else {
                         return Err(JsError::type_err("DataView buffer is detached or out of bounds"));
                     };
-                    if is_buffer_immutable(rt, dv.buffer) {
-                        return Err(JsError::type_err("ArrayBuffer is immutable"));
-                    }
                     let end = off.checked_add($size).ok_or_else(|| {
                         JsError::range("Offset is outside the bounds of the DataView")
                     })?;
@@ -877,15 +877,15 @@ fn init_data_view(rt: &mut JsRuntime) {
         2,
         Rc::new(|rt, this, args| {
             let (oid, dv) = dv_data(rt, &this)?;
+            if is_buffer_immutable(rt, dv.buffer) {
+                return Err(JsError::type_err("ArrayBuffer is immutable"));
+            }
             let off = to_index(rt, args.first())?;
             let bi = rt.to_bigint(args.get(1).unwrap_or(&JsValue::Undefined))? as i64;
             let le = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
             let Some(view_len) = rt.data_view_effective_byte_length(oid) else {
                 return Err(JsError::type_err("DataView buffer is detached or out of bounds"));
             };
-            if is_buffer_immutable(rt, dv.buffer) {
-                return Err(JsError::type_err("ArrayBuffer is immutable"));
-            }
             let end = off.checked_add(8).ok_or_else(|| {
                 JsError::range("Offset is outside the bounds of the DataView")
             })?;
@@ -908,15 +908,15 @@ fn init_data_view(rt: &mut JsRuntime) {
         2,
         Rc::new(|rt, this, args| {
             let (oid, dv) = dv_data(rt, &this)?;
+            if is_buffer_immutable(rt, dv.buffer) {
+                return Err(JsError::type_err("ArrayBuffer is immutable"));
+            }
             let off = to_index(rt, args.first())?;
             let bi = rt.to_bigint(args.get(1).unwrap_or(&JsValue::Undefined))? as u64;
             let le = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
             let Some(view_len) = rt.data_view_effective_byte_length(oid) else {
                 return Err(JsError::type_err("DataView buffer is detached or out of bounds"));
             };
-            if is_buffer_immutable(rt, dv.buffer) {
-                return Err(JsError::type_err("ArrayBuffer is immutable"));
-            }
             let end = off.checked_add(8).ok_or_else(|| {
                 JsError::range("Offset is outside the bounds of the DataView")
             })?;
@@ -1289,6 +1289,9 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
         1,
         Rc::new(|rt, this, args| {
             let (oid, ta, len) = validate_typed_array(rt, &this)?;
+            if is_buffer_immutable(rt, ta.buffer) {
+                return Err(JsError::type_err("TypedArray buffer is immutable"));
+            }
             let val_arg = args.first().unwrap_or(&JsValue::Undefined);
             let converted = if ta.kind.is_bigint() {
                 JsValue::BigInt(rt.to_bigint(val_arg)?)
@@ -1300,9 +1303,6 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
             let Some(cur_len) = rt.typed_array_effective_length(oid) else {
                 return Err(JsError::type_err("TypedArray buffer is detached or out of bounds"));
             };
-            if is_buffer_immutable(rt, ta.buffer) && start < end.min(cur_len) {
-                return Err(JsError::type_err("TypedArray buffer is immutable"));
-            }
             let final_end = end.min(cur_len);
             for i in start..final_end {
                 rt.typed_array_set_raw(&ta, i, &converted)?;
@@ -2040,32 +2040,44 @@ fn init_typed_arrays(rt: &mut JsRuntime) {
             let sym_iter = PropertyKey::Symbol(rt.symbols.iterator);
             let oid = rt.to_object(src)?;
             let iter_method = rt.get_property_key(oid, &sym_iter)?;
-            let values = if !iter_method.is_nullish() {
+            if !iter_method.is_nullish() {
                 if !rt.is_callable(&iter_method) {
                     return Err(JsError::type_err("Iterator method is not callable"));
                 }
                 let iter = rt.call_function(iter_method, src.clone(), &[])?;
-                let mut out = Vec::new();
+                let mut values = Vec::new();
                 while let Some(v) = rt.iterator_step(&iter)? {
-                    out.push(v);
+                    values.push(v);
                 }
-                out
-            } else {
-                let len_v = rt.get_property(oid, "length")?;
-                let len = to_length(rt.to_number(&len_v)?);
-                let mut out = Vec::with_capacity(len);
-                for i in 0..len {
-                    out.push(rt.get_property(oid, &i.to_string())?);
+                let len = values.len();
+                let target = rt.construct(this, &[JsValue::Number(len as f64)])?;
+                let (tid, _, target_len) = validate_typed_array(rt, &target)?;
+                if target_len < len {
+                    return Err(JsError::type_err("TypedArray constructor created too small array"));
                 }
-                out
-            };
-            let len = values.len();
+                for (i, item) in values.into_iter().enumerate() {
+                    let val = if !map_fn.is_undefined() {
+                        rt.call_function(
+                            map_fn.clone(),
+                            this_arg.clone(),
+                            &[item, JsValue::Number(i as f64)],
+                        )?
+                    } else {
+                        item
+                    };
+                    rt.set_property_key_strict(tid, PropertyKey::String(i.to_string()), val, true)?;
+                }
+                return Ok(JsValue::Object(tid));
+            }
+            let len_v = rt.get_property(oid, "length")?;
+            let len = to_length(rt.to_number(&len_v)?);
             let target = rt.construct(this, &[JsValue::Number(len as f64)])?;
             let (tid, _, target_len) = validate_typed_array(rt, &target)?;
             if target_len < len {
                 return Err(JsError::type_err("TypedArray constructor created too small array"));
             }
-            for (i, item) in values.into_iter().enumerate() {
+            for i in 0..len {
+                let item = rt.get_property(oid, &i.to_string())?;
                 let val = if !map_fn.is_undefined() {
                     rt.call_function(
                         map_fn.clone(),
@@ -2303,21 +2315,22 @@ fn construct_typed_array(
         }
         let sym_iter = PropertyKey::Symbol(rt.symbols.iterator);
         let iter_method = rt.get_property_key(*oid, &sym_iter)?;
-        let items = if !iter_method.is_nullish() {
-            rt.collect_iterable(first)?
-        } else {
-            let len_v = rt.get_property(*oid, "length")?;
-            let len = to_length(rt.to_number(&len_v)?);
-            let mut out = Vec::with_capacity(len);
-            for i in 0..len {
-                out.push(rt.get_property(*oid, &i.to_string())?);
+        if !iter_method.is_nullish() {
+            let items = rt.collect_iterable(first)?;
+            let obj = alloc_typed_array_with_proto(rt, kind, items.len(), obj_proto)?;
+            let data = ta_data(rt, &JsValue::Object(obj))?.1;
+            for (i, v) in items.iter().enumerate() {
+                rt.typed_array_set(&data, i, v)?;
             }
-            out
-        };
-        let obj = alloc_typed_array_with_proto(rt, kind, items.len(), obj_proto)?;
+            return Ok(JsValue::Object(obj));
+        }
+        let len_v = rt.get_property(*oid, "length")?;
+        let len = to_length(rt.to_number(&len_v)?);
+        let obj = alloc_typed_array_with_proto(rt, kind, len, obj_proto)?;
         let data = ta_data(rt, &JsValue::Object(obj))?.1;
-        for (i, v) in items.iter().enumerate() {
-            rt.typed_array_set(&data, i, v)?;
+        for i in 0..len {
+            let v = rt.get_property(*oid, &i.to_string())?;
+            rt.typed_array_set(&data, i, &v)?;
         }
         return Ok(JsValue::Object(obj));
     }

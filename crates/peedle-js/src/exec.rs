@@ -15,6 +15,26 @@ pub enum FrameOutcome {
     Await(JsValue),
 }
 
+fn pattern_has_expr(pat: &Pattern) -> bool {
+    match pat {
+        Pattern::Ident(_) => false,
+        Pattern::Assign { .. } => true,
+        Pattern::Array { elements, rest } => {
+            elements
+                .iter()
+                .flatten()
+                .any(pattern_has_expr)
+                || rest.as_deref().is_some_and(pattern_has_expr)
+        }
+        Pattern::Object { props, rest } => {
+            props.iter().any(|p| {
+                matches!(p.key, crate::ast::PropKey::Computed(_)) || pattern_has_expr(&p.value)
+            }) || rest.as_deref().is_some_and(pattern_has_expr)
+        }
+        Pattern::Member(_) => true,
+    }
+}
+
 impl JsRuntime {
     pub fn hoist_into_env(
         &mut self,
@@ -23,8 +43,91 @@ impl JsRuntime {
         _strict: bool,
     ) -> Result<(), JsError> {
         let is_global = self.heap.get_env(env).object_env == Some(self.global_object);
-        for name in &chunk.hoisted_vars {
-            if is_global {
+        if is_global {
+            for (name, _) in &chunk.lex_names {
+                let e = self.heap.get_env(env);
+                if e.lex_names.contains(name) || e.var_names.contains(name) {
+                    return Err(JsError::syntax(format!(
+                        "Identifier '{}' has already been declared",
+                        name
+                    )));
+                }
+                let key = PropertyKey::String(name.clone());
+                if let Some(ex) = self.heap.get_obj(self.global_object).get_own_prop(&key) {
+                    if !ex.configurable {
+                        return Err(JsError::syntax(format!(
+                            "Identifier '{}' has already been declared",
+                            name
+                        )));
+                    }
+                }
+            }
+            for name in &chunk.hoisted_vars {
+                if self.heap.get_env(env).lex_names.contains(name) {
+                    return Err(JsError::syntax(format!(
+                        "Identifier '{}' has already been declared",
+                        name
+                    )));
+                }
+            }
+            for (name, _) in &chunk.hoisted_funcs {
+                if self.heap.get_env(env).lex_names.contains(name) {
+                    return Err(JsError::syntax(format!(
+                        "Identifier '{}' has already been declared",
+                        name
+                    )));
+                }
+            }
+            for (name, _) in &chunk.hoisted_funcs {
+                let key = PropertyKey::String(name.clone());
+                let existing = self.heap.get_obj(self.global_object).get_own_prop(&key).cloned();
+                if let Some(ex) = existing {
+                    if !ex.configurable {
+                        if matches!(ex.value, PropValue::Accessor { .. })
+                            || !ex.writable
+                            || !ex.enumerable
+                        {
+                            return Err(JsError::type_err("Cannot redefine global function"));
+                        }
+                    }
+                } else if !self.heap.get_obj(self.global_object).extensible {
+                    return Err(JsError::type_err(
+                        "Cannot define global function on non-extensible object",
+                    ));
+                }
+            }
+            for name in &chunk.hoisted_vars {
+                let key = PropertyKey::String(name.clone());
+                if !self.has_own_property(self.global_object, &key)?
+                    && !self.heap.get_obj(self.global_object).extensible
+                {
+                    return Err(JsError::type_err(
+                        "Cannot define global var on non-extensible object",
+                    ));
+                }
+            }
+            for (name, tmpl) in &chunk.hoisted_funcs {
+                let fn_id = self.create_js_function(tmpl, env);
+                let key = PropertyKey::String(name.clone());
+                let existing = self.heap.get_obj(self.global_object).get_own_prop(&key).cloned();
+                if let Some(ex) = existing {
+                    if ex.configurable {
+                        self.heap.get_obj_mut(self.global_object).set_own_prop(
+                            key,
+                            PropEntry::data(JsValue::Object(fn_id), true, true, false),
+                        );
+                    } else {
+                        self.set_property(self.global_object, name, JsValue::Object(fn_id))?;
+                    }
+                } else {
+                    self.heap.get_obj_mut(self.global_object).set_own_prop(
+                        key,
+                        PropEntry::data(JsValue::Object(fn_id), true, true, false),
+                    );
+                }
+                self.heap.get_env_mut(env).var_names.insert(name.clone());
+            }
+            for name in &chunk.hoisted_vars {
                 let key = PropertyKey::String(name.clone());
                 if !self.has_own_property(self.global_object, &key)? {
                     self.heap.get_obj_mut(self.global_object).set_own_prop(
@@ -32,40 +135,51 @@ impl JsRuntime {
                         PropEntry::data(JsValue::Undefined, true, true, false),
                     );
                 }
-            } else {
+                self.heap.get_env_mut(env).var_names.insert(name.clone());
+            }
+            for (name, is_const) in &chunk.lex_names {
                 let e = self.heap.get_env_mut(env);
-                e.bindings.entry(name.clone()).or_insert(Binding {
-                    value: JsValue::Undefined,
+                e.lex_names.insert(name.clone());
+                e.bindings.insert(
+                    name.clone(),
+                    Binding {
+                        value: JsValue::Undefined,
+                        mutable: !is_const,
+                        initialized: false,
+                        deletable: false,
+                        strict_immutable: *is_const,
+                    },
+                );
+            }
+            return Ok(());
+        }
+        for name in &chunk.hoisted_vars {
+            let e = self.heap.get_env_mut(env);
+            e.bindings.entry(name.clone()).or_insert(Binding {
+                value: JsValue::Undefined,
+                mutable: true,
+                initialized: true,
+                deletable: false,
+                strict_immutable: false,
+            });
+        }
+        for (name, tmpl) in &chunk.hoisted_funcs {
+            let fn_id = self.create_js_function(tmpl, env);
+            self.heap.get_env_mut(env).bindings.insert(
+                name.clone(),
+                Binding {
+                    value: JsValue::Object(fn_id),
                     mutable: true,
                     initialized: true,
                     deletable: false,
                     strict_immutable: false,
-                });
-            }
-        }
-        for (name, tmpl) in &chunk.hoisted_funcs {
-            let fn_id = self.create_js_function(tmpl, env);
-            if is_global {
-                let key = PropertyKey::String(name.clone());
-                self.heap.get_obj_mut(self.global_object).set_own_prop(
-                    key,
-                    PropEntry::data(JsValue::Object(fn_id), true, true, false),
-                );
-            } else {
-                self.heap.get_env_mut(env).bindings.insert(
-                    name.clone(),
-                    Binding {
-                        value: JsValue::Object(fn_id),
-                        mutable: true,
-                        initialized: true,
-                        deletable: false,
-                    strict_immutable: false,
-                    },
-                );
-            }
+                },
+            );
         }
         for (name, is_const) in &chunk.lex_names {
-            self.heap.get_env_mut(env).bindings.insert(
+            let e = self.heap.get_env_mut(env);
+            e.lex_names.insert(name.clone());
+            e.bindings.insert(
                 name.clone(),
                 Binding {
                     value: JsValue::Undefined,
@@ -377,6 +491,7 @@ impl JsRuntime {
             new_target,
             is_constructor,
             this_for_ctor,
+            prev_realm,
         );
         let res = match res {
             Err(e @ JsError::Native { object: None, .. }) if prev_realm != fn_realm => {
@@ -396,6 +511,7 @@ impl JsRuntime {
         new_target: Option<JsValue>,
         is_constructor: bool,
         this_for_ctor: Option<ObjectId>,
+        caller_realm: usize,
     ) -> Result<JsValue, JsError> {
         let func = match &self.heap.get_obj(fn_id).kind {
             ObjectKind::Function(f) => f.clone(),
@@ -438,18 +554,52 @@ impl JsRuntime {
             };
             env_rec.this_binding = Some(bound_this);
             env_rec.new_target = Some(new_target.unwrap_or(JsValue::Undefined));
+            env_rec.allow_new_target = true;
+            env_rec.allow_super_call = func.is_derived_ctor;
+            env_rec.allow_super_prop = func.home_object.is_some();
+        }
+        if func.class_brand.is_some() {
+            env_rec.allow_private = true;
         }
         if let Some(home) = func.home_object {
             env_rec.super_proto = self.heap.get_obj(home).prototype;
         }
         let fn_env = self.heap.alloc_env(env_rec);
 
-        if !func.is_arrow {
+        let mut all_param_names = Vec::new();
+        for p in func.params.iter() {
+            crate::compiler::collect_pattern_names(&p.pattern, &mut all_param_names, false);
+        }
+        let has_param_exprs = func.params.iter().any(|p| pattern_has_expr(&p.pattern));
+        let param_has_arguments = all_param_names.iter().any(|(n, _)| n == "arguments");
+
+        if !func.is_arrow && !param_has_arguments {
+            let is_simple_params = func
+                .params
+                .iter()
+                .all(|p| !p.rest && matches!(p.pattern, crate::ast::Pattern::Ident(_)));
+            let (mapped_env, mapped_params) = if !func.strict && is_simple_params {
+                let map_len = args.len().min(func.params.len());
+                let mut m = vec![None; map_len];
+                let mut seen = HashSet::new();
+                for i in (0..map_len).rev() {
+                    if let crate::ast::Pattern::Ident(ref pname) = func.params[i].pattern {
+                        if seen.insert(pname.clone()) {
+                            m[i] = Some(pname.clone());
+                        }
+                    }
+                }
+                (Some(fn_env), m)
+            } else {
+                (None, Vec::new())
+            };
             let args_obj = self.heap.alloc_object(JsObject::new(
                 Some(self.intrinsics.object_proto),
                 ObjectKind::Arguments(ArgumentsData {
                     values: args.to_vec(),
                     strict: func.strict,
+                    mapped_env,
+                    mapped_params,
                 }),
             ));
             self.heap.get_obj_mut(args_obj).set_own_prop(
@@ -462,10 +612,21 @@ impl JsRuntime {
                 sym_iter,
                 PropEntry::data(arr_vals, true, false, true),
             );
-            if !func.strict {
+            if !func.strict && is_simple_params {
                 self.heap.get_obj_mut(args_obj).set_own_prop(
                     PropertyKey::from("callee"),
                     PropEntry::data(JsValue::Object(fn_id), true, false, true),
+                );
+            } else {
+                let tte = self.intrinsics.throw_type_error;
+                self.heap.get_obj_mut(args_obj).set_own_prop(
+                    PropertyKey::from("callee"),
+                    PropEntry::accessor(
+                        Some(JsValue::Object(tte)),
+                        Some(JsValue::Object(tte)),
+                        false,
+                        false,
+                    ),
                 );
             }
             self.heap.get_env_mut(fn_env).bindings.insert(
@@ -480,7 +641,17 @@ impl JsRuntime {
             );
         }
 
-        self.hoist_into_env(&func.chunk, fn_env, func.strict)?;
+        if has_param_exprs {
+            let e = self.heap.get_env_mut(fn_env);
+            e.is_param_env = true;
+            for (pn, _) in &all_param_names {
+                e.lex_names.insert(pn.clone());
+            }
+            if !func.is_arrow {
+                e.lex_names.insert("arguments".to_string());
+            }
+        }
+
         let bind_res = self.bind_params(&func.params, args, fn_env);
         if let Err(e) = bind_res {
             if func.is_async && !func.is_generator {
@@ -492,7 +663,36 @@ impl JsRuntime {
             return Err(e);
         }
 
-        let mut frame = CallFrame::new(func.chunk.clone(), fn_env, Some(fn_id));
+        let body_env = if has_param_exprs {
+            let mut var_env_rec = EnvRecord::new(Some(fn_env), true, func.strict);
+            for vn in &func.chunk.hoisted_vars {
+                let init_val = self
+                    .heap
+                    .get_env(fn_env)
+                    .bindings
+                    .get(vn)
+                    .map(|b| b.value.clone())
+                    .unwrap_or(JsValue::Undefined);
+                var_env_rec.bindings.insert(
+                    vn.clone(),
+                    Binding {
+                        value: init_val,
+                        mutable: true,
+                        initialized: true,
+                        deletable: false,
+                        strict_immutable: false,
+                    },
+                );
+            }
+            let vid = self.heap.alloc_env(var_env_rec);
+            self.hoist_into_env(&func.chunk, vid, func.strict)?;
+            vid
+        } else {
+            self.hoist_into_env(&func.chunk, fn_env, func.strict)?;
+            fn_env
+        };
+
+        let mut frame = CallFrame::new(func.chunk.clone(), body_env, Some(fn_id));
         frame.is_constructor = is_constructor;
         frame.this_for_ctor = this_for_ctor;
         frame.is_derived_ctor = func.is_derived_ctor;
@@ -539,12 +739,23 @@ impl JsRuntime {
         match res? {
             FrameOutcome::Return(v) => {
                 if is_constructor && func.is_derived_ctor && !v.is_object() {
+                    if !v.is_undefined() {
+                        let err = self.create_realm_error_object(
+                            caller_realm,
+                            ErrorKind::TypeError,
+                            "Derived constructors may only return object or undefined",
+                        );
+                        return Err(JsError::Thrown(JsValue::Object(err)));
+                    }
                     if let Some(inst) = frame.this_for_ctor {
                         return Ok(JsValue::Object(inst));
                     }
-                    return Err(JsError::reference(
+                    let err = self.create_realm_error_object(
+                        caller_realm,
+                        ErrorKind::ReferenceError,
                         "Must call super constructor in derived class before returning",
-                    ));
+                    );
+                    return Err(JsError::Thrown(JsValue::Object(err)));
                 }
                 Ok(v)
             }
@@ -1496,20 +1707,24 @@ impl JsRuntime {
             }
             Op::DeclareLet(idx) => {
                 let name = get_const_str(&frame.chunk, idx).to_string();
-                self.heap.get_env_mut(frame.env).bindings.insert(
+                let e = self.heap.get_env_mut(frame.env);
+                e.lex_names.insert(name.clone());
+                e.bindings.insert(
                     name,
                     Binding {
                         value: JsValue::Undefined,
                         mutable: true,
                         initialized: false,
                         deletable: false,
-                    strict_immutable: false,
+                        strict_immutable: false,
                     },
                 );
             }
             Op::DeclareConst(idx) => {
                 let name = get_const_str(&frame.chunk, idx).to_string();
-                self.heap.get_env_mut(frame.env).bindings.insert(
+                let e = self.heap.get_env_mut(frame.env);
+                e.lex_names.insert(name.clone());
+                e.bindings.insert(
                     name,
                     Binding {
                         value: JsValue::Undefined,
@@ -1785,6 +2000,22 @@ impl JsRuntime {
                     );
                 }
             }
+            Op::ObjectSetOwnProp(idx) => {
+                let name = get_const_str(&frame.chunk, idx).to_string();
+                let val = frame.stack.pop().unwrap();
+                let JsValue::Object(oid) = frame.stack.last().copied_or_ref() else {
+                    unreachable!();
+                };
+                if let JsValue::Object(fid) = val {
+                    if let ObjectKind::Function(ref mut f) = self.heap.get_obj_mut(fid).kind {
+                        f.home_object = Some(oid);
+                    }
+                }
+                self.heap.get_obj_mut(oid).set_own_prop(
+                    PropertyKey::String(name),
+                    PropEntry::data(val, true, true, true),
+                );
+            }
             Op::ObjectSetComputed => {
                 let val = frame.stack.pop().unwrap();
                 let key_val = frame.stack.pop().unwrap();
@@ -1808,9 +2039,11 @@ impl JsRuntime {
                     unreachable!();
                 };
                 if let JsValue::Object(fid) = getter {
-                    if let ObjectKind::Function(ref mut f) = self.heap.get_obj_mut(fid).kind {
+                    let fobj = self.heap.get_obj_mut(fid);
+                    if let ObjectKind::Function(ref mut f) = fobj.kind {
                         f.home_object = Some(oid);
                     }
+                    fobj.remove_own_prop(&PropertyKey::from("prototype"));
                 }
                 self.define_property(
                     oid,
@@ -1832,9 +2065,11 @@ impl JsRuntime {
                     unreachable!();
                 };
                 if let JsValue::Object(fid) = setter {
-                    if let ObjectKind::Function(ref mut f) = self.heap.get_obj_mut(fid).kind {
+                    let fobj = self.heap.get_obj_mut(fid);
+                    if let ObjectKind::Function(ref mut f) = fobj.kind {
                         f.home_object = Some(oid);
                     }
+                    fobj.remove_own_prop(&PropertyKey::from("prototype"));
                 }
                 self.define_property(
                     oid,
@@ -1856,6 +2091,13 @@ impl JsRuntime {
                 let JsValue::Object(oid) = frame.stack.last().copied_or_ref() else {
                     unreachable!();
                 };
+                if let JsValue::Object(fid) = getter {
+                    let fobj = self.heap.get_obj_mut(fid);
+                    if let ObjectKind::Function(ref mut f) = fobj.kind {
+                        f.home_object = Some(oid);
+                    }
+                    fobj.remove_own_prop(&PropertyKey::from("prototype"));
+                }
                 self.define_property(
                     oid,
                     key,
@@ -1876,6 +2118,13 @@ impl JsRuntime {
                 let JsValue::Object(oid) = frame.stack.last().copied_or_ref() else {
                     unreachable!();
                 };
+                if let JsValue::Object(fid) = setter {
+                    let fobj = self.heap.get_obj_mut(fid);
+                    if let ObjectKind::Function(ref mut f) = fobj.kind {
+                        f.home_object = Some(oid);
+                    }
+                    fobj.remove_own_prop(&PropertyKey::from("prototype"));
+                }
                 self.define_property(
                     oid,
                     key,
@@ -1966,6 +2215,37 @@ impl JsRuntime {
                 } else {
                     let n = self.to_number(&v)?;
                     frame.stack.push(JsValue::Number(n));
+                }
+            }
+            Op::ToString => {
+                let v = frame.stack.pop().unwrap();
+                let s = self.to_string(&v)?;
+                frame.stack.push(JsValue::String(s));
+            }
+            Op::ToPropertyKey => {
+                let key = frame.stack.pop().unwrap();
+                if let Some(base) = frame.stack.last() {
+                    if base.is_nullish() {
+                        return Err(JsError::type_err(
+                            "Cannot read properties of null or undefined",
+                        ));
+                    }
+                }
+                let pk = self.to_property_key(&key)?;
+                frame.stack.push(pk.to_value());
+            }
+            Op::ToPropertyKeyOnly => {
+                let key = frame.stack.pop().unwrap();
+                let pk = self.to_property_key(&key)?;
+                frame.stack.push(pk.to_value());
+            }
+            Op::RequireObjectCoercible => {
+                if let Some(v) = frame.stack.last() {
+                    if v.is_nullish() {
+                        return Err(JsError::type_err(
+                            "Cannot destructure property of null or undefined",
+                        ));
+                    }
                 }
             }
             Op::Inc => {
@@ -2067,6 +2347,22 @@ impl JsRuntime {
                     frame.stack.push(res);
                 }
             }
+            Op::CallDirectEvalSpread => {
+                let arr = frame.stack.pop().unwrap();
+                let callee = frame.stack.pop().unwrap();
+                let args = self.extract_args_array(arr);
+                if callee == JsValue::Object(self.intrinsics.eval_fn) {
+                    let arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let res = match arg {
+                        JsValue::String(s) => self.eval_in_env(&s, frame.env, frame.chunk.strict)?,
+                        other => other,
+                    };
+                    frame.stack.push(res);
+                } else {
+                    let res = self.call_function(callee, JsValue::Undefined, &args)?;
+                    frame.stack.push(res);
+                }
+            }
             Op::New(argc) => {
                 let start = frame.stack.len() - argc as usize;
                 let args: Vec<JsValue> = frame.stack.drain(start..).collect();
@@ -2103,13 +2399,24 @@ impl JsRuntime {
                     in_catch: false,
                     in_finally: false,
                     pending: PendingCompletion::Normal,
+                    saved_last_value: None,
                 });
             }
             Op::TryPop => {
                 frame.handlers.pop();
             }
+            Op::FinallyStart => {
+                if let Some(handler) = frame.handlers.last_mut() {
+                    handler.in_finally = true;
+                    handler.saved_last_value = Some(frame.last_value.clone());
+                    frame.last_value = JsValue::Undefined;
+                }
+            }
             Op::FinallyEnd => {
                 if let Some(handler) = frame.handlers.pop() {
+                    if let Some(saved) = handler.saved_last_value {
+                        frame.last_value = saved;
+                    }
                     match handler.pending {
                         PendingCompletion::Normal => {}
                         PendingCompletion::Throw(e) => return Err(e),
@@ -2176,10 +2483,18 @@ impl JsRuntime {
             }
             Op::IteratorNext(done_target) => {
                 let iter = frame.stack.last().cloned().unwrap();
-                if let Some(val) = self.iterator_step(&iter)? {
-                    frame.stack.push(val);
-                } else {
-                    frame.ip = done_target as usize;
+                match self.iterator_step(&iter) {
+                    Ok(Some(val)) => {
+                        frame.stack.push(val);
+                    }
+                    Ok(None) => {
+                        *frame.stack.last_mut().unwrap() = JsValue::Undefined;
+                        frame.ip = done_target as usize;
+                    }
+                    Err(e) => {
+                        *frame.stack.last_mut().unwrap() = JsValue::Undefined;
+                        return Err(e);
+                    }
                 }
             }
             Op::IteratorNextValue => {
@@ -2187,11 +2502,34 @@ impl JsRuntime {
                 if iter.is_undefined() {
                     frame.stack.push(JsValue::Undefined);
                 } else {
-                    match self.iterator_step(&iter)? {
-                        Some(val) => frame.stack.push(val),
-                        None => {
+                    match self.iterator_step(&iter) {
+                        Ok(Some(val)) => frame.stack.push(val),
+                        Ok(None) => {
                             *frame.stack.last_mut().unwrap() = JsValue::Undefined;
                             frame.stack.push(JsValue::Undefined);
+                        }
+                        Err(e) => {
+                            *frame.stack.last_mut().unwrap() = JsValue::Undefined;
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            Op::IteratorNextValueAt(depth) => {
+                let slot = frame.stack.len() - 1 - depth as usize;
+                let iter = frame.stack[slot].clone();
+                if iter.is_undefined() {
+                    frame.stack.push(JsValue::Undefined);
+                } else {
+                    match self.iterator_step(&iter) {
+                        Ok(Some(val)) => frame.stack.push(val),
+                        Ok(None) => {
+                            frame.stack[slot] = JsValue::Undefined;
+                            frame.stack.push(JsValue::Undefined);
+                        }
+                        Err(e) => {
+                            frame.stack[slot] = JsValue::Undefined;
+                            return Err(e);
                         }
                     }
                 }
@@ -2200,10 +2538,41 @@ impl JsRuntime {
                 let iter = frame.stack.last().cloned().unwrap();
                 let mut rest = Vec::new();
                 if !iter.is_undefined() {
-                    while let Some(v) = self.iterator_step(&iter)? {
-                        rest.push(v);
+                    loop {
+                        match self.iterator_step(&iter) {
+                            Ok(Some(v)) => rest.push(v),
+                            Ok(None) => {
+                                *frame.stack.last_mut().unwrap() = JsValue::Undefined;
+                                break;
+                            }
+                            Err(e) => {
+                                *frame.stack.last_mut().unwrap() = JsValue::Undefined;
+                                return Err(e);
+                            }
+                        }
                     }
-                    *frame.stack.last_mut().unwrap() = JsValue::Undefined;
+                }
+                let arr = self.create_array(rest);
+                frame.stack.push(JsValue::Object(arr));
+            }
+            Op::IteratorRestAt(depth) => {
+                let slot = frame.stack.len() - 1 - depth as usize;
+                let iter = frame.stack[slot].clone();
+                let mut rest = Vec::new();
+                if !iter.is_undefined() {
+                    loop {
+                        match self.iterator_step(&iter) {
+                            Ok(Some(v)) => rest.push(v),
+                            Ok(None) => {
+                                frame.stack[slot] = JsValue::Undefined;
+                                break;
+                            }
+                            Err(e) => {
+                                frame.stack[slot] = JsValue::Undefined;
+                                return Err(e);
+                            }
+                        }
+                    }
                 }
                 let arr = self.create_array(rest);
                 frame.stack.push(JsValue::Object(arr));
@@ -2211,7 +2580,11 @@ impl JsRuntime {
             Op::IteratorClose => {
                 if let Some(iter) = frame.stack.last().cloned() {
                     if !iter.is_undefined() {
-                        self.iterator_close(&iter);
+                        *frame.stack.last_mut().unwrap() = JsValue::Undefined;
+                        let suppress = frame.handlers.last().is_some_and(|h| {
+                            matches!(h.pending, PendingCompletion::Throw(_))
+                        });
+                        self.iterator_close_checked(&iter, suppress)?;
                     }
                 }
             }
@@ -2228,25 +2601,66 @@ impl JsRuntime {
                 return Ok(Some(FrameOutcome::Await(val)));
             }
             Op::CreateTemplateObject(idx) => {
-                let ConstValue::TemplateStrings { raw, cooked } =
-                    frame.chunk.consts[idx as usize].clone()
+                let ConstValue::TemplateStrings {
+                    site_id,
+                    raw,
+                    cooked,
+                } = frame.chunk.consts[idx as usize].clone()
                 else {
                     unreachable!();
                 };
-                let cooked_vals: Vec<JsValue> = cooked
-                    .into_iter()
-                    .map(|c| c.map(JsValue::String).unwrap_or(JsValue::Undefined))
-                    .collect();
-                let raw_vals: Vec<JsValue> = raw.into_iter().map(JsValue::String).collect();
-                let arr = self.create_array(cooked_vals);
-                let raw_arr = self.create_array(raw_vals);
-                self.heap.get_obj_mut(raw_arr).extensible = false;
-                self.heap.get_obj_mut(arr).set_own_prop(
-                    PropertyKey::from("raw"),
-                    PropEntry::data(JsValue::Object(raw_arr), false, false, false),
-                );
-                self.heap.get_obj_mut(arr).extensible = false;
-                frame.stack.push(JsValue::Object(arr));
+                let cache_key = (self.current_realm_id, site_id);
+                if let Some(&cached) = self.template_cache.get(&cache_key) {
+                    frame.stack.push(JsValue::Object(cached));
+                } else {
+                    let cooked_vals: Vec<JsValue> = cooked
+                        .into_iter()
+                        .map(|c| c.map(JsValue::String).unwrap_or(JsValue::Undefined))
+                        .collect();
+                    let raw_vals: Vec<JsValue> = raw.into_iter().map(JsValue::String).collect();
+                    let arr = self.create_array(cooked_vals.clone());
+                    let raw_arr = self.create_array(raw_vals.clone());
+                    let raw_len = raw_vals.len();
+                    for (i, v) in raw_vals.into_iter().enumerate() {
+                        let o = self.heap.get_obj_mut(raw_arr);
+                        if let ObjectKind::Array(ref mut a) = o.kind {
+                            a.has_custom_index_props = true;
+                        }
+                        o.set_own_prop(
+                            PropertyKey::String(i.to_string()),
+                            PropEntry::data(v, false, true, false),
+                        );
+                    }
+                    self.heap.get_obj_mut(raw_arr).set_own_prop(
+                        PropertyKey::from("length"),
+                        PropEntry::data(JsValue::Number(raw_len as f64), false, false, false),
+                    );
+                    self.heap.non_writable_array_lengths.insert(raw_arr);
+                    self.heap.get_obj_mut(raw_arr).extensible = false;
+                    let arr_len = cooked_vals.len();
+                    for (i, v) in cooked_vals.into_iter().enumerate() {
+                        let o = self.heap.get_obj_mut(arr);
+                        if let ObjectKind::Array(ref mut a) = o.kind {
+                            a.has_custom_index_props = true;
+                        }
+                        o.set_own_prop(
+                            PropertyKey::String(i.to_string()),
+                            PropEntry::data(v, false, true, false),
+                        );
+                    }
+                    self.heap.get_obj_mut(arr).set_own_prop(
+                        PropertyKey::from("length"),
+                        PropEntry::data(JsValue::Number(arr_len as f64), false, false, false),
+                    );
+                    self.heap.non_writable_array_lengths.insert(arr);
+                    self.heap.get_obj_mut(arr).set_own_prop(
+                        PropertyKey::from("raw"),
+                        PropEntry::data(JsValue::Object(raw_arr), false, false, false),
+                    );
+                    self.heap.get_obj_mut(arr).extensible = false;
+                    self.template_cache.insert(cache_key, arr);
+                    frame.stack.push(JsValue::Object(arr));
+                }
             }
             Op::DynamicImport => {
                 let spec_val = frame.stack.pop().unwrap();
@@ -2645,55 +3059,96 @@ impl JsRuntime {
             let fn_id = self.create_js_function(&m.func, class_env);
             if let ObjectKind::Function(ref mut f) = self.heap.get_obj_mut(fn_id).kind {
                 f.home_object = Some(target);
+                f.class_brand = Some(brand);
+            }
+            if !m.func.is_generator {
+                self.heap
+                    .get_obj_mut(fn_id)
+                    .remove_own_prop(&PropertyKey::from("prototype"));
             }
             if m.is_private {
                 let pname = m.name.clone().unwrap_or_default();
-                let entry = match m.kind {
-                    MethodKind::Get => PropEntry::accessor(Some(JsValue::Object(fn_id)), None, false, false),
-                    MethodKind::Set => PropEntry::accessor(None, Some(JsValue::Object(fn_id)), false, false),
-                    _ => PropEntry::data(JsValue::Object(fn_id), false, false, false),
-                };
-                self.heap
-                    .get_obj_mut(target)
-                    .private_fields
-                    .insert((brand, pname), entry);
-            } else {
+                let pf = &mut self.heap.get_obj_mut(target).private_fields;
                 match m.kind {
                     MethodKind::Get => {
-                        self.define_property(
-                            target,
-                            key,
-                            PropertyDescriptor {
-                                value: None,
-                                writable: None,
-                                get: Some(JsValue::Object(fn_id)),
-                                set: None,
-                                enumerable: Some(false),
-                                configurable: Some(true),
-                            },
-                        )?;
+                        if let Some(existing) = pf.get_mut(&(brand, pname.clone())) {
+                            if let PropValue::Accessor { ref mut get, .. } = existing.value {
+                                *get = Some(JsValue::Object(fn_id));
+                            } else {
+                                *existing = PropEntry::accessor(
+                                    Some(JsValue::Object(fn_id)),
+                                    None,
+                                    false,
+                                    false,
+                                );
+                            }
+                        } else {
+                            pf.insert(
+                                (brand, pname),
+                                PropEntry::accessor(Some(JsValue::Object(fn_id)), None, false, false),
+                            );
+                        }
                     }
                     MethodKind::Set => {
-                        self.define_property(
-                            target,
-                            key,
-                            PropertyDescriptor {
-                                value: None,
-                                writable: None,
-                                get: None,
-                                set: Some(JsValue::Object(fn_id)),
-                                enumerable: Some(false),
-                                configurable: Some(true),
-                            },
-                        )?;
+                        if let Some(existing) = pf.get_mut(&(brand, pname.clone())) {
+                            if let PropValue::Accessor { ref mut set, .. } = existing.value {
+                                *set = Some(JsValue::Object(fn_id));
+                            } else {
+                                *existing = PropEntry::accessor(
+                                    None,
+                                    Some(JsValue::Object(fn_id)),
+                                    false,
+                                    false,
+                                );
+                            }
+                        } else {
+                            pf.insert(
+                                (brand, pname),
+                                PropEntry::accessor(None, Some(JsValue::Object(fn_id)), false, false),
+                            );
+                        }
                     }
                     _ => {
-                        self.define_property(
-                            target,
-                            key,
-                            PropertyDescriptor::data(JsValue::Object(fn_id), true, false, true),
-                        )?;
+                        pf.insert(
+                            (brand, pname),
+                            PropEntry::data(JsValue::Object(fn_id), false, false, false),
+                        );
                     }
+                }
+            } else {
+                let ok = match m.kind {
+                    MethodKind::Get => self.define_property(
+                        target,
+                        key,
+                        PropertyDescriptor {
+                            value: None,
+                            writable: None,
+                            get: Some(JsValue::Object(fn_id)),
+                            set: None,
+                            enumerable: Some(false),
+                            configurable: Some(true),
+                        },
+                    )?,
+                    MethodKind::Set => self.define_property(
+                        target,
+                        key,
+                        PropertyDescriptor {
+                            value: None,
+                            writable: None,
+                            get: None,
+                            set: Some(JsValue::Object(fn_id)),
+                            enumerable: Some(false),
+                            configurable: Some(true),
+                        },
+                    )?,
+                    _ => self.define_property(
+                        target,
+                        key,
+                        PropertyDescriptor::data(JsValue::Object(fn_id), true, false, true),
+                    )?,
+                };
+                if !ok {
+                    return Err(JsError::type_err("Cannot define class method"));
                 }
             }
         }
@@ -2702,6 +3157,9 @@ impl JsRuntime {
             let val = if let Some(ref chunk) = sf.init_chunk {
                 let mut fenv = EnvRecord::new(Some(class_env), true, true);
                 fenv.this_binding = Some(JsValue::Object(ctor_id));
+                fenv.allow_super_prop = true;
+                fenv.allow_new_target = true;
+                fenv.allow_private = true;
                 let eid = self.heap.alloc_env(fenv);
                 self.exec_script_chunk(chunk.clone(), eid, true)?
             } else {
@@ -2736,6 +3194,9 @@ impl JsRuntime {
         for sb in &tmpl.static_blocks {
             let mut senv = EnvRecord::new(Some(class_env), true, true);
             senv.this_binding = Some(JsValue::Object(ctor_id));
+            senv.allow_super_prop = true;
+            senv.allow_new_target = true;
+            senv.allow_private = true;
             let eid = self.heap.alloc_env(senv);
             self.exec_script_chunk(sb.clone(), eid, true)?;
         }
