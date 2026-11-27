@@ -155,16 +155,24 @@ impl JsRuntime {
             return Err(JsError::type_err("Value is not a constructor"));
         }
 
-        let is_native = matches!(self.heap.get_obj(ctor_id).kind, ObjectKind::NativeFunction(_));
-        if is_native {
-            let proto_val = if let JsValue::Object(nt_id) = new_target {
-                self.get_property(nt_id, "prototype")?
-            } else {
-                self.get_property(ctor_id, "prototype")?
-            };
-            let proto = proto_val
+        let native_handles_nt = match &self.heap.get_obj(ctor_id).kind {
+            ObjectKind::NativeFunction(nf) => Some(nf.handles_new_target),
+            _ => None,
+        };
+        if let Some(handles_nt) = native_handles_nt {
+            if handles_nt {
+                return self.call_internal(
+                    JsValue::Object(ctor_id),
+                    JsValue::Undefined,
+                    args,
+                    Some(new_target),
+                );
+            }
+            let default_proto = self
+                .get_property(ctor_id, "prototype")?
                 .as_object()
                 .unwrap_or(self.intrinsics.object_proto);
+            let proto = self.get_prototype_from_constructor(&new_target, default_proto)?;
             let instance = self.create_object_with_proto(Some(proto));
             let res = self.call_internal(
                 JsValue::Object(ctor_id),
@@ -187,14 +195,7 @@ impl JsRuntime {
         let this_obj = if is_derived {
             None
         } else {
-            let proto_val = if let JsValue::Object(nt_id) = new_target {
-                self.get_property(nt_id, "prototype")?
-            } else {
-                self.get_property(ctor_id, "prototype")?
-            };
-            let proto = proto_val
-                .as_object()
-                .unwrap_or(self.intrinsics.object_proto);
+            let proto = self.get_prototype_from_constructor(&new_target, self.intrinsics.object_proto)?;
             Some(self.create_object_with_proto(Some(proto)))
         };
 
@@ -314,9 +315,25 @@ impl JsRuntime {
             _ => None,
         };
         if let Some(cb) = native_cb {
+            let fn_realm = self
+                .heap
+                .object_realms
+                .get(&oid)
+                .copied()
+                .unwrap_or(self.current_realm_id);
+            let prev_realm = self.switch_realm(fn_realm);
             self.call_depth += 1;
+            let prev_nt = self.native_new_target.replace(new_target.unwrap_or(JsValue::Undefined));
             let res = cb(self, this_arg, args);
+            let res = match res {
+                Err(e @ JsError::Native { object: None, .. }) if prev_realm != fn_realm => {
+                    Err(JsError::Thrown(self.error_to_js_value(e)))
+                }
+                other => other,
+            };
+            self.native_new_target = prev_nt;
             self.call_depth -= 1;
+            self.switch_realm(prev_realm);
             return res;
         }
 
@@ -338,6 +355,40 @@ impl JsRuntime {
     }
 
     fn call_js_function_internal(
+        &mut self,
+        fn_id: ObjectId,
+        this_arg: JsValue,
+        args: &[JsValue],
+        new_target: Option<JsValue>,
+        is_constructor: bool,
+        this_for_ctor: Option<ObjectId>,
+    ) -> Result<JsValue, JsError> {
+        let fn_realm = self
+            .heap
+            .object_realms
+            .get(&fn_id)
+            .copied()
+            .unwrap_or(self.current_realm_id);
+        let prev_realm = self.switch_realm(fn_realm);
+        let res = self.call_js_function_body(
+            fn_id,
+            this_arg,
+            args,
+            new_target,
+            is_constructor,
+            this_for_ctor,
+        );
+        let res = match res {
+            Err(e @ JsError::Native { object: None, .. }) if prev_realm != fn_realm => {
+                Err(JsError::Thrown(self.error_to_js_value(e)))
+            }
+            other => other,
+        };
+        self.switch_realm(prev_realm);
+        res
+    }
+
+    fn call_js_function_body(
         &mut self,
         fn_id: ObjectId,
         this_arg: JsValue,
@@ -478,9 +529,11 @@ impl JsRuntime {
         }
 
         self.call_depth += 1;
+        self.call_stack_callees.push(fn_id);
         self.active_frames.push(fn_env);
         let res = self.run_frame(&mut frame);
         self.active_frames.pop();
+        self.call_stack_callees.pop();
         self.call_depth -= 1;
 
         match res? {
@@ -578,6 +631,195 @@ impl JsRuntime {
         p
     }
 
+    fn pipe_async_gen_result(&mut self, res: Result<JsValue, JsError>, out_p: ObjectId) {
+        match res {
+            Ok(v) => self.resolve_promise(out_p, v),
+            Err(e) => {
+                let ev = self.error_to_js_value(e);
+                self.reject_promise(out_p, ev);
+            }
+        }
+    }
+
+    fn resume_async_delegate(
+        &mut self,
+        gen_id: ObjectId,
+        del_iter: JsValue,
+        mode: u8,
+        arg: JsValue,
+    ) -> ObjectId {
+        let out_p = self.create_promise();
+        self.step_async_delegate(gen_id, del_iter, mode, arg, out_p);
+        out_p
+    }
+
+    fn step_async_delegate(
+        &mut self,
+        gen_id: ObjectId,
+        del_iter: JsValue,
+        mode: u8,
+        arg: JsValue,
+        out_p: ObjectId,
+    ) {
+        let JsValue::Object(d_oid) = del_iter else {
+            if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                g.delegating = None;
+            }
+            let err = self.error_to_js_value(JsError::type_err("Delegated iterator is not an object"));
+            let res = self.resume_generator(gen_id, 1, err);
+            self.pipe_async_gen_result(res, out_p);
+            return;
+        };
+
+        let call_res: Result<Option<JsValue>, JsError> = (|| match mode {
+            0 => {
+                let next_fn = self.get_property(d_oid, "next")?;
+                if !self.is_callable(&next_fn) {
+                    return Err(JsError::type_err("Delegated iterator next is not callable"));
+                }
+                let r = self.call_function(next_fn, del_iter.clone(), &[arg.clone()])?;
+                Ok(Some(r))
+            }
+            1 => {
+                let throw_fn = self.get_property(d_oid, "throw")?;
+                if throw_fn.is_nullish() {
+                    return Ok(None);
+                }
+                if !self.is_callable(&throw_fn) {
+                    return Err(JsError::type_err("Delegated iterator throw is not callable"));
+                }
+                let r = self.call_function(throw_fn, del_iter.clone(), &[arg.clone()])?;
+                Ok(Some(r))
+            }
+            2 => {
+                let ret_fn = self.get_property(d_oid, "return")?;
+                if ret_fn.is_nullish() {
+                    return Ok(None);
+                }
+                if !self.is_callable(&ret_fn) {
+                    return Err(JsError::type_err("Delegated iterator return is not callable"));
+                }
+                let r = self.call_function(ret_fn, del_iter.clone(), &[arg.clone()])?;
+                Ok(Some(r))
+            }
+            _ => Ok(None),
+        })();
+
+        match call_res {
+            Err(e) => {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.delegating = None;
+                }
+                let ev = self.error_to_js_value(e);
+                let res = self.resume_generator(gen_id, 1, ev);
+                self.pipe_async_gen_result(res, out_p);
+            }
+            Ok(None) => {
+                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
+                    g.delegating = None;
+                }
+                if mode == 1 {
+                    self.iterator_close(&del_iter);
+                    let err = self.error_to_js_value(JsError::type_err(
+                        "The iterator does not provide a 'throw' method",
+                    ));
+                    let res = self.resume_generator(gen_id, 1, err);
+                    self.pipe_async_gen_result(res, out_p);
+                } else {
+                    let arg_p = self.promise_resolve_value(arg);
+                    let on_ok = self.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, a| {
+                            let v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let res = rt.resume_generator(gen_id, 2, v);
+                            rt.pipe_async_gen_result(res, out_p);
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    let on_err = self.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, a| {
+                            let v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let res = rt.resume_generator(gen_id, 1, v);
+                            rt.pipe_async_gen_result(res, out_p);
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    self.promise_then(
+                        arg_p,
+                        Some(JsValue::Object(on_ok)),
+                        Some(JsValue::Object(on_err)),
+                    );
+                }
+            }
+            Ok(Some(inner_val)) => {
+                let inner_p = self.promise_resolve_value(inner_val);
+                let on_ok = self.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, a| {
+                        let resolved = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        let step: Result<(bool, JsValue), JsError> = (|| {
+                            let JsValue::Object(r_oid) = resolved else {
+                                return Err(JsError::type_err("Iterator result is not an object"));
+                            };
+                            let done = rt.get_property(r_oid, "done")?.to_boolean();
+                            let val = rt.get_property(r_oid, "value")?;
+                            Ok((done, val))
+                        })();
+                        match step {
+                            Err(e) => {
+                                if let ObjectKind::Generator(ref mut g) =
+                                    rt.heap.get_obj_mut(gen_id).kind
+                                {
+                                    g.delegating = None;
+                                }
+                                let ev = rt.error_to_js_value(e);
+                                let res = rt.resume_generator(gen_id, 1, ev);
+                                rt.pipe_async_gen_result(res, out_p);
+                            }
+                            Ok((true, val)) => {
+                                if let ObjectKind::Generator(ref mut g) =
+                                    rt.heap.get_obj_mut(gen_id).kind
+                                {
+                                    g.delegating = None;
+                                }
+                                let resume_mode = if mode == 2 { 2 } else { 0 };
+                                let res = rt.resume_generator(gen_id, resume_mode, val);
+                                rt.pipe_async_gen_result(res, out_p);
+                            }
+                            Ok((false, val)) => {
+                                let ir = rt.create_iter_result(val, false);
+                                rt.resolve_promise(out_p, ir);
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+                let on_err = self.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, a| {
+                        let err = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        if let ObjectKind::Generator(ref mut g) = rt.heap.get_obj_mut(gen_id).kind {
+                            g.delegating = None;
+                        }
+                        let res = rt.resume_generator(gen_id, 1, err);
+                        rt.pipe_async_gen_result(res, out_p);
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+                self.promise_then(
+                    inner_p,
+                    Some(JsValue::Object(on_ok)),
+                    Some(JsValue::Object(on_err)),
+                );
+            }
+        }
+    }
+
     pub fn resume_generator(
         &mut self,
         gen_id: ObjectId,
@@ -590,6 +832,10 @@ impl JsRuntime {
         };
 
         if let Some(del_iter) = delegating {
+            if is_async {
+                let p = self.resume_async_delegate(gen_id, del_iter, mode, arg);
+                return Ok(JsValue::Object(p));
+            }
             if mode == 0 {
                 if let JsValue::Object(d_oid) = del_iter {
                     let next_fn = self.get_property(d_oid, "next")?;
@@ -610,6 +856,23 @@ impl JsRuntime {
         }
 
         if state == GeneratorState::Completed {
+            if is_async {
+                return match mode {
+                    1 => {
+                        let p = self.create_promise();
+                        self.reject_promise(p, arg);
+                        Ok(JsValue::Object(p))
+                    }
+                    2 => {
+                        let r = self.create_iter_result(arg, true);
+                        Ok(JsValue::Object(self.promise_resolve_value(r)))
+                    }
+                    _ => {
+                        let r = self.create_iter_result(JsValue::Undefined, true);
+                        Ok(JsValue::Object(self.promise_resolve_value(r)))
+                    }
+                };
+            }
             return match mode {
                 1 => Err(JsError::thrown(arg)),
                 2 => Ok(self.create_iter_result(arg, true)),
@@ -617,7 +880,14 @@ impl JsRuntime {
             };
         }
         if state == GeneratorState::Executing {
-            return Err(JsError::type_err("Generator is already running"));
+            let err = JsError::type_err("Generator is already running");
+            if is_async {
+                let p = self.create_promise();
+                let ev = self.error_to_js_value(err);
+                self.reject_promise(p, ev);
+                return Ok(JsValue::Object(p));
+            }
+            return Err(err);
         }
 
         let mut frame = match &mut self.heap.get_obj_mut(gen_id).kind {
@@ -634,13 +904,22 @@ impl JsRuntime {
                     if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
                         g.state = GeneratorState::Completed;
                     }
+                    if is_async {
+                        let p = self.create_promise();
+                        self.reject_promise(p, arg);
+                        return Ok(JsValue::Object(p));
+                    }
                     return Err(JsError::thrown(arg));
                 }
                 2 => {
                     if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
                         g.state = GeneratorState::Completed;
                     }
-                    return Ok(self.create_iter_result(arg, true));
+                    let r = self.create_iter_result(arg, true);
+                    if is_async {
+                        return Ok(JsValue::Object(self.promise_resolve_value(r)));
+                    }
+                    return Ok(r);
                 }
                 _ => {}
             }
@@ -652,15 +931,44 @@ impl JsRuntime {
                         if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
                             g.state = GeneratorState::Completed;
                         }
+                        if is_async {
+                            let p = self.create_promise();
+                            let ev = self.error_to_js_value(e);
+                            self.reject_promise(p, ev);
+                            return Ok(JsValue::Object(p));
+                        }
                         return Err(e);
                     }
                 }
                 2 => {
-                    if let Some(ret_val) = self.unwind_return(&mut frame, arg)? {
-                        if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
-                            g.state = GeneratorState::Completed;
+                    match self.unwind_return(&mut frame, arg) {
+                        Ok(Some(ret_val)) => {
+                            if let ObjectKind::Generator(ref mut g) =
+                                self.heap.get_obj_mut(gen_id).kind
+                            {
+                                g.state = GeneratorState::Completed;
+                            }
+                            let r = self.create_iter_result(ret_val, true);
+                            if is_async {
+                                return Ok(JsValue::Object(self.promise_resolve_value(r)));
+                            }
+                            return Ok(r);
                         }
-                        return Ok(self.create_iter_result(ret_val, true));
+                        Ok(None) => {}
+                        Err(e) => {
+                            if let ObjectKind::Generator(ref mut g) =
+                                self.heap.get_obj_mut(gen_id).kind
+                            {
+                                g.state = GeneratorState::Completed;
+                            }
+                            if is_async {
+                                let p = self.create_promise();
+                                let ev = self.error_to_js_value(e);
+                                self.reject_promise(p, ev);
+                                return Ok(JsValue::Object(p));
+                            }
+                            return Err(e);
+                        }
                     }
                 }
                 _ => {}
@@ -688,21 +996,61 @@ impl JsRuntime {
                     g.state = GeneratorState::SuspendedYield;
                     g.frame = Some(Box::new(frame));
                 }
-                let r = self.create_iter_result(v, false);
                 if is_async {
-                    Ok(JsValue::Object(self.promise_resolve_value(r)))
+                    let p = self.promise_resolve_value(v);
+                    let out_p = self.create_promise();
+                    let on_ok = self.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, a| {
+                            let av = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let res = rt.create_iter_result(av, false);
+                            rt.resolve_promise(out_p, res);
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    let on_err = self.create_native_function(
+                        "",
+                        1,
+                        Rc::new(move |rt, _, a| {
+                            let err_v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let res = rt.resume_generator(gen_id, 1, err_v);
+                            rt.pipe_async_gen_result(res, out_p);
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                    self.promise_then(
+                        p,
+                        Some(JsValue::Object(on_ok)),
+                        Some(JsValue::Object(on_err)),
+                    );
+                    Ok(JsValue::Object(out_p))
                 } else {
+                    let r = self.create_iter_result(v, false);
                     Ok(r)
                 }
             }
             Ok(FrameOutcome::YieldDelegate(iterable)) => {
-                let iter = self.get_iterator(&iterable, is_async)?;
-                if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind {
-                    g.state = GeneratorState::SuspendedYield;
-                    g.frame = Some(Box::new(frame));
-                    g.delegating = Some(iter);
+                match self.get_iterator(&iterable, is_async) {
+                    Ok(iter) => {
+                        if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind
+                        {
+                            g.state = GeneratorState::SuspendedYield;
+                            g.frame = Some(Box::new(frame));
+                            g.delegating = Some(iter);
+                        }
+                        self.resume_generator(gen_id, 0, JsValue::Undefined)
+                    }
+                    Err(e) => {
+                        if let ObjectKind::Generator(ref mut g) = self.heap.get_obj_mut(gen_id).kind
+                        {
+                            g.state = GeneratorState::SuspendedYield;
+                            g.frame = Some(Box::new(frame));
+                        }
+                        let ev = self.error_to_js_value(e);
+                        self.resume_generator(gen_id, 1, ev)
+                    }
                 }
-                self.resume_generator(gen_id, 0, JsValue::Undefined)
             }
             Ok(FrameOutcome::Await(awaited)) => {
                 let p = self.promise_resolve_value(awaited);
@@ -716,13 +1064,8 @@ impl JsRuntime {
                     1,
                     Rc::new(move |rt, _, a| {
                         let v = a.first().cloned().unwrap_or(JsValue::Undefined);
-                        match rt.resume_generator(gen_id, 0, v) {
-                            Ok(r) => rt.resolve_promise(out_p, r),
-                            Err(e) => {
-                                let ev = rt.error_to_js_value(e);
-                                rt.reject_promise(out_p, ev);
-                            }
-                        }
+                        let res = rt.resume_generator(gen_id, 0, v);
+                        rt.pipe_async_gen_result(res, out_p);
                         Ok(JsValue::Undefined)
                     }),
                 );
@@ -731,13 +1074,8 @@ impl JsRuntime {
                     1,
                     Rc::new(move |rt, _, a| {
                         let v = a.first().cloned().unwrap_or(JsValue::Undefined);
-                        match rt.resume_generator(gen_id, 1, v) {
-                            Ok(r) => rt.resolve_promise(out_p, r),
-                            Err(e) => {
-                                let ev = rt.error_to_js_value(e);
-                                rt.reject_promise(out_p, ev);
-                            }
-                        }
+                        let res = rt.resume_generator(gen_id, 1, v);
+                        rt.pipe_async_gen_result(res, out_p);
                         Ok(JsValue::Undefined)
                     }),
                 );
@@ -820,7 +1158,15 @@ impl JsRuntime {
             }
             Pattern::Assign { left, right } => {
                 let actual = if val.is_undefined() {
-                    let c = Compiler::compile_expr_chunk(right, self.heap.get_env(env).strict)?;
+                    let infer_name = match left.as_ref() {
+                        Pattern::Ident(n) => Some(n.as_str()),
+                        _ => None,
+                    };
+                    let c = Compiler::compile_expr_chunk_with_name(
+                        right,
+                        self.heap.get_env(env).strict,
+                        infer_name,
+                    )?;
                     self.exec_script_chunk(c, env, self.heap.get_env(env).strict)?
                 } else {
                     val
@@ -829,20 +1175,38 @@ impl JsRuntime {
             }
             Pattern::Array { elements, rest } => {
                 let iter = self.get_iterator(&val, false)?;
+                let mut done = false;
                 for el in elements {
-                    let next = self.iterator_step(&iter)?.unwrap_or(JsValue::Undefined);
+                    let next = if done {
+                        JsValue::Undefined
+                    } else {
+                        match self.iterator_step(&iter)? {
+                            Some(v) => v,
+                            None => {
+                                done = true;
+                                JsValue::Undefined
+                            }
+                        }
+                    };
                     if let Some(sub) = el {
-                        self.bind_pattern_value(sub, next, env)?;
+                        if let Err(e) = self.bind_pattern_value(sub, next, env) {
+                            if !done {
+                                self.iterator_close(&iter);
+                            }
+                            return Err(e);
+                        }
                     }
                 }
                 if let Some(rest_pat) = rest {
                     let mut rest_vals = Vec::new();
-                    while let Some(v) = self.iterator_step(&iter)? {
-                        rest_vals.push(v);
+                    if !done {
+                        while let Some(v) = self.iterator_step(&iter)? {
+                            rest_vals.push(v);
+                        }
                     }
                     let arr = self.create_array(rest_vals);
                     self.bind_pattern_value(rest_pat, JsValue::Object(arr), env)?;
-                } else {
+                } else if !done {
                     self.iterator_close(&iter);
                 }
             }
@@ -1820,21 +2184,35 @@ impl JsRuntime {
             }
             Op::IteratorNextValue => {
                 let iter = frame.stack.last().cloned().unwrap();
-                let val = self.iterator_step(&iter)?.unwrap_or(JsValue::Undefined);
-                frame.stack.push(val);
+                if iter.is_undefined() {
+                    frame.stack.push(JsValue::Undefined);
+                } else {
+                    match self.iterator_step(&iter)? {
+                        Some(val) => frame.stack.push(val),
+                        None => {
+                            *frame.stack.last_mut().unwrap() = JsValue::Undefined;
+                            frame.stack.push(JsValue::Undefined);
+                        }
+                    }
+                }
             }
             Op::IteratorRest => {
                 let iter = frame.stack.last().cloned().unwrap();
                 let mut rest = Vec::new();
-                while let Some(v) = self.iterator_step(&iter)? {
-                    rest.push(v);
+                if !iter.is_undefined() {
+                    while let Some(v) = self.iterator_step(&iter)? {
+                        rest.push(v);
+                    }
+                    *frame.stack.last_mut().unwrap() = JsValue::Undefined;
                 }
                 let arr = self.create_array(rest);
                 frame.stack.push(JsValue::Object(arr));
             }
             Op::IteratorClose => {
                 if let Some(iter) = frame.stack.last().cloned() {
-                    self.iterator_close(&iter);
+                    if !iter.is_undefined() {
+                        self.iterator_close(&iter);
+                    }
                 }
             }
             Op::Yield => {
@@ -1960,6 +2338,110 @@ impl JsRuntime {
                 frame.stack.push(frame.last_value.clone());
             }
             Op::Debugger => {}
+            Op::AddDisposable {
+                stack_name,
+                is_async,
+            } => {
+                let name = get_const_str(&frame.chunk, stack_name).to_string();
+                let val = frame.stack.last().cloned().unwrap_or(JsValue::Undefined);
+                let stack_val = self.get_var(frame.env, &name)?;
+                let JsValue::Object(stack_oid) = stack_val else {
+                    return Err(JsError::internal("Invalid dispose stack"));
+                };
+                if val.is_nullish() {
+                    if is_async {
+                        let entry = self.create_array(vec![
+                            val,
+                            JsValue::Undefined,
+                            JsValue::Boolean(true),
+                        ]);
+                        if let ObjectKind::Array(ref mut arr) =
+                            self.heap.get_obj_mut(stack_oid).kind
+                        {
+                            let len = arr.length;
+                            arr.set(len, JsValue::Object(entry));
+                        }
+                    }
+                } else if let JsValue::Object(oid) = val {
+                    let method = if is_async {
+                        let async_key = PropertyKey::Symbol(self.symbols.async_dispose);
+                        let m = self.get_property_key(oid, &async_key)?;
+                        if m.is_nullish() {
+                            let sync_key = PropertyKey::Symbol(self.symbols.dispose);
+                            let sm = self.get_property_key(oid, &sync_key)?;
+                            if !self.is_callable(&sm) {
+                                return Err(JsError::type_err("Object is not async disposable"));
+                            }
+                            sm
+                        } else if !self.is_callable(&m) {
+                            return Err(JsError::type_err("Symbol.asyncDispose is not callable"));
+                        } else {
+                            m
+                        }
+                    } else {
+                        let sync_key = PropertyKey::Symbol(self.symbols.dispose);
+                        let sm = self.get_property_key(oid, &sync_key)?;
+                        if !self.is_callable(&sm) {
+                            return Err(JsError::type_err("Object is not disposable"));
+                        }
+                        sm
+                    };
+                    let entry = self.create_array(vec![
+                        val,
+                        method,
+                        JsValue::Boolean(is_async),
+                    ]);
+                    if let ObjectKind::Array(ref mut arr) = self.heap.get_obj_mut(stack_oid).kind {
+                        let len = arr.length;
+                        arr.set(len, JsValue::Object(entry));
+                    }
+                } else {
+                    return Err(JsError::type_err("Disposable resource must be an object"));
+                }
+            }
+            Op::DisposeNext {
+                stack_name,
+                sync_ip,
+                end_ip,
+            } => {
+                let name = get_const_str(&frame.chunk, stack_name).to_string();
+                let stack_val = self.get_var(frame.env, &name)?;
+                let JsValue::Object(stack_oid) = stack_val else {
+                    frame.ip = end_ip as usize;
+                    return Ok(None);
+                };
+                let popped = match &mut self.heap.get_obj_mut(stack_oid).kind {
+                    ObjectKind::Array(ref mut arr) if arr.length > 0 => {
+                        let idx = arr.length - 1;
+                        let item = arr.get(idx).cloned();
+                        arr.truncate(idx);
+                        item
+                    }
+                    _ => None,
+                };
+                let Some(JsValue::Object(entry_oid)) = popped else {
+                    frame.ip = end_ip as usize;
+                    return Ok(None);
+                };
+                let (res_val, method_val, is_async_val) = match &self.heap.get_obj(entry_oid).kind {
+                    ObjectKind::Array(a) => (
+                        a.get(0).cloned().unwrap_or(JsValue::Undefined),
+                        a.get(1).cloned().unwrap_or(JsValue::Undefined),
+                        a.get(2).cloned().unwrap_or(JsValue::Boolean(false)).to_boolean(),
+                    ),
+                    _ => (JsValue::Undefined, JsValue::Undefined, false),
+                };
+                let call_res = if self.is_callable(&method_val) {
+                    self.call_function(method_val, res_val, &[])?
+                } else {
+                    JsValue::Undefined
+                };
+                if is_async_val {
+                    frame.stack.push(call_res);
+                } else {
+                    frame.ip = sync_ip as usize;
+                }
+            }
         }
         Ok(None)
     }
@@ -2350,10 +2832,16 @@ impl JsRuntime {
 
     fn extract_args_array(&self, val: JsValue) -> Vec<JsValue> {
         if let JsValue::Object(oid) = val {
-            if let ObjectKind::Array(ref arr) = self.heap.get_obj(oid).kind {
-                return (0..arr.length)
-                    .map(|i| arr.get(i).cloned().unwrap_or(JsValue::Undefined))
-                    .collect();
+            match &self.heap.get_obj(oid).kind {
+                ObjectKind::Array(arr) => {
+                    return (0..arr.length)
+                        .map(|i| arr.get(i).cloned().unwrap_or(JsValue::Undefined))
+                        .collect();
+                }
+                ObjectKind::Arguments(args) => {
+                    return args.values.clone();
+                }
+                _ => {}
             }
         }
         Vec::new()
@@ -2533,7 +3021,7 @@ impl JsRuntime {
             if let Some(oid) = obj_env {
                 let key = PropertyKey::String(name.to_string());
                 if self.has_property(oid, &key)? {
-                    if oid != self.global_object {
+                    if parent.is_some() {
                         let unscop = PropertyKey::Symbol(self.symbols.unscopables);
                         let u = self.get_property_key(oid, &unscop)?;
                         if let JsValue::Object(uid) = u {
@@ -2590,6 +3078,18 @@ impl JsRuntime {
             if let Some(oid) = obj_env {
                 let key = PropertyKey::String(name.to_string());
                 if self.has_property(oid, &key)? {
+                    if parent.is_some() {
+                        let unscop = PropertyKey::Symbol(self.symbols.unscopables);
+                        let u = self.get_property_key(oid, &unscop)?;
+                        if let JsValue::Object(uid) = u {
+                            if self.get_property(uid, name)?.to_boolean() {
+                                if let Some(p) = parent {
+                                    env = p;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     self.set_property_key_strict(oid, key, val, strict)?;
                     return Ok(());
                 }

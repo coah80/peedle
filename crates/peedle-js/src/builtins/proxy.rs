@@ -21,16 +21,6 @@ fn create_proxy_obj(rt: &mut JsRuntime, args: &[JsValue]) -> Result<ObjectId, Js
             "Cannot create proxy with a non-object as target or handler",
         ));
     };
-    if let ObjectKind::Proxy(ref p) = rt.heap.get_obj(*target).kind {
-        if p.revoked {
-            return Err(JsError::type_err("Cannot create proxy with a revoked proxy as target"));
-        }
-    }
-    if let ObjectKind::Proxy(ref p) = rt.heap.get_obj(*handler).kind {
-        if p.revoked {
-            return Err(JsError::type_err("Cannot create proxy with a revoked proxy as handler"));
-        }
-    }
     Ok(rt.heap.alloc_object(JsObject::new(
         None,
         ObjectKind::Proxy(ProxyData {
@@ -47,22 +37,21 @@ fn init_proxy(rt: &mut JsRuntime) {
         ObjectKind::NativeFunction(NativeFn {
             name: "Proxy".into(),
             length: 2,
-            callback: Rc::new(|rt, this, args| {
-                if !this.is_object() {
-                    return Err(JsError::type_err("Constructor Proxy requires 'new'"));
-                }
+            callback: Rc::new(|rt, _, args| {
+                rt.require_new_target("Proxy")?;
                 Ok(JsValue::Object(create_proxy_obj(rt, args)?))
             }),
             is_constructor: true,
+            handles_new_target: true,
         }),
     ));
     rt.heap.get_obj_mut(ctor).set_own_prop(
-        PropertyKey::from("name"),
-        PropEntry::data(JsValue::String("Proxy".into()), false, false, true),
-    );
-    rt.heap.get_obj_mut(ctor).set_own_prop(
         PropertyKey::from("length"),
         PropEntry::data(JsValue::Number(2.0), false, false, true),
+    );
+    rt.heap.get_obj_mut(ctor).set_own_prop(
+        PropertyKey::from("name"),
+        PropEntry::data(JsValue::String("Proxy".into()), false, false, true),
     );
 
     set_method(

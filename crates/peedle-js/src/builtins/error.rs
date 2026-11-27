@@ -1,3 +1,4 @@
+use crate::builtins::array::create_data_property_or_throw;
 use crate::builtins::{set_global, set_method};
 use crate::error::{ErrorKind, JsError};
 use crate::heap::*;
@@ -14,6 +15,55 @@ pub fn init(rt: &mut JsRuntime) {
     rt.heap.get_obj_mut(error_proto).set_own_prop(
         PropertyKey::from("message"),
         PropEntry::data(JsValue::String(String::new()), true, false, true),
+    );
+    let stack_get = rt.create_native_function(
+        "get stack",
+        0,
+        Rc::new(|rt, this, _| {
+            let JsValue::Object(oid) = this else {
+                return Err(JsError::type_err("Error.prototype.stack getter requires an object"));
+            };
+            match &rt.heap.get_obj(oid).kind {
+                ObjectKind::Error(e) => Ok(JsValue::String(e.stack.clone())),
+                _ => Ok(JsValue::Undefined),
+            }
+        }),
+    );
+    let stack_set = rt.create_native_function(
+        "set stack",
+        1,
+        Rc::new(move |rt, this, args| {
+            let JsValue::Object(oid) = this else {
+                return Err(JsError::type_err("Error.prototype.stack setter requires an object"));
+            };
+            let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !matches!(val, JsValue::String(_)) {
+                return Err(JsError::type_err("Error.prototype.stack value must be a string"));
+            }
+            if oid == error_proto {
+                return Err(JsError::type_err("Cannot set stack on Error.prototype"));
+            }
+            let key = PropertyKey::from("stack");
+            let desc = rt.get_own_property_descriptor(oid, &key)?;
+            if desc.is_none() {
+                create_data_property_or_throw(rt, oid, key, val)?;
+            } else {
+                rt.set_property_key_strict(oid, key, val, true)?;
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let _ = rt.define_property(
+        error_proto,
+        PropertyKey::from("stack"),
+        PropertyDescriptor {
+            value: None,
+            writable: None,
+            get: Some(JsValue::Object(stack_get)),
+            set: Some(JsValue::Object(stack_set)),
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
     );
     set_method(
         rt,
@@ -47,6 +97,19 @@ pub fn init(rt: &mut JsRuntime) {
     );
 
     let err_ctor = make_error_ctor(rt, ErrorKind::Error, error_proto, None);
+    set_method(
+        rt,
+        err_ctor,
+        "isError",
+        1,
+        Rc::new(|rt, _, args| {
+            let b = matches!(
+                args.first(),
+                Some(JsValue::Object(oid)) if matches!(rt.heap.get_obj(*oid).kind, ObjectKind::Error(_))
+            );
+            Ok(JsValue::Boolean(b))
+        }),
+    );
     set_global(rt, "Error", JsValue::Object(err_ctor));
 
     let subclasses = [
@@ -80,23 +143,20 @@ pub fn init(rt: &mut JsRuntime) {
         PropertyKey::from("message"),
         PropEntry::data(JsValue::String(String::new()), true, false, true),
     );
-    let agg_ctor = rt.create_native_constructor(
+    let agg_ctor = rt.create_spec_constructor(
         "AggregateError",
         2,
         agg_proto,
-        Rc::new(|rt, _, args| {
-            let errors_arg = args.first().unwrap_or(&JsValue::Undefined);
-            let errors = rt.collect_iterable(errors_arg)?;
-            let msg = match args.get(1) {
-                None | Some(JsValue::Undefined) => String::new(),
-                Some(v) => rt.to_string(v)?,
+        Rc::new(move |rt, _, args| {
+            let obj_proto = rt.get_prototype_from_new_target(agg_proto)?;
+            let has_msg = !matches!(args.get(1), None | Some(JsValue::Undefined));
+            let msg = if has_msg {
+                rt.to_string(&args[1])?
+            } else {
+                String::new()
             };
-            let err_obj = rt.create_error_object(ErrorKind::AggregateError, &msg);
-            let err_arr = rt.create_array(errors);
-            rt.heap.get_obj_mut(err_obj).set_own_prop(
-                PropertyKey::from("errors"),
-                PropEntry::data(JsValue::Object(err_arr), true, false, true),
-            );
+            let err_obj =
+                rt.create_error_object_with_proto(ErrorKind::AggregateError, &msg, has_msg, obj_proto);
             if let Some(JsValue::Object(opts)) = args.get(2) {
                 if rt.has_property(*opts, &PropertyKey::from("cause"))? {
                     let cause = rt.get_property(*opts, "cause")?;
@@ -106,6 +166,13 @@ pub fn init(rt: &mut JsRuntime) {
                     );
                 }
             }
+            let errors_arg = args.first().unwrap_or(&JsValue::Undefined);
+            let errors = rt.collect_iterable(errors_arg)?;
+            let err_arr = rt.create_array(errors);
+            rt.heap.get_obj_mut(err_obj).set_own_prop(
+                PropertyKey::from("errors"),
+                PropEntry::data(JsValue::Object(err_arr), true, false, true),
+            );
             Ok(JsValue::Object(err_obj))
         }),
     );
@@ -119,16 +186,19 @@ fn make_error_ctor(
     proto: ObjectId,
     parent_ctor: Option<ObjectId>,
 ) -> ObjectId {
-    let ctor = rt.create_native_constructor(
+    let ctor = rt.create_spec_constructor(
         kind.name(),
         1,
         proto,
         Rc::new(move |rt, _, args| {
-            let msg = match args.first() {
-                None | Some(JsValue::Undefined) => String::new(),
-                Some(v) => rt.to_string(v)?,
+            let obj_proto = rt.get_prototype_from_new_target(proto)?;
+            let has_msg = !matches!(args.first(), None | Some(JsValue::Undefined));
+            let msg = if has_msg {
+                rt.to_string(&args[0])?
+            } else {
+                String::new()
             };
-            let obj = rt.create_error_object(kind, &msg);
+            let obj = rt.create_error_object_with_proto(kind, &msg, has_msg, obj_proto);
             if let Some(JsValue::Object(opts)) = args.get(1) {
                 if rt.has_property(*opts, &PropertyKey::from("cause"))? {
                     let cause = rt.get_property(*opts, "cause")?;

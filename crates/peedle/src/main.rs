@@ -74,11 +74,12 @@ fn run_headless(args: &[String]) {
             eprintln!("navigation error: {}", e);
         }
         if wait_ms > 0 {
-            let steps = (wait_ms / 16).max(1);
+            let steps = (wait_ms / 25).clamp(1, 500);
             let step_ms = (wait_ms / steps).max(1);
             for _ in 0..steps {
-                page.advance_time_ms(step_ms);
+                page.js_env.advance_time_ms(step_ms);
             }
+            page.recompute_if_needed();
         }
         if let Some(ref code) = eval_code {
             match page.eval_js(code) {
@@ -107,11 +108,12 @@ fn run_headless(args: &[String]) {
         let mut page = Page::new(width, height);
         let _ = page.navigate(&url);
         if wait_ms > 0 {
-            let steps = (wait_ms / 16).max(1);
+            let steps = (wait_ms / 25).clamp(1, 500);
             let step_ms = (wait_ms / steps).max(1);
             for _ in 0..steps {
-                page.advance_time_ms(step_ms);
+                page.js_env.advance_time_ms(step_ms);
             }
+            page.recompute_if_needed();
         }
         if let Some(ref code) = eval_code {
             match page.eval_js(code) {

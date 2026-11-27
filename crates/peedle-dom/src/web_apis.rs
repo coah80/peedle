@@ -807,8 +807,35 @@ fn define_observers_and_misc(rt: &mut JsRuntime, dom: SharedDom, global: ObjectI
             let nid = args.first().and_then(|v| node_id_of(rt, v));
             let style = {
                 let mut st = d.borrow_mut();
-                st.ensure_layout();
-                nid.and_then(|id| st.styles.get(id).cloned()).unwrap_or_default()
+                if let Some(id) = nid {
+                    let mut root = id;
+                    while let Some(p) = st.doc.node(root).parent {
+                        root = p;
+                    }
+                    if root == st.doc.root {
+                        st.ensure_layout();
+                        st.styles.get(id).cloned().unwrap_or_default()
+                    } else {
+                        let mut sub_sheets = Vec::new();
+                        for sub_nid in st.doc.descendants(root) {
+                            if let Some(el) = st.doc.element(sub_nid) {
+                                if el.is_html() && el.tag_is("style") {
+                                    let css = st.doc.text_content(sub_nid);
+                                    sub_sheets.push(peedle_css::parse_stylesheet(&css));
+                                }
+                            }
+                        }
+                        let vp = Viewport {
+                            width: st.viewport_w,
+                            height: st.viewport_h,
+                            dark_mode: st.dark_mode,
+                        };
+                        let sub_map = peedle_css::compute_styles_for_root(&st.doc, root, &sub_sheets, vp);
+                        sub_map.get(id).cloned().unwrap_or_default()
+                    }
+                } else {
+                    peedle_css::ComputedStyle::default()
+                }
             };
             let target = rt.create_object();
             let s1 = style.clone();

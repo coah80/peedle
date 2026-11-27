@@ -26,6 +26,8 @@ pub struct Compiler {
     track_completion: bool,
     pending_label: Option<String>,
     strict: bool,
+    dispose_stacks: Vec<String>,
+    next_dispose_id: u32,
 }
 
 impl Compiler {
@@ -39,12 +41,12 @@ impl Compiler {
             track_completion: !program.is_module,
             pending_label: None,
             strict: program.strict,
+            dispose_stacks: Vec::new(),
+            next_dispose_id: 0,
         };
         collect_hoisted(&program.body, &mut comp.chunk, program.strict)?;
         collect_block_lex(&program.body, &mut comp.chunk.lex_names);
-        for stmt in &program.body {
-            comp.compile_stmt(stmt)?;
-        }
+        comp.compile_stmt_list_with_dispose(&program.body)?;
         if comp.track_completion {
             comp.emit(Op::PushLastValue);
         } else {
@@ -64,14 +66,14 @@ impl Compiler {
             track_completion: false,
             pending_label: None,
             strict: func.strict,
+            dispose_stacks: Vec::new(),
+            next_dispose_id: 0,
         };
         match &func.body {
             FuncBody::Block(stmts) => {
                 collect_hoisted(stmts, &mut comp.chunk, func.strict)?;
                 collect_block_lex(stmts, &mut comp.chunk.lex_names);
-                for stmt in stmts {
-                    comp.compile_stmt(stmt)?;
-                }
+                comp.compile_stmt_list_with_dispose(stmts)?;
                 comp.emit(Op::PushUndefined);
                 comp.emit(Op::Return);
             }
@@ -93,6 +95,14 @@ impl Compiler {
     }
 
     pub fn compile_expr_chunk(expr: &Expr, strict: bool) -> Result<Rc<Chunk>, JsError> {
+        Self::compile_expr_chunk_with_name(expr, strict, None)
+    }
+
+    pub fn compile_expr_chunk_with_name(
+        expr: &Expr,
+        strict: bool,
+        name: Option<&str>,
+    ) -> Result<Rc<Chunk>, JsError> {
         let mut comp = Compiler {
             chunk: Chunk::new(strict, false),
             loops: Vec::new(),
@@ -102,8 +112,14 @@ impl Compiler {
             track_completion: false,
             pending_label: None,
             strict,
+            dispose_stacks: Vec::new(),
+            next_dispose_id: 0,
         };
-        comp.compile_expr(expr)?;
+        if let Some(n) = name {
+            comp.compile_expr_with_name(expr, n)?;
+        } else {
+            comp.compile_expr(expr)?;
+        }
         comp.emit(Op::Return);
         Ok(Rc::new(comp.chunk))
     }
@@ -118,12 +134,12 @@ impl Compiler {
             track_completion: false,
             pending_label: None,
             strict,
+            dispose_stacks: Vec::new(),
+            next_dispose_id: 0,
         };
         collect_hoisted(stmts, &mut comp.chunk, strict)?;
         collect_block_lex(stmts, &mut comp.chunk.lex_names);
-        for s in stmts {
-            comp.compile_stmt(s)?;
-        }
+        comp.compile_stmt_list_with_dispose(stmts)?;
         comp.emit(Op::PushUndefined);
         comp.emit(Op::Return);
         Ok(Rc::new(comp.chunk))
@@ -389,6 +405,68 @@ impl Compiler {
         }
     }
 
+    fn compile_stmt_list_with_dispose(&mut self, stmts: &[Stmt]) -> Result<(), JsError> {
+        let has_using = stmts.iter().any(|s| {
+            matches!(
+                s,
+                Stmt::VarDecl {
+                    kind: VarKind::Using | VarKind::AwaitUsing,
+                    ..
+                }
+            )
+        });
+        if !has_using {
+            for stmt in stmts {
+                self.compile_stmt(stmt)?;
+            }
+            return Ok(());
+        }
+        let disp_name = format!("\0__dispose_{}", self.next_dispose_id);
+        self.next_dispose_id += 1;
+        let disp_idx = self.str_const(&disp_name);
+        self.emit(Op::DeclareLet(disp_idx));
+        self.emit(Op::CreateArray(0));
+        self.stack_depth += 1;
+        self.emit(Op::InitBinding(disp_idx));
+        self.stack_depth -= 1;
+
+        let try_push_idx = self.emit(Op::TryPush {
+            catch_ip: None,
+            finally_ip: None,
+        });
+        self.handler_depth += 1;
+        self.dispose_stacks.push(disp_name);
+
+        for stmt in stmts {
+            self.compile_stmt(stmt)?;
+        }
+
+        self.dispose_stacks.pop();
+        let fin_ip = self.current_ip();
+        self.chunk.ops[try_push_idx] = Op::TryPush {
+            catch_ip: None,
+            finally_ip: Some(fin_ip),
+        };
+        let loop_start = self.current_ip();
+        let disp_op_idx = self.emit(Op::DisposeNext {
+            stack_name: disp_idx,
+            sync_ip: loop_start,
+            end_ip: 0,
+        });
+        self.emit(Op::Await);
+        self.emit(Op::Pop);
+        self.emit(Op::Jump(loop_start));
+        let end_ip = self.current_ip();
+        self.chunk.ops[disp_op_idx] = Op::DisposeNext {
+            stack_name: disp_idx,
+            sync_ip: loop_start,
+            end_ip,
+        };
+        self.emit(Op::FinallyEnd);
+        self.handler_depth -= 1;
+        Ok(())
+    }
+
     fn compile_block_stmts(&mut self, stmts: &[Stmt]) -> Result<(), JsError> {
         let mut lex_names = Vec::new();
         let mut block_funcs = Vec::new();
@@ -403,7 +481,7 @@ impl Compiler {
                     }
                 }
                 Stmt::VarDecl {
-                    kind: VarKind::Const,
+                    kind: VarKind::Const | VarKind::Using | VarKind::AwaitUsing,
                     decls,
                 } => {
                     for d in decls {
@@ -445,9 +523,7 @@ impl Compiler {
                 self.stack_depth -= 1;
             }
         }
-        for stmt in stmts {
-            self.compile_stmt(stmt)?;
-        }
+        self.compile_stmt_list_with_dispose(stmts)?;
         if needs_scope {
             self.pop_scope();
         }
@@ -457,11 +533,33 @@ impl Compiler {
     fn compile_var_decl(&mut self, kind: VarKind, decls: &[VarDeclarator]) -> Result<(), JsError> {
         for decl in decls {
             if let Some(ref init) = decl.init {
-                self.compile_expr(init)?;
+                if let Pattern::Ident(ref name) = decl.pattern {
+                    self.compile_expr_with_name(init, name)?;
+                } else {
+                    self.compile_expr(init)?;
+                }
+                if matches!(kind, VarKind::Using | VarKind::AwaitUsing) {
+                    if let Some(stack_name) = self.dispose_stacks.last().cloned() {
+                        let sidx = self.str_const(&stack_name);
+                        self.emit(Op::AddDisposable {
+                            stack_name: sidx,
+                            is_async: kind == VarKind::AwaitUsing,
+                        });
+                    }
+                }
                 self.compile_pattern_bind(&decl.pattern, kind)?;
             } else if kind != VarKind::Var {
                 self.emit(Op::PushUndefined);
                 self.stack_depth += 1;
+                if matches!(kind, VarKind::Using | VarKind::AwaitUsing) {
+                    if let Some(stack_name) = self.dispose_stacks.last().cloned() {
+                        let sidx = self.str_const(&stack_name);
+                        self.emit(Op::AddDisposable {
+                            stack_name: sidx,
+                            is_async: kind == VarKind::AwaitUsing,
+                        });
+                    }
+                }
                 self.compile_pattern_bind(&decl.pattern, kind)?;
             }
         }
@@ -1104,7 +1202,11 @@ impl Compiler {
                 let j_skip = self.emit(Op::JumpIfNotUndefined(0));
                 self.emit(Op::Pop);
                 self.stack_depth -= 1;
-                self.compile_expr(right)?;
+                if let Pattern::Ident(name) = left.as_ref() {
+                    self.compile_expr_with_name(right, name)?;
+                } else {
+                    self.compile_expr(right)?;
+                }
                 let target = self.current_ip();
                 self.chunk.patch_jump(j_skip, target);
                 self.compile_pattern_bind(left, kind)
@@ -1188,7 +1290,11 @@ impl Compiler {
                 let j_skip = self.emit(Op::JumpIfNotUndefined(0));
                 self.emit(Op::Pop);
                 self.stack_depth -= 1;
-                self.compile_expr(right)?;
+                if let Pattern::Ident(name) = left.as_ref() {
+                    self.compile_expr_with_name(right, name)?;
+                } else {
+                    self.compile_expr(right)?;
+                }
                 let target = self.current_ip();
                 self.chunk.patch_jump(j_skip, target);
                 self.compile_pattern_assign(left)
@@ -2333,6 +2439,26 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_expr_with_name(&mut self, expr: &Expr, name: &str) -> Result<(), JsError> {
+        match expr {
+            Expr::Function(func) | Expr::Arrow(func) if func.name.is_none() => {
+                let mut named = (**func).clone();
+                named.name = Some(name.to_string());
+                let tmpl = Compiler::compile_function(&named)?;
+                let idx = self.chunk.add_const(ConstValue::Func(tmpl));
+                self.emit(Op::CreateFunction(idx));
+                self.stack_depth += 1;
+                Ok(())
+            }
+            Expr::Class(cls) if cls.name.is_none() => {
+                let mut named = (**cls).clone();
+                named.name = Some(name.to_string());
+                self.compile_class(&named)
+            }
+            _ => self.compile_expr(expr),
+        }
+    }
+
     fn compile_class(&mut self, cls: &ClassNode) -> Result<(), JsError> {
         let has_super = cls.super_class.is_some();
         if let Some(ref sup) = cls.super_class {
@@ -2612,7 +2738,7 @@ fn collect_block_lex(stmts: &[Stmt], out: &mut Vec<(String, bool)>) {
                 }
             }
             Stmt::VarDecl {
-                kind: VarKind::Const,
+                kind: VarKind::Const | VarKind::Using | VarKind::AwaitUsing,
                 decls,
             } => {
                 for d in decls {

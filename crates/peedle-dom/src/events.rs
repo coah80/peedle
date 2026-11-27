@@ -470,10 +470,12 @@ fn invoke_listeners(
     }
 
     if !capture_only && !is_imm_stopped(rt, ev_oid) {
+        let mut invoked_prop = false;
         if let Some(ct_oid) = current_target.as_object() {
             let on_prop = format!("on{}", event_type);
             if let Ok(handler) = rt.get_property(ct_oid, &on_prop) {
                 if rt.is_callable(&handler) {
+                    invoked_prop = true;
                     let res = rt.call_function(
                         handler,
                         current_target.clone(),
@@ -484,6 +486,29 @@ fn invoke_listeners(
                             if ev.cancelable {
                                 ev.default_prevented = true;
                             }
+                        }
+                    }
+                }
+            }
+        }
+        if !invoked_prop {
+            if let Some(nid) = node_opt {
+                let on_attr = format!("on{}", event_type);
+                let attr_code = dom
+                    .borrow()
+                    .doc
+                    .element(nid)
+                    .and_then(|e| e.get_attr(&on_attr))
+                    .map(|s| s.to_string());
+                if let Some(code) = attr_code {
+                    let wrapped = format!("(function(event){{ {} }})", code);
+                    if let Ok(fval) = rt.eval(&wrapped) {
+                        if rt.is_callable(&fval) {
+                            let _ = rt.call_function(
+                                fval,
+                                current_target.clone(),
+                                &[JsValue::Object(ev_oid)],
+                            );
                         }
                     }
                 }

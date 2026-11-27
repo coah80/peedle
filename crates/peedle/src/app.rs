@@ -12,7 +12,8 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::chrome::{
-    content_viewport_height, draw_chrome, hit_test_chrome, ChromeHit, ChromeState, CHROME_H,
+    content_viewport_height, draw_chrome, hit_test_chrome, top_chrome_height, Bookmark, ChromeHit,
+    ChromeState, DevToolsTab,
 };
 
 pub struct BrowserApp {
@@ -69,8 +70,53 @@ impl BrowserApp {
         }
     }
 
+    fn toggle_current_bookmark(&mut self) {
+        let url = self.active_page().url.clone();
+        if let Some(pos) = self.chrome.bookmarks.iter().position(|b| b.url == url) {
+            self.chrome.bookmarks.remove(pos);
+        } else {
+            let title = self.active_page().title();
+            self.chrome.bookmarks.push(Bookmark { title, url });
+        }
+    }
+
+    fn run_find(&mut self, advance: bool) {
+        let q = self.chrome.find_query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            self.chrome.find_match_count = 0;
+            self.chrome.find_match_index = 0;
+            return;
+        }
+        let ys: Vec<f32> = {
+            let st = self.active_page().js_env.dom.borrow();
+            let mut hits = Vec::new();
+            for b in &st.layout.boxes {
+                for frag in &b.text_fragments {
+                    if frag.text.to_ascii_lowercase().contains(&q) {
+                        hits.push(frag.y);
+                    }
+                }
+            }
+            hits
+        };
+        self.chrome.find_match_count = ys.len();
+        if ys.is_empty() {
+            self.chrome.find_match_index = 0;
+            return;
+        }
+        if advance {
+            self.chrome.find_match_index = (self.chrome.find_match_index + 1) % ys.len();
+        } else if self.chrome.find_match_index >= ys.len() {
+            self.chrome.find_match_index = 0;
+        }
+        let target_y = (ys[self.chrome.find_match_index] - 80.0).max(0.0);
+        let page = self.active_page_mut();
+        page.scroll_y = target_y;
+        page.scroll_by(0.0, 0.0);
+    }
+
     fn open_new_tab(&mut self, url: &str) {
-        let vh = content_viewport_height(self.height as f32, self.chrome.devtools_open);
+        let vh = content_viewport_height(self.height as f32, &self.chrome);
         let mut page = Page::new(self.width as f32, vh);
         if url != "peedle://newtab" {
             let _ = page.navigate(url);
@@ -97,7 +143,7 @@ impl BrowserApp {
 
     fn resize_all_tabs(&mut self) {
         let w = self.width as f32;
-        let vh = content_viewport_height(self.height as f32, self.chrome.devtools_open);
+        let vh = content_viewport_height(self.height as f32, &self.chrome);
         for tab in &mut self.tabs {
             tab.resize(w, vh);
         }
@@ -107,14 +153,15 @@ impl BrowserApp {
         if self.width == 0 || self.height == 0 || self.tabs.is_empty() {
             return;
         }
-        let vh = content_viewport_height(self.height as f32, self.chrome.devtools_open);
+        let top_h = top_chrome_height(&self.chrome);
+        let vh = content_viewport_height(self.height as f32, &self.chrome);
         let mut page_fb = Framebuffer::new(self.width, vh.ceil() as u32);
         self.tabs[self.active_tab].render_to_framebuffer(&mut page_fb);
 
         let mut full_fb = Framebuffer::new(self.width, self.height);
         full_fb.push_clip(ClipRect {
             x: 0,
-            y: CHROME_H as i32,
+            y: top_h as i32,
             w: self.width as i32,
             h: vh.ceil() as i32,
         });
@@ -123,7 +170,7 @@ impl BrowserApp {
             page_fb.height,
             &page_fb.data,
             0.0,
-            CHROME_H,
+            top_h,
             page_fb.width as f32,
             page_fb.height as f32,
             1.0,
@@ -194,9 +241,10 @@ impl ApplicationHandler for BrowserApp {
                 self.cursor_x = position.x as f32;
                 self.cursor_y = position.y as f32;
                 let cx = self.cursor_x;
-                if self.cursor_y >= CHROME_H {
-                    let vy = self.cursor_y - CHROME_H;
-                    let vh = content_viewport_height(self.height as f32, self.chrome.devtools_open);
+                let top_h = top_chrome_height(&self.chrome);
+                if self.cursor_y >= top_h {
+                    let vy = self.cursor_y - top_h;
+                    let vh = content_viewport_height(self.height as f32, &self.chrome);
                     if vy < vh && self.active_page_mut().on_mouse_move(cx, vy) {
                         self.request_redraw();
                     }
@@ -221,7 +269,7 @@ impl ApplicationHandler for BrowserApp {
                     self.width as f32,
                     self.height as f32,
                     self.tabs.len(),
-                    self.chrome.devtools_open,
+                    &self.chrome,
                 );
                 self.chrome.omnibox_focused = false;
                 self.chrome.console_focused = false;
@@ -250,6 +298,16 @@ impl ApplicationHandler for BrowserApp {
                     ChromeHit::Omnibox => {
                         self.chrome.omnibox_focused = true;
                     }
+                    ChromeHit::ToggleBookmark => {
+                        self.toggle_current_bookmark();
+                    }
+                    ChromeHit::BookmarkItem(i) => {
+                        if let Some(bm) = self.chrome.bookmarks.get(i).cloned() {
+                            let _ = self.active_page_mut().navigate(&bm.url);
+                            self.sync_omnibox();
+                            self.sync_window_title();
+                        }
+                    }
                     ChromeHit::ToggleDevTools => {
                         self.chrome.devtools_open = !self.chrome.devtools_open;
                         self.resize_all_tabs();
@@ -258,12 +316,15 @@ impl ApplicationHandler for BrowserApp {
                         self.chrome.devtools_tab = t;
                     }
                     ChromeHit::ConsoleInput => {
-                        self.chrome.devtools_tab = crate::chrome::DevToolsTab::Console;
+                        self.chrome.devtools_tab = DevToolsTab::Console;
                         self.chrome.console_focused = true;
+                    }
+                    ChromeHit::FindInput => {
+                        self.chrome.find_open = true;
                     }
                     ChromeHit::Content => {
                         let cx = self.cursor_x;
-                        let vy = self.cursor_y - CHROME_H;
+                        let vy = self.cursor_y - top_chrome_height(&self.chrome);
                         if self.active_page_mut().on_click(cx, vy).is_some() {
                             self.sync_omnibox();
                             self.sync_window_title();
@@ -295,12 +356,32 @@ impl ApplicationHandler for BrowserApp {
                             }
                             "l" => {
                                 self.chrome.omnibox_focused = true;
+                                self.chrome.find_open = false;
+                                self.chrome.console_focused = false;
                                 self.chrome.omnibox_text.clear();
                                 self.request_redraw();
                                 return;
                             }
                             "r" => {
                                 let _ = self.active_page_mut().reload();
+                                self.request_redraw();
+                                return;
+                            }
+                            "d" => {
+                                self.toggle_current_bookmark();
+                                self.request_redraw();
+                                return;
+                            }
+                            "b" => {
+                                self.chrome.bookmarks_visible = !self.chrome.bookmarks_visible;
+                                self.resize_all_tabs();
+                                self.request_redraw();
+                                return;
+                            }
+                            "f" => {
+                                self.chrome.find_open = !self.chrome.find_open;
+                                self.chrome.omnibox_focused = false;
+                                self.chrome.console_focused = false;
                                 self.request_redraw();
                                 return;
                             }
@@ -317,6 +398,33 @@ impl ApplicationHandler for BrowserApp {
                 }
                 if matches!(event.logical_key, Key::Named(NamedKey::F5)) {
                     let _ = self.active_page_mut().reload();
+                    self.request_redraw();
+                    return;
+                }
+
+                if self.chrome.find_open {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            self.chrome.find_open = false;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            self.run_find(true);
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            self.chrome.find_query.pop();
+                            self.run_find(false);
+                        }
+                        _ => {
+                            if let Some(txt) = &event.text {
+                                for c in txt.chars() {
+                                    if !c.is_control() {
+                                        self.chrome.find_query.push(c);
+                                    }
+                                }
+                                self.run_find(false);
+                            }
+                        }
+                    }
                     self.request_redraw();
                     return;
                 }

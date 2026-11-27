@@ -19,6 +19,14 @@ pub struct NativeFn {
     pub length: usize,
     pub callback: NativeCallback,
     pub is_constructor: bool,
+    pub handles_new_target: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct BufferMeta {
+    pub max_byte_length: Option<usize>,
+    pub is_shared: bool,
+    pub immutable: bool,
 }
 
 #[derive(Clone)]
@@ -643,6 +651,14 @@ pub struct Heap {
     global_symbol_registry: HashMap<String, u64>,
     next_class_brand: usize,
     alloc_since_gc: usize,
+    pub buffer_meta: HashMap<ObjectId, BufferMeta>,
+    pub auto_length_views: HashSet<ObjectId>,
+    pub raw_json_objects: HashSet<ObjectId>,
+    pub weak_map_symbols: HashMap<ObjectId, Vec<(u64, JsValue)>>,
+    pub weak_set_symbols: HashMap<ObjectId, Vec<u64>>,
+    pub object_realms: HashMap<ObjectId, usize>,
+    pub non_writable_array_lengths: HashSet<ObjectId>,
+    pub deleted_arg_indices: HashMap<ObjectId, HashSet<usize>>,
 }
 
 impl Heap {
@@ -657,6 +673,14 @@ impl Heap {
             global_symbol_registry: HashMap::new(),
             next_class_brand: 1,
             alloc_since_gc: 0,
+            buffer_meta: HashMap::new(),
+            auto_length_views: HashSet::new(),
+            raw_json_objects: HashSet::new(),
+            weak_map_symbols: HashMap::new(),
+            weak_set_symbols: HashMap::new(),
+            object_realms: HashMap::new(),
+            non_writable_array_lengths: HashSet::new(),
+            deleted_arg_indices: HashMap::new(),
         }
     }
 
@@ -933,6 +957,16 @@ impl Heap {
                                 }
                             }
                         }
+                        if let Some(sym_entries) = self.weak_map_symbols.get(&ObjectId(i)) {
+                            for (_, v) in sym_entries {
+                                if let JsValue::Object(vo) = v {
+                                    if vo.0 < marked_objs.len() && !marked_objs[vo.0] {
+                                        obj_stack.push(*vo);
+                                        progressed = true;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -947,6 +981,15 @@ impl Heap {
                 if slot.is_some() {
                     *slot = None;
                     self.free_objects.push(i);
+                    let oid = ObjectId(i);
+                    self.buffer_meta.remove(&oid);
+                    self.auto_length_views.remove(&oid);
+                    self.raw_json_objects.remove(&oid);
+                    self.weak_map_symbols.remove(&oid);
+                    self.weak_set_symbols.remove(&oid);
+                    self.object_realms.remove(&oid);
+                    self.non_writable_array_lengths.remove(&oid);
+                    self.deleted_arg_indices.remove(&oid);
                 }
             } else if let Some(obj) = slot {
                 match &mut obj.kind {

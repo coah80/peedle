@@ -182,6 +182,15 @@ pub enum Op {
     SetLastValue,
     PushLastValue,
     Debugger,
+    AddDisposable {
+        stack_name: u32,
+        is_async: bool,
+    },
+    DisposeNext {
+        stack_name: u32,
+        sync_ip: u32,
+        end_ip: u32,
+    },
 }
 
 #[derive(Debug, Clone)]

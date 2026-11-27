@@ -13,6 +13,7 @@ fn test262_root() -> PathBuf {
 struct TestMeta {
     includes: Vec<String>,
     flags: Vec<String>,
+    features: Vec<String>,
     negative_phase: Option<String>,
     negative_type: Option<String>,
 }
@@ -41,6 +42,9 @@ fn parse_meta(src: &str) -> TestMeta {
             } else if let Some(v) = trimmed.strip_prefix("flags:") {
                 section = "flags";
                 parse_inline_list(v, &mut meta.flags);
+            } else if let Some(v) = trimmed.strip_prefix("features:") {
+                section = "features";
+                parse_inline_list(v, &mut meta.features);
             } else if trimmed.starts_with("negative:") {
                 section = "negative";
             }
@@ -54,6 +58,11 @@ fn parse_meta(src: &str) -> TestMeta {
                 "flags" => {
                     if let Some(item) = trimmed.strip_prefix('-') {
                         meta.flags.push(item.trim().to_string());
+                    }
+                }
+                "features" => {
+                    if let Some(item) = trimmed.strip_prefix('-') {
+                        meta.features.push(item.trim().to_string());
                     }
                 }
                 "negative" => {
@@ -106,13 +115,83 @@ fn collect_js_files(dir: &Path, limit: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn format_js_error(rt: &mut JsRuntime, err: &JsError) -> String {
+    match err {
+        JsError::Native { kind, message, .. } => format!("{}: {}", kind.name(), message),
+        JsError::Thrown(JsValue::Object(oid)) => {
+            let name = rt
+                .get_property(*oid, "name")
+                .ok()
+                .and_then(|v| rt.to_string(&v).ok())
+                .unwrap_or_else(|| "Object".to_string());
+            let msg = rt
+                .get_property(*oid, "message")
+                .ok()
+                .and_then(|v| rt.to_string(&v).ok())
+                .unwrap_or_default();
+            if msg.is_empty() {
+                name
+            } else {
+                format!("{}: {}", name, msg)
+            }
+        }
+        JsError::Thrown(v) => format!("Uncaught {:?}", v),
+    }
+}
+
+fn make_host_262(rt: &mut JsRuntime, realm_id: usize) -> peedle_js::ObjectId {
+    let host_262 = rt.create_object();
+    let realm_global = rt.realms[realm_id].global_object;
+    let _ = rt.set_property(host_262, "global", JsValue::Object(realm_global));
+    let detach_fn = rt.create_native_function(
+        "detachArrayBuffer",
+        1,
+        Rc::new(|rt, _, args| {
+            if let Some(JsValue::Object(oid)) = args.first() {
+                if let peedle_js::ObjectKind::ArrayBuffer(ref mut ab) =
+                    rt.heap.get_obj_mut(*oid).kind
+                {
+                    ab.bytes.clear();
+                    ab.detached = true;
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let eval_script_fn = rt.create_native_function(
+        "evalScript",
+        1,
+        Rc::new(move |rt, _, args| {
+            let src = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
+            rt.eval_in_realm(realm_id, &src)
+        }),
+    );
+    let create_realm_fn = rt.create_native_function(
+        "createRealm",
+        0,
+        Rc::new(|rt, _, _| {
+            let new_id = rt.create_realm();
+            let prev = rt.switch_realm(new_id);
+            let h = make_host_262(rt, new_id);
+            let rg = rt.global_object();
+            let _ = rt.set_property(rg, "$262", JsValue::Object(h));
+            rt.switch_realm(prev);
+            Ok(JsValue::Object(h))
+        }),
+    );
+    let _ = rt.set_property(host_262, "detachArrayBuffer", JsValue::Object(detach_fn));
+    let _ = rt.set_property(host_262, "evalScript", JsValue::Object(eval_script_fn));
+    let _ = rt.set_property(host_262, "createRealm", JsValue::Object(create_realm_fn));
+    host_262
+}
+
 fn run_single_test(
     src: &str,
     meta: &TestMeta,
     harness_cache: &HashMap<String, String>,
 ) -> Result<(), String> {
     let mut rt = JsRuntime::new();
-    rt.max_steps = Some(500_000);
+    rt.max_steps = Some(10_000_000);
     rt.max_call_depth = 128;
 
     let is_async = meta.flags.iter().any(|f| f == "async");
@@ -134,21 +213,7 @@ fn run_single_test(
     let g = rt.global_object();
     let _ = rt.set_property(g, "print", JsValue::Object(print_fn));
 
-    let host_262 = rt.create_object();
-    let detach_fn = rt.create_native_function(
-        "detachArrayBuffer",
-        1,
-        Rc::new(|rt, _, args| {
-            if let Some(JsValue::Object(oid)) = args.first() {
-                if let peedle_js::ObjectKind::ArrayBuffer(ref mut ab) = rt.heap.get_obj_mut(*oid).kind {
-                    ab.bytes.clear();
-                    ab.detached = true;
-                }
-            }
-            Ok(JsValue::Undefined)
-        }),
-    );
-    let _ = rt.set_property(host_262, "detachArrayBuffer", JsValue::Object(detach_fn));
+    let host_262 = make_host_262(&mut rt, 0);
     let _ = rt.set_property(g, "$262", JsValue::Object(host_262));
 
     if !is_raw {
@@ -166,7 +231,7 @@ fn run_single_test(
         for inc in &meta.includes {
             if let Some(code) = harness_cache.get(inc) {
                 if let Err(e) = rt.eval(code) {
-                    return Err(format!("harness {} failed: {}", inc, e));
+                    return Err(format!("harness {} failed: {}", inc, format_js_error(&mut rt, &e)));
                 }
             }
         }
@@ -191,7 +256,11 @@ fn run_single_test(
                 if error_matches_type(&mut rt, &e, expected_type) {
                     Ok(())
                 } else {
-                    Err(format!("Expected {} but got {}", expected_type, e))
+                    Err(format!(
+                        "Expected {} but got {}",
+                        expected_type,
+                        format_js_error(&mut rt, &e)
+                    ))
                 }
             }
         };
@@ -212,7 +281,7 @@ fn run_single_test(
                 Ok(())
             }
         }
-        Err(e) => Err(format!("{}", e)),
+        Err(e) => Err(format_js_error(&mut rt, &e)),
     }
 }
 
@@ -254,69 +323,154 @@ fn test262_broad_suite() {
         }
     }
 
-    let suites: [(&str, usize); 16] = [
+    let suites: [(&str, usize); 29] = [
         ("language/types", 200),
-        ("language/expressions", 300),
-        ("language/statements", 300),
-        ("built-ins/Object", 250),
-        ("built-ins/Array", 250),
-        ("built-ins/String", 250),
-        ("built-ins/Number", 150),
-        ("built-ins/Math", 150),
-        ("built-ins/JSON", 150),
-        ("built-ins/Map", 150),
-        ("built-ins/Set", 150),
-        ("built-ins/Promise", 150),
-        ("built-ins/Proxy", 150),
-        ("built-ins/Reflect", 150),
-        ("built-ins/RegExp", 150),
-        ("built-ins/TypedArray", 150),
+        ("language/expressions", 400),
+        ("language/statements", 400),
+        ("language/block-scope", 150),
+        ("language/destructuring", 50),
+        ("language/rest-parameters", 50),
+        ("built-ins/Object", 350),
+        ("built-ins/Array", 350),
+        ("built-ins/String", 300),
+        ("built-ins/Number", 250),
+        ("built-ins/Math", 250),
+        ("built-ins/JSON", 200),
+        ("built-ins/Map", 250),
+        ("built-ins/Set", 250),
+        ("built-ins/Promise", 250),
+        ("built-ins/Proxy", 250),
+        ("built-ins/Reflect", 200),
+        ("built-ins/RegExp", 250),
+        ("built-ins/TypedArray", 250),
+        ("built-ins/Function", 250),
+        ("built-ins/Symbol", 150),
+        ("built-ins/Error", 150),
+        ("built-ins/ArrayBuffer", 250),
+        ("built-ins/DataView", 250),
+        ("built-ins/Date", 250),
+        ("built-ins/BigInt", 100),
+        ("built-ins/Boolean", 100),
+        ("built-ins/WeakMap", 150),
+        ("built-ins/WeakSet", 100),
     ];
+
+    let filter = std::env::var("TEST262_FILTER").ok();
+    let trace = std::env::var("TEST262_TRACE").is_ok();
+    let mut suite_files: Vec<(&str, Vec<PathBuf>)> = Vec::new();
+    for (suite, limit) in suites {
+        if let Some(ref flt) = filter {
+            if !suite.contains(flt.as_str()) {
+                continue;
+            }
+        }
+        let dir = root.join("test").join(suite);
+        let mut files = Vec::new();
+        collect_js_files(&dir, limit, &mut files);
+        suite_files.push((suite, files));
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(4, 8))
+        .unwrap_or(4);
+    let mut flat_jobs: Vec<(usize, PathBuf)> = Vec::new();
+    for (s_idx, (_, files)) in suite_files.iter().enumerate() {
+        for f in files {
+            flat_jobs.push((s_idx, f.clone()));
+        }
+    }
+    let next_job = std::sync::atomic::AtomicUsize::new(0);
+    let suite_count = suite_files.len();
+
+    let worker_results: Vec<Vec<(usize, usize, Vec<(String, String, String)>)>> =
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for _ in 0..workers {
+                let jobs = &flat_jobs;
+                let counter = &next_job;
+                let hc = &harness_cache;
+                let r = &root;
+                handles.push(s.spawn(move || {
+                    let mut per_suite: Vec<(usize, usize, Vec<(String, String, String)>)> =
+                        (0..suite_count).map(|_| (0, 0, Vec::new())).collect();
+                    loop {
+                        let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= jobs.len() {
+                            break;
+                        }
+                        let (s_idx, ref f) = jobs[idx];
+                        let Ok(src) = std::fs::read_to_string(f) else {
+                            continue;
+                        };
+                        let meta = parse_meta(&src);
+                        if meta.flags.iter().any(|fl| fl == "module") {
+                            continue;
+                        }
+                        if trace {
+                            eprintln!("RUN {}", f.display());
+                        }
+                        match run_single_test(&src, &meta, hc) {
+                            Ok(()) => per_suite[s_idx].0 += 1,
+                            Err(msg) => {
+                                per_suite[s_idx].1 += 1;
+                                let rel = f.strip_prefix(r).unwrap_or(f);
+                                per_suite[s_idx].2.push((
+                                    rel.display().to_string(),
+                                    meta.features.join(","),
+                                    msg,
+                                ));
+                            }
+                        }
+                    }
+                    per_suite
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
     let mut total_pass = 0usize;
     let mut total_fail = 0usize;
     let mut sample_failures: Vec<String> = Vec::new();
+    let mut dump_lines: Vec<String> = Vec::new();
 
-    for (suite, limit) in suites {
-        let dir = root.join("test").join(suite);
-        let mut files = Vec::new();
-        collect_js_files(&dir, limit, &mut files);
-        let mut pass = 0usize;
-        let mut fail = 0usize;
-        let mut suite_samples = 0usize;
-
-        for f in files {
-            let Ok(src) = std::fs::read_to_string(&f) else {
-                continue;
-            };
-            let meta = parse_meta(&src);
-            if meta.flags.iter().any(|fl| fl == "module") {
-                continue;
-            }
-            match run_single_test(&src, &meta, &harness_cache) {
-                Ok(()) => pass += 1,
-                Err(msg) => {
-                    fail += 1;
-                    if suite_samples < 3 {
-                        suite_samples += 1;
-                        let rel = f.strip_prefix(&root).unwrap_or(&f);
-                        sample_failures.push(format!("{} -> {}", rel.display(), msg));
-                    }
-                }
-            }
+    for (s_idx, (suite, _)) in suite_files.iter().enumerate() {
+        let mut suite_pass = 0usize;
+        let mut suite_fail = 0usize;
+        let mut suite_failures: Vec<(String, String, String)> = Vec::new();
+        for wr in &worker_results {
+            suite_pass += wr[s_idx].0;
+            suite_fail += wr[s_idx].1;
+            suite_failures.extend(wr[s_idx].2.iter().cloned());
         }
-        total_pass += pass;
-        total_fail += fail;
-        let total = pass + fail;
+        suite_failures.sort_by(|a, b| a.0.cmp(&b.0));
+        total_pass += suite_pass;
+        total_fail += suite_fail;
+        let total = suite_pass + suite_fail;
         let pct = if total > 0 {
-            (pass as f64 / total as f64) * 100.0
+            (suite_pass as f64 / total as f64) * 100.0
         } else {
             0.0
         };
         eprintln!(
             "test262 {:24} {:4}/{:4} ({:5.1}%)",
-            suite, pass, total, pct
+            suite, suite_pass, total, pct
         );
+        for (i, (rel, feats, msg)) in suite_failures.iter().enumerate() {
+            if i < 3 {
+                sample_failures.push(format!("{} -> {}", rel, msg));
+            }
+            dump_lines.push(format!(
+                "{} | {} | [{}] | {}",
+                suite,
+                rel,
+                feats,
+                msg.replace('\n', " ")
+            ));
+        }
+    }
+
+    if let Ok(dump_path) = std::env::var("TEST262_DUMP") {
+        let _ = std::fs::write(&dump_path, dump_lines.join("\n"));
     }
 
     let grand = total_pass + total_fail;
@@ -332,12 +486,14 @@ fn test262_broad_suite() {
     for s in sample_failures.iter().take(30) {
         eprintln!("  FAIL: {}", s);
     }
-    assert!(grand >= 2000, "Expected at least 2000 Test262 tests run, got {}", grand);
-    assert!(
-        grand_pct >= 60.0,
-        "Test262 pass rate too low: {:.1}% ({}/{})",
-        grand_pct,
-        total_pass,
-        grand
-    );
+    if filter.is_none() {
+        assert!(grand >= 5000, "Expected at least 5000 Test262 tests run, got {}", grand);
+        assert!(
+            grand_pct >= 95.0,
+            "Test262 pass rate too low: {:.1}% ({}/{})",
+            grand_pct,
+            total_pass,
+            grand
+        );
+    }
 }

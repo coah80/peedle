@@ -1,10 +1,10 @@
-use crate::builtins::array::is_array_val;
+use crate::builtins::array::is_array_val_checked;
 use crate::builtins::{set_global, set_method};
 use crate::error::JsError;
 use crate::heap::*;
 use crate::value::*;
 use crate::vm::JsRuntime;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 pub fn init(rt: &mut JsRuntime) {
@@ -24,17 +24,69 @@ pub fn init(rt: &mut JsRuntime) {
             let text = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
             let reviver = args.get(1).cloned().unwrap_or(JsValue::Undefined);
             let mut parser = JsonParser::new(&text);
-            let val = parser.parse_value(rt)?;
+            let (val, record) = parser.parse_value(rt)?;
             parser.skip_ws();
             if parser.pos < parser.bytes.len() {
                 return Err(JsError::syntax("Unexpected trailing data in JSON"));
             }
             if rt.is_callable(&reviver) {
                 let root = rt.create_object();
-                let _ = rt.set_property(root, "", val);
-                return revive_walk(rt, root, "", &reviver);
+                let _ = rt.define_property(
+                    root,
+                    PropertyKey::from(""),
+                    PropertyDescriptor::data(val, true, true, true),
+                );
+                return revive_walk(rt, root, "", &reviver, Some(&record));
             }
             Ok(val)
+        }),
+    );
+
+    set_method(
+        rt,
+        json,
+        "rawJSON",
+        1,
+        Rc::new(|rt, _, args| {
+            let text = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
+            if text.is_empty() {
+                return Err(JsError::syntax("JSON.rawJSON cannot be empty"));
+            }
+            let bytes = text.as_bytes();
+            let is_json_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r');
+            if is_json_ws(bytes[0]) || is_json_ws(bytes[bytes.len() - 1]) {
+                return Err(JsError::syntax("JSON.rawJSON cannot have leading or trailing whitespace"));
+            }
+            if matches!(bytes[0], b'{' | b'[') {
+                return Err(JsError::syntax("JSON.rawJSON must be a JSON primitive"));
+            }
+            let mut parser = JsonParser::new(&text);
+            let _ = parser.parse_value(rt)?;
+            if parser.pos != parser.bytes.len() {
+                return Err(JsError::syntax("Unexpected trailing data in JSON.rawJSON"));
+            }
+            let obj = rt.create_object_with_proto(None);
+            rt.heap.get_obj_mut(obj).set_own_prop(
+                PropertyKey::from("rawJSON"),
+                PropEntry::data(JsValue::String(text), false, true, false),
+            );
+            rt.heap.get_obj_mut(obj).extensible = false;
+            rt.heap.raw_json_objects.insert(obj);
+            Ok(JsValue::Object(obj))
+        }),
+    );
+
+    set_method(
+        rt,
+        json,
+        "isRawJSON",
+        1,
+        Rc::new(|rt, _, args| {
+            let b = matches!(
+                args.first(),
+                Some(JsValue::Object(oid)) if rt.heap.raw_json_objects.contains(oid)
+            );
+            Ok(JsValue::Boolean(b))
         }),
     );
 
@@ -53,19 +105,20 @@ pub fn init(rt: &mut JsRuntime) {
             } else {
                 None
             };
-            let prop_list = if replacer_fn.is_none() && is_array_val(rt, &replacer) {
+            let prop_list = if replacer_fn.is_none() && is_array_val_checked(rt, &replacer)? {
                 let mut list = Vec::new();
                 if let JsValue::Object(rid) = replacer {
                     let len_v = rt.get_property(rid, "length")?;
                     let len = to_length(rt.to_number(&len_v)?);
                     for i in 0..len {
                         let item = rt.get_property(rid, &i.to_string())?;
-                        let key = match item {
-                            JsValue::String(s) => Some(s),
-                            JsValue::Number(n) => Some(number_to_string(n)),
-                            JsValue::Object(oid) => match &rt.heap.get_obj(oid).kind {
-                                ObjectKind::StringObj(s) => Some(s.clone()),
-                                ObjectKind::NumberObj(n) => Some(number_to_string(*n)),
+                        let key = match &item {
+                            JsValue::String(s) => Some(s.clone()),
+                            JsValue::Number(n) => Some(number_to_string(*n)),
+                            JsValue::Object(oid) => match &rt.heap.get_obj(*oid).kind {
+                                ObjectKind::StringObj(_) | ObjectKind::NumberObj(_) => {
+                                    Some(rt.to_string(&item)?)
+                                }
                                 _ => None,
                             },
                             _ => None,
@@ -82,25 +135,29 @@ pub fn init(rt: &mut JsRuntime) {
                 None
             };
 
-            let gap = match space_arg {
+            let space_val = match &space_arg {
+                JsValue::Object(oid) => match &rt.heap.get_obj(*oid).kind {
+                    ObjectKind::NumberObj(_) => JsValue::Number(rt.to_number(&space_arg)?),
+                    ObjectKind::StringObj(_) => JsValue::String(rt.to_string(&space_arg)?),
+                    _ => space_arg,
+                },
+                _ => space_arg,
+            };
+            let gap = match space_val {
                 JsValue::Number(n) => {
                     let count = to_integer_or_infinity(n).clamp(0.0, 10.0) as usize;
                     " ".repeat(count)
                 }
                 JsValue::String(s) => s.chars().take(10).collect(),
-                JsValue::Object(oid) => match &rt.heap.get_obj(oid).kind {
-                    ObjectKind::NumberObj(n) => {
-                        let count = to_integer_or_infinity(*n).clamp(0.0, 10.0) as usize;
-                        " ".repeat(count)
-                    }
-                    ObjectKind::StringObj(s) => s.chars().take(10).collect(),
-                    _ => String::new(),
-                },
                 _ => String::new(),
             };
 
             let wrapper = rt.create_object();
-            let _ = rt.set_property(wrapper, "", value);
+            let _ = rt.define_property(
+                wrapper,
+                PropertyKey::from(""),
+                PropertyDescriptor::data(value, true, true, true),
+            );
             let mut state = StringifyState {
                 replacer_fn,
                 prop_list,
@@ -118,6 +175,21 @@ pub fn init(rt: &mut JsRuntime) {
     set_global(rt, "JSON", JsValue::Object(json));
 }
 
+enum ParseRecord {
+    Primitive {
+        value: JsValue,
+        source: String,
+    },
+    Array {
+        object: ObjectId,
+        elements: Vec<ParseRecord>,
+    },
+    Object {
+        object: ObjectId,
+        entries: HashMap<String, ParseRecord>,
+    },
+}
+
 struct StringifyState {
     replacer_fn: Option<JsValue>,
     prop_list: Option<Vec<String>>,
@@ -133,11 +205,21 @@ fn stringify_prop(
     holder: ObjectId,
 ) -> Result<Option<String>, JsError> {
     let mut val = rt.get_property(holder, key)?;
-    if let JsValue::Object(oid) = val {
-        let to_json = rt.get_property(oid, "toJSON")?;
-        if rt.is_callable(&to_json) {
-            val = rt.call_function(to_json, val, &[JsValue::String(key.to_string())])?;
+    match &val {
+        JsValue::Object(oid) => {
+            let to_json = rt.get_property(*oid, "toJSON")?;
+            if rt.is_callable(&to_json) {
+                val = rt.call_function(to_json, val, &[JsValue::String(key.to_string())])?;
+            }
         }
+        JsValue::BigInt(_) => {
+            let bi_proto = rt.intrinsics.bigint_proto;
+            let to_json = rt.get_property(bi_proto, "toJSON")?;
+            if rt.is_callable(&to_json) {
+                val = rt.call_function(to_json, val, &[JsValue::String(key.to_string())])?;
+            }
+        }
+        _ => {}
     }
     if let Some(ref rf) = state.replacer_fn {
         val = rt.call_function(
@@ -147,10 +229,17 @@ fn stringify_prop(
         )?;
     }
     if let JsValue::Object(oid) = val {
+        if rt.heap.raw_json_objects.contains(&oid) {
+            let raw = rt.get_property(oid, "rawJSON")?;
+            if let JsValue::String(s) = raw {
+                return Ok(Some(s));
+            }
+        }
         match &rt.heap.get_obj(oid).kind {
             ObjectKind::NumberObj(_) => val = JsValue::Number(rt.to_number(&val)?),
             ObjectKind::StringObj(_) => val = JsValue::String(rt.to_string(&val)?),
             ObjectKind::BooleanObj(b) => val = JsValue::Boolean(*b),
+            ObjectKind::BigIntObj(b) => val = JsValue::BigInt(*b),
             _ => {}
         }
     }
@@ -175,7 +264,14 @@ fn stringify_prop(
             if !state.stack.insert(oid) {
                 return Err(JsError::type_err("Converting circular structure to JSON"));
             }
-            let res = if is_array_val(rt, &JsValue::Object(oid)) {
+            let is_arr = match is_array_val_checked(rt, &JsValue::Object(oid)) {
+                Ok(b) => b,
+                Err(e) => {
+                    state.stack.remove(&oid);
+                    return Err(e);
+                }
+            };
+            let res = if is_arr {
                 stringify_array(rt, state, oid)
             } else {
                 stringify_object(rt, state, oid)
@@ -287,53 +383,78 @@ fn revive_walk(
     holder: ObjectId,
     name: &str,
     reviver: &JsValue,
+    snapshot: Option<&ParseRecord>,
 ) -> Result<JsValue, JsError> {
     let val = rt.get_property(holder, name)?;
+    let ctx = rt.create_object();
     if let JsValue::Object(oid) = val {
-        if is_array_val(rt, &val) {
+        let is_arr = is_array_val_checked(rt, &val)?;
+        if is_arr {
             let len_v = rt.get_property(oid, "length")?;
             let len = to_length(rt.to_number(&len_v)?);
+            let elem_snaps = match snapshot {
+                Some(ParseRecord::Array { object, elements }) if *object == oid => Some(elements),
+                _ => None,
+            };
             for i in 0..len {
                 let k = i.to_string();
-                let new_el = revive_walk(rt, oid, &k, reviver)?;
+                let child_snap = elem_snaps.and_then(|els| els.get(i));
+                let new_el = revive_walk(rt, oid, &k, reviver, child_snap)?;
                 if new_el.is_undefined() {
-                    let _ = rt.delete_property(oid, &PropertyKey::String(k));
+                    rt.delete_property(oid, &PropertyKey::String(k))?;
                 } else {
-                    let _ = rt.define_property(
+                    rt.define_property(
                         oid,
                         PropertyKey::String(k),
                         PropertyDescriptor::data(new_el, true, true, true),
-                    );
+                    )?;
                 }
             }
         } else {
-            let keys = rt.own_keys(oid)?;
-            for k in keys {
+            let own = rt.own_keys(oid)?;
+            let mut keys = Vec::new();
+            for k in own {
                 if let PropertyKey::String(s) = k {
                     if let Some(d) =
                         rt.get_own_property_descriptor(oid, &PropertyKey::String(s.clone()))?
                     {
                         if d.enumerable.unwrap_or(false) {
-                            let new_el = revive_walk(rt, oid, &s, reviver)?;
-                            if new_el.is_undefined() {
-                                let _ = rt.delete_property(oid, &PropertyKey::String(s));
-                            } else {
-                                let _ = rt.define_property(
-                                    oid,
-                                    PropertyKey::String(s),
-                                    PropertyDescriptor::data(new_el, true, true, true),
-                                );
-                            }
+                            keys.push(s);
                         }
                     }
                 }
             }
+            let prop_snaps = match snapshot {
+                Some(ParseRecord::Object { object, entries }) if *object == oid => Some(entries),
+                _ => None,
+            };
+            for s in keys {
+                let child_snap = prop_snaps.and_then(|m| m.get(&s));
+                let new_el = revive_walk(rt, oid, &s, reviver, child_snap)?;
+                if new_el.is_undefined() {
+                    rt.delete_property(oid, &PropertyKey::String(s))?;
+                } else {
+                    rt.define_property(
+                        oid,
+                        PropertyKey::String(s),
+                        PropertyDescriptor::data(new_el, true, true, true),
+                    )?;
+                }
+            }
+        }
+    } else if let Some(ParseRecord::Primitive { value, source }) = snapshot {
+        if val.same_value(value) {
+            let _ = rt.define_property(
+                ctx,
+                PropertyKey::from("source"),
+                PropertyDescriptor::data(JsValue::String(source.clone()), true, true, true),
+            );
         }
     }
     rt.call_function(
         reviver.clone(),
         JsValue::Object(holder),
-        &[JsValue::String(name.to_string()), val],
+        &[JsValue::String(name.to_string()), val, JsValue::Object(ctx)],
     )
 }
 
@@ -362,19 +483,26 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_value(&mut self, rt: &mut JsRuntime) -> Result<JsValue, JsError> {
+    fn parse_value(&mut self, rt: &mut JsRuntime) -> Result<(JsValue, ParseRecord), JsError> {
         self.skip_ws();
+        let start = self.pos;
         let Some(&b) = self.bytes.get(self.pos) else {
             return Err(JsError::syntax("Unexpected end of JSON input"));
         };
         match b {
-            b'"' => self.parse_string().map(JsValue::String),
+            b'"' => {
+                let s = self.parse_string()?;
+                let raw = self.src[start..self.pos].to_string();
+                let v = JsValue::String(s);
+                Ok((v.clone(), ParseRecord::Primitive { value: v, source: raw }))
+            }
             b'{' => self.parse_object(rt),
             b'[' => self.parse_array(rt),
             b't' => {
                 if self.bytes.get(self.pos..self.pos + 4) == Some(b"true") {
                     self.pos += 4;
-                    Ok(JsValue::Boolean(true))
+                    let v = JsValue::Boolean(true);
+                    Ok((v.clone(), ParseRecord::Primitive { value: v, source: "true".into() }))
                 } else {
                     Err(JsError::syntax("Invalid JSON token"))
                 }
@@ -382,7 +510,8 @@ impl<'a> JsonParser<'a> {
             b'f' => {
                 if self.bytes.get(self.pos..self.pos + 5) == Some(b"false") {
                     self.pos += 5;
-                    Ok(JsValue::Boolean(false))
+                    let v = JsValue::Boolean(false);
+                    Ok((v.clone(), ParseRecord::Primitive { value: v, source: "false".into() }))
                 } else {
                     Err(JsError::syntax("Invalid JSON token"))
                 }
@@ -390,23 +519,33 @@ impl<'a> JsonParser<'a> {
             b'n' => {
                 if self.bytes.get(self.pos..self.pos + 4) == Some(b"null") {
                     self.pos += 4;
-                    Ok(JsValue::Null)
+                    let v = JsValue::Null;
+                    Ok((v.clone(), ParseRecord::Primitive { value: v, source: "null".into() }))
                 } else {
                     Err(JsError::syntax("Invalid JSON token"))
                 }
             }
-            b'-' | b'0'..=b'9' => self.parse_number().map(JsValue::Number),
+            b'-' | b'0'..=b'9' => {
+                let n = self.parse_number()?;
+                let raw = self.src[start..self.pos].to_string();
+                let v = JsValue::Number(n);
+                Ok((v.clone(), ParseRecord::Primitive { value: v, source: raw }))
+            }
             _ => Err(JsError::syntax("Unexpected token in JSON")),
         }
     }
 
-    fn parse_object(&mut self, rt: &mut JsRuntime) -> Result<JsValue, JsError> {
+    fn parse_object(&mut self, rt: &mut JsRuntime) -> Result<(JsValue, ParseRecord), JsError> {
         self.pos += 1;
         let obj = rt.create_object();
+        let mut entries = HashMap::new();
         self.skip_ws();
         if self.bytes.get(self.pos) == Some(&b'}') {
             self.pos += 1;
-            return Ok(JsValue::Object(obj));
+            return Ok((
+                JsValue::Object(obj),
+                ParseRecord::Object { object: obj, entries },
+            ));
         }
         loop {
             self.skip_ws();
@@ -419,39 +558,54 @@ impl<'a> JsonParser<'a> {
                 return Err(JsError::syntax("Expected ':' in JSON object"));
             }
             self.pos += 1;
-            let val = self.parse_value(rt)?;
+            let (val, rec) = self.parse_value(rt)?;
             rt.heap.get_obj_mut(obj).set_own_prop(
-                PropertyKey::String(key),
+                PropertyKey::String(key.clone()),
                 PropEntry::data(val, true, true, true),
             );
+            entries.insert(key, rec);
             self.skip_ws();
             match self.bytes.get(self.pos) {
                 Some(&b',') => self.pos += 1,
                 Some(&b'}') => {
                     self.pos += 1;
-                    return Ok(JsValue::Object(obj));
+                    return Ok((
+                        JsValue::Object(obj),
+                        ParseRecord::Object { object: obj, entries },
+                    ));
                 }
                 _ => return Err(JsError::syntax("Expected ',' or '}' in JSON object")),
             }
         }
     }
 
-    fn parse_array(&mut self, rt: &mut JsRuntime) -> Result<JsValue, JsError> {
+    fn parse_array(&mut self, rt: &mut JsRuntime) -> Result<(JsValue, ParseRecord), JsError> {
         self.pos += 1;
         let mut items = Vec::new();
+        let mut records = Vec::new();
         self.skip_ws();
         if self.bytes.get(self.pos) == Some(&b']') {
             self.pos += 1;
-            return Ok(JsValue::Object(rt.create_array(items)));
+            let arr = rt.create_array(items);
+            return Ok((
+                JsValue::Object(arr),
+                ParseRecord::Array { object: arr, elements: records },
+            ));
         }
         loop {
-            items.push(self.parse_value(rt)?);
+            let (v, r) = self.parse_value(rt)?;
+            items.push(v);
+            records.push(r);
             self.skip_ws();
             match self.bytes.get(self.pos) {
                 Some(&b',') => self.pos += 1,
                 Some(&b']') => {
                     self.pos += 1;
-                    return Ok(JsValue::Object(rt.create_array(items)));
+                    let arr = rt.create_array(items);
+                    return Ok((
+                        JsValue::Object(arr),
+                        ParseRecord::Array { object: arr, elements: records },
+                    ));
                 }
                 _ => return Err(JsError::syntax("Expected ',' or ']' in JSON array")),
             }

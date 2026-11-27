@@ -218,9 +218,22 @@ fn step_builtin_iterator(rt: &mut JsRuntime, oid: ObjectId) -> Result<JsValue, J
     };
     match kind {
         BuiltinIteratorKind::Array { target, mode } => {
-            let len_v = rt.get_property(target, "length")?;
-            let len = to_length(rt.to_number(&len_v)?);
+            if idx == usize::MAX {
+                return Ok(rt.create_iter_result(JsValue::Undefined, true));
+            }
+            let len = if matches!(rt.heap.get_obj(target).kind, ObjectKind::TypedArray(_)) {
+                match rt.typed_array_effective_length(target) {
+                    Some(l) => l,
+                    None => return Err(JsError::type_err("TypedArray buffer is detached or out of bounds")),
+                }
+            } else {
+                let len_v = rt.get_property(target, "length")?;
+                to_length(rt.to_number(&len_v)?)
+            };
             if idx >= len {
+                if let ObjectKind::Iterator(ref mut it) = rt.heap.get_obj_mut(oid).kind {
+                    it.index = usize::MAX;
+                }
                 return Ok(rt.create_iter_result(JsValue::Undefined, true));
             }
             if let ObjectKind::Iterator(ref mut it) = rt.heap.get_obj_mut(oid).kind {

@@ -12,6 +12,7 @@ use crate::events::{build_event_object, define_event_system, dispatch_event_obje
 use crate::nodes::{define_element_proto, define_node_proto, wrap_node};
 use crate::state::{DomPrototypes, DomState, SharedDom};
 use crate::style_binding::define_style_and_classlist_protos;
+use crate::traversal::{define_dom_exception, define_traversal_protos};
 use crate::web_apis::define_web_apis;
 
 pub struct BrowserJsEnv {
@@ -54,6 +55,9 @@ impl BrowserJsEnv {
         let headers_proto = rt.create_object_with_proto(Some(obj_proto));
         let response_proto = rt.create_object_with_proto(Some(obj_proto));
         let range_proto = rt.create_object_with_proto(Some(obj_proto));
+        let dom_exception_proto = rt.create_object_with_proto(Some(obj_proto));
+        let node_iterator_proto = rt.create_object_with_proto(Some(obj_proto));
+        let tree_walker_proto = rt.create_object_with_proto(Some(obj_proto));
 
         dom.borrow_mut().protos = Some(DomPrototypes {
             event_target,
@@ -77,16 +81,21 @@ impl BrowserJsEnv {
             headers_proto,
             response_proto,
             range_proto,
+            dom_exception_proto,
+            node_iterator_proto,
+            tree_walker_proto,
         });
 
         let global = rt.global_object();
         let _ = rt.set_prototype_of(global, Some(event_target));
 
+        define_dom_exception(&mut rt, dom_exception_proto);
         define_event_system(&mut rt, dom.clone(), event_target, event);
         define_style_and_classlist_protos(&mut rt, dom.clone(), css_style_decl, dom_token_list);
         define_canvas2d_proto(&mut rt, dom.clone(), canvas2d);
         define_node_proto(&mut rt, dom.clone(), node);
         define_element_proto(&mut rt, dom.clone(), element, html_element);
+        define_traversal_protos(&mut rt, dom.clone(), node_iterator_proto, tree_walker_proto);
         define_document_proto(
             &mut rt,
             dom.clone(),
@@ -115,6 +124,8 @@ impl BrowserJsEnv {
             ("DOMTokenList", dom_token_list),
             ("CanvasRenderingContext2D", canvas2d),
             ("Range", range_proto),
+            ("NodeIterator", node_iterator_proto),
+            ("TreeWalker", tree_walker_proto),
         ] {
             let ctor = rt.create_native_constructor(
                 ctor_name,
@@ -126,10 +137,21 @@ impl BrowserJsEnv {
                 for (c_name, code) in [
                     ("ELEMENT_NODE", 1.0),
                     ("TEXT_NODE", 3.0),
+                    ("PROCESSING_INSTRUCTION_NODE", 7.0),
                     ("COMMENT_NODE", 8.0),
                     ("DOCUMENT_NODE", 9.0),
                     ("DOCUMENT_TYPE_NODE", 10.0),
                     ("DOCUMENT_FRAGMENT_NODE", 11.0),
+                ] {
+                    let _ = rt.set_property(ctor, c_name, JsValue::Number(code));
+                }
+            }
+            if ctor_name == "Range" {
+                for (c_name, code) in [
+                    ("START_TO_START", 0.0),
+                    ("START_TO_END", 1.0),
+                    ("END_TO_END", 2.0),
+                    ("END_TO_START", 3.0),
                 ] {
                     let _ = rt.set_property(ctor, c_name, JsValue::Number(code));
                 }
@@ -263,8 +285,41 @@ impl BrowserJsEnv {
         self.dom.borrow_mut().ready_state = "interactive".to_string();
         let root_id = self.dom.borrow().doc.root;
         let _ = self.dispatch_dom_event(Some(root_id), "DOMContentLoaded", true, false);
+
+        let embedded_nodes: Vec<NodeId> = {
+            let st = self.dom.borrow();
+            st.doc
+                .descendants(st.doc.root)
+                .into_iter()
+                .filter(|&id| {
+                    st.doc.element(id).map_or(false, |e| {
+                        e.is_html() && (e.tag_is("iframe") || e.tag_is("object"))
+                    })
+                })
+                .collect()
+        };
+        for eid in embedded_nodes {
+            let _ = crate::nodes::ensure_subdocument(&self.dom, eid);
+            let _ = self.dispatch_dom_event(Some(eid), "load", false, false);
+        }
+
         self.dom.borrow_mut().ready_state = "complete".to_string();
+        let body_onload = {
+            let st = self.dom.borrow();
+            st.doc
+                .body()
+                .and_then(|bid| st.doc.element(bid))
+                .and_then(|e| e.get_attr("onload"))
+                .map(|s| s.to_string())
+        };
         let _ = self.dispatch_dom_event(None, "load", false, false);
+        if let Some(code) = body_onload {
+            if let Err(e) = self.rt.eval(&code) {
+                let msg = e.to_string();
+                self.rt.console_lines.push(format!("[Error] {}", msg));
+                errors.push(msg);
+            }
+        }
         self.tick_event_loop(64);
         errors
     }

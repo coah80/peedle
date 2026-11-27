@@ -68,12 +68,15 @@ pub struct DomPrototypes {
     pub headers_proto: ObjectId,
     pub response_proto: ObjectId,
     pub range_proto: ObjectId,
+    pub dom_exception_proto: ObjectId,
+    pub node_iterator_proto: ObjectId,
+    pub tree_walker_proto: ObjectId,
 }
 
 pub struct DomState {
     pub doc: Document,
     pub url: String,
-    pub external_stylesheets: Vec<Stylesheet>,
+    pub external_stylesheets: HashMap<NodeId, Stylesheet>,
     pub stylesheets: Vec<Stylesheet>,
     pub styles: StyleMap,
     pub layout: LayoutTree,
@@ -106,6 +109,9 @@ pub struct DomState {
     pub protos: Option<DomPrototypes>,
     pub focused_node: Option<NodeId>,
     pub pending_navigation: Option<String>,
+    pub sub_documents: HashMap<NodeId, NodeId>,
+    pub xml_documents: std::collections::HashSet<NodeId>,
+    pub xml_elements: std::collections::HashSet<NodeId>,
 }
 
 pub type SharedDom = Rc<RefCell<DomState>>;
@@ -115,7 +121,7 @@ impl DomState {
         let mut st = Self {
             doc,
             url: url.clone(),
-            external_stylesheets: Vec::new(),
+            external_stylesheets: HashMap::new(),
             stylesheets: Vec::new(),
             styles: StyleMap::default(),
             layout: LayoutTree::default(),
@@ -148,6 +154,9 @@ impl DomState {
             protos: None,
             focused_node: None,
             pending_navigation: None,
+            sub_documents: HashMap::new(),
+            xml_documents: std::collections::HashSet::new(),
+            xml_elements: std::collections::HashSet::new(),
         };
         st.doc.track_mutations = true;
         st
@@ -160,9 +169,12 @@ impl DomState {
 
     pub fn collect_inline_stylesheets(&mut self) {
         self.stylesheets.clear();
-        self.stylesheets.extend(self.external_stylesheets.iter().cloned());
         let nodes = self.doc.descendants(self.doc.root);
         for nid in nodes {
+            if let Some(ext) = self.external_stylesheets.get(&nid) {
+                self.stylesheets.push(ext.clone());
+                continue;
+            }
             if let Some(el) = self.doc.element(nid) {
                 if el.is_html() && el.tag_is("style") {
                     let css = self.doc.text_content(nid);
@@ -261,7 +273,7 @@ pub struct EventData {
     pub path: Vec<JsValue>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct RangeData {
     pub start_container: NodeId,
     pub start_offset: usize,

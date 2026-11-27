@@ -218,30 +218,37 @@ pub fn init(rt: &mut JsRuntime) {
         "concat",
         1,
         Rc::new(|rt, this, args| {
+            const MAX_SAFE: usize = 9_007_199_254_740_991;
             let oid = rt.to_object(&this)?;
+            let out = array_species_create(rt, oid, 0)?;
             let mut items = vec![JsValue::Object(oid)];
             items.extend_from_slice(args);
-            let out = rt.create_array(Vec::new());
             let mut n = 0usize;
             for item in items {
                 if is_concat_spreadable(rt, &item)? {
                     let item_id = rt.to_object(&item)?;
                     let len_v = rt.get_property(item_id, "length")?;
                     let len = to_length(rt.to_number(&len_v)?);
+                    if n.saturating_add(len) > MAX_SAFE {
+                        return Err(JsError::type_err("Invalid array length"));
+                    }
                     for k in 0..len {
                         let pk = PropertyKey::String(k.to_string());
                         if rt.has_property(item_id, &pk)? {
                             let v = rt.get_property_key(item_id, &pk)?;
-                            let _ = rt.set_property(out, &n.to_string(), v);
+                            create_data_property_or_throw(rt, out, PropertyKey::String(n.to_string()), v)?;
                         }
                         n += 1;
                     }
                 } else {
-                    let _ = rt.set_property(out, &n.to_string(), item);
+                    if n >= MAX_SAFE {
+                        return Err(JsError::type_err("Invalid array length"));
+                    }
+                    create_data_property_or_throw(rt, out, PropertyKey::String(n.to_string()), item)?;
                     n += 1;
                 }
             }
-            let _ = rt.set_property(out, "length", JsValue::Number(n as f64));
+            rt.set_property_key_strict(out, PropertyKey::from("length"), JsValue::Number(n as f64), true)?;
             Ok(JsValue::Object(out))
         }),
     );
@@ -1193,11 +1200,42 @@ pub fn init(rt: &mut JsRuntime) {
         }),
     );
 
-    let ctor = rt.create_native_constructor(
+    let unscopables = rt.create_object_with_proto(None);
+    for name in [
+        "at",
+        "copyWithin",
+        "entries",
+        "fill",
+        "find",
+        "findIndex",
+        "findLast",
+        "findLastIndex",
+        "flat",
+        "flatMap",
+        "includes",
+        "keys",
+        "toReversed",
+        "toSorted",
+        "toSpliced",
+        "values",
+    ] {
+        rt.heap.get_obj_mut(unscopables).set_own_prop(
+            PropertyKey::from(name),
+            PropEntry::data(JsValue::Boolean(true), true, true, true),
+        );
+    }
+    let sym_unscopables = rt.symbols.unscopables;
+    rt.heap.get_obj_mut(proto).set_own_prop(
+        PropertyKey::Symbol(sym_unscopables),
+        PropEntry::data(JsValue::Object(unscopables), false, false, true),
+    );
+
+    let ctor = rt.create_spec_constructor(
         "Array",
         1,
         proto,
         Rc::new(|rt, _, args| {
+            let obj_proto = rt.get_prototype_from_new_target(rt.intrinsics.array_proto)?;
             if args.len() == 1 {
                 if let JsValue::Number(n) = args[0] {
                     let u = to_uint32(n);
@@ -1205,13 +1243,17 @@ pub fn init(rt: &mut JsRuntime) {
                         return Err(JsError::range("Invalid array length"));
                     }
                     let obj = rt.heap.alloc_object(JsObject::new(
-                        Some(rt.intrinsics.array_proto),
+                        Some(obj_proto),
                         ObjectKind::Array(ArrayData::with_len(u as usize)),
                     ));
                     return Ok(JsValue::Object(obj));
                 }
             }
-            Ok(JsValue::Object(rt.create_array(args.to_vec())))
+            let obj = rt.heap.alloc_object(JsObject::new(
+                Some(obj_proto),
+                ObjectKind::Array(ArrayData::from_vec(args.to_vec())),
+            ));
+            Ok(JsValue::Object(obj))
         }),
     );
     rt.intrinsics.array_ctor = ctor;
@@ -1223,7 +1265,7 @@ pub fn init(rt: &mut JsRuntime) {
         1,
         Rc::new(|rt, _, args| {
             let v = args.first().unwrap_or(&JsValue::Undefined);
-            Ok(JsValue::Boolean(is_array_val(rt, v)))
+            Ok(JsValue::Boolean(is_array_val_checked(rt, v)?))
         }),
     );
 
@@ -1232,7 +1274,33 @@ pub fn init(rt: &mut JsRuntime) {
         ctor,
         "of",
         0,
-        Rc::new(|rt, _, args| Ok(JsValue::Object(rt.create_array(args.to_vec())))),
+        Rc::new(|rt, this, args| {
+            let len = args.len();
+            let out_id = if rt.is_constructor(&this) {
+                let v = rt.construct(this, &[JsValue::Number(len as f64)])?;
+                rt.to_object(&v)?
+            } else {
+                rt.heap.alloc_object(JsObject::new(
+                    Some(rt.intrinsics.array_proto),
+                    ObjectKind::Array(ArrayData::with_len(len)),
+                ))
+            };
+            for (k, item) in args.iter().enumerate() {
+                create_data_property_or_throw(
+                    rt,
+                    out_id,
+                    PropertyKey::String(k.to_string()),
+                    item.clone(),
+                )?;
+            }
+            rt.set_property_key_strict(
+                out_id,
+                PropertyKey::from("length"),
+                JsValue::Number(len as f64),
+                true,
+            )?;
+            Ok(JsValue::Object(out_id))
+        }),
     );
 
     set_method(
@@ -1278,12 +1346,14 @@ pub fn init(rt: &mut JsRuntime) {
                     } else {
                         item
                     };
-                    if !rt.define_property(
+                    if let Err(e) = create_data_property_or_throw(
+                        rt,
                         out_id,
                         PropertyKey::String(k.to_string()),
-                        PropertyDescriptor::data(val, true, true, true),
-                    )? {
-                        return Err(JsError::type_err("Cannot define property"));
+                        val,
+                    ) {
+                        rt.iterator_close(&iter);
+                        return Err(e);
                     }
                     k += 1;
                 }
@@ -1317,13 +1387,12 @@ pub fn init(rt: &mut JsRuntime) {
                 } else {
                     item
                 };
-                if !rt.define_property(
+                create_data_property_or_throw(
+                    rt,
                     out_id,
                     PropertyKey::String(k.to_string()),
-                    PropertyDescriptor::data(val, true, true, true),
-                )? {
-                    return Err(JsError::type_err("Cannot define property"));
-                }
+                    val,
+                )?;
             }
             rt.set_property_key_strict(
                 out_id,
@@ -1332,6 +1401,24 @@ pub fn init(rt: &mut JsRuntime) {
                 true,
             )?;
             Ok(JsValue::Object(out_id))
+        }),
+    );
+
+    set_method(
+        rt,
+        ctor,
+        "fromAsync",
+        1,
+        Rc::new(|rt, this, args| {
+            let promise = rt.create_promise();
+            let async_items = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let map_fn = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+            if let Err(e) = array_from_async_start(rt, this, async_items, map_fn, this_arg, promise) {
+                let ev = rt.error_to_js_value(e);
+                rt.reject_promise(promise, ev);
+            }
+            Ok(JsValue::Object(promise))
         }),
     );
 
@@ -1354,15 +1441,82 @@ pub fn init(rt: &mut JsRuntime) {
     set_global(rt, "Array", JsValue::Object(ctor));
 }
 
-pub fn is_array_val(rt: &JsRuntime, val: &JsValue) -> bool {
+pub fn is_array_val_checked(rt: &JsRuntime, val: &JsValue) -> Result<bool, JsError> {
     let JsValue::Object(oid) = val else {
-        return false;
+        return Ok(false);
     };
     match &rt.heap.get_obj(*oid).kind {
-        ObjectKind::Array(_) => true,
-        ObjectKind::Proxy(p) => !p.revoked && is_array_val(rt, &JsValue::Object(p.target)),
-        _ => false,
+        ObjectKind::Array(_) => Ok(true),
+        ObjectKind::Proxy(p) => {
+            if p.revoked {
+                return Err(JsError::type_err("Cannot perform 'IsArray' on a proxy that has been revoked"));
+            }
+            let target = p.target;
+            is_array_val_checked(rt, &JsValue::Object(target))
+        }
+        _ => Ok(false),
     }
+}
+
+pub fn is_array_val(rt: &JsRuntime, val: &JsValue) -> bool {
+    is_array_val_checked(rt, val).unwrap_or(false)
+}
+
+pub fn create_data_property_or_throw(
+    rt: &mut JsRuntime,
+    oid: ObjectId,
+    key: PropertyKey,
+    val: JsValue,
+) -> Result<(), JsError> {
+    if !rt.define_property(oid, key, PropertyDescriptor::data(val, true, true, true))? {
+        return Err(JsError::type_err("Cannot define property"));
+    }
+    Ok(())
+}
+
+pub fn array_species_create(
+    rt: &mut JsRuntime,
+    orig: ObjectId,
+    length: usize,
+) -> Result<ObjectId, JsError> {
+    let is_arr = is_array_val_checked(rt, &JsValue::Object(orig))?;
+    if !is_arr {
+        return Ok(rt.heap.alloc_object(JsObject::new(
+            Some(rt.intrinsics.array_proto),
+            ObjectKind::Array(ArrayData::with_len(length)),
+        )));
+    }
+    let mut ctor = rt.get_property(orig, "constructor")?;
+    if let JsValue::Object(cid) = ctor {
+        let mut is_other_realm_array = false;
+        if rt.is_constructor(&JsValue::Object(cid)) {
+            let realm_c = rt.get_function_realm(cid)?;
+            if realm_c != rt.current_realm_id
+                && realm_c < rt.realms.len()
+                && cid == rt.realms[realm_c].intrinsics.array_ctor
+            {
+                is_other_realm_array = true;
+            }
+        }
+        if is_other_realm_array {
+            ctor = JsValue::Undefined;
+        } else {
+            let sym_species = PropertyKey::Symbol(rt.symbols.species);
+            let sp = rt.get_property_key(cid, &sym_species)?;
+            ctor = if sp.is_null() { JsValue::Undefined } else { sp };
+        }
+    }
+    if ctor.is_undefined() {
+        return Ok(rt.heap.alloc_object(JsObject::new(
+            Some(rt.intrinsics.array_proto),
+            ObjectKind::Array(ArrayData::with_len(length)),
+        )));
+    }
+    if !rt.is_constructor(&ctor) {
+        return Err(JsError::type_err("Array species constructor is not a constructor"));
+    }
+    let res = rt.construct(ctor, &[JsValue::Number(length as f64)])?;
+    rt.to_object(&res)
 }
 
 fn is_concat_spreadable(rt: &mut JsRuntime, val: &JsValue) -> Result<bool, JsError> {
@@ -1374,7 +1528,7 @@ fn is_concat_spreadable(rt: &mut JsRuntime, val: &JsValue) -> Result<bool, JsErr
     if !sp.is_undefined() {
         return Ok(sp.to_boolean());
     }
-    Ok(is_array_val(rt, val))
+    is_array_val_checked(rt, val)
 }
 
 fn resolve_index(
@@ -1482,4 +1636,467 @@ pub fn stable_merge_sort(
         k += 1;
     }
     Ok(())
+}
+
+struct FromAsyncIterState {
+    iter: JsValue,
+    next_fn: JsValue,
+    is_async_iter: bool,
+    out_id: ObjectId,
+    map_fn: Option<JsValue>,
+    this_arg: JsValue,
+    k: usize,
+    promise: ObjectId,
+}
+
+fn close_from_async_iter(
+    rt: &mut JsRuntime,
+    iter: JsValue,
+    is_async_iter: bool,
+    reason: JsValue,
+    promise: ObjectId,
+) {
+    let ret_res = (|| -> Result<Option<JsValue>, JsError> {
+        let JsValue::Object(iid) = iter else {
+            return Ok(None);
+        };
+        let ret_fn = rt.get_property(iid, "return")?;
+        if ret_fn.is_nullish() {
+            return Ok(None);
+        }
+        if !rt.is_callable(&ret_fn) {
+            return Err(JsError::type_err("Iterator return is not callable"));
+        }
+        let r = rt.call_function(ret_fn, iter, &[])?;
+        Ok(Some(r))
+    })();
+    if is_async_iter {
+        if let Ok(Some(ret_val)) = ret_res {
+            let p = rt.promise_resolve_value(ret_val);
+            let r1 = reason.clone();
+            let on_fin1 = rt.create_native_function(
+                "",
+                1,
+                Rc::new(move |rt, _, _| {
+                    rt.reject_promise(promise, r1.clone());
+                    Ok(JsValue::Undefined)
+                }),
+            );
+            let on_fin2 = rt.create_native_function(
+                "",
+                1,
+                Rc::new(move |rt, _, _| {
+                    rt.reject_promise(promise, reason.clone());
+                    Ok(JsValue::Undefined)
+                }),
+            );
+            let _ = rt.promise_then(
+                p,
+                Some(JsValue::Object(on_fin1)),
+                Some(JsValue::Object(on_fin2)),
+            );
+            return;
+        }
+    }
+    rt.reject_promise(promise, reason);
+}
+
+fn array_from_async_start(
+    rt: &mut JsRuntime,
+    this: JsValue,
+    async_items: JsValue,
+    map_fn: JsValue,
+    this_arg: JsValue,
+    promise: ObjectId,
+) -> Result<(), JsError> {
+    let mapping = if map_fn.is_undefined() {
+        None
+    } else if rt.is_callable(&map_fn) {
+        Some(map_fn)
+    } else {
+        return Err(JsError::type_err("Array.fromAsync mapfn is not a function"));
+    };
+    let items_oid = rt.to_object(&async_items)?;
+    let async_sym = PropertyKey::Symbol(rt.symbols.async_iterator);
+    let using_async = rt.get_property_key(items_oid, &async_sym)?;
+    let (using_method, is_async_iter) = if !using_async.is_nullish() {
+        if !rt.is_callable(&using_async) {
+            return Err(JsError::type_err("Async iterator method is not callable"));
+        }
+        (Some(using_async), true)
+    } else {
+        let sync_sym = PropertyKey::Symbol(rt.symbols.iterator);
+        let using_sync = rt.get_property_key(items_oid, &sync_sym)?;
+        if !using_sync.is_nullish() {
+            if !rt.is_callable(&using_sync) {
+                return Err(JsError::type_err("Iterator method is not callable"));
+            }
+            (Some(using_sync), false)
+        } else {
+            (None, false)
+        }
+    };
+
+    if let Some(method) = using_method {
+        let iter = rt.call_function(method, async_items, &[])?;
+        let JsValue::Object(iter_oid) = iter else {
+            return Err(JsError::type_err("Iterator must be an object"));
+        };
+        let next_fn = rt.get_property(iter_oid, "next")?;
+        let out_id = if rt.is_constructor(&this) && this != JsValue::Object(rt.intrinsics.array_ctor) {
+            let v = rt.construct(this, &[])?;
+            rt.to_object(&v)?
+        } else {
+            rt.create_array(Vec::new())
+        };
+        let state = Rc::new(std::cell::RefCell::new(FromAsyncIterState {
+            iter,
+            next_fn,
+            is_async_iter,
+            out_id,
+            map_fn: mapping,
+            this_arg,
+            k: 0,
+            promise,
+        }));
+        step_from_async_iter(rt, state);
+        return Ok(());
+    }
+
+    let len_v = rt.get_property(items_oid, "length")?;
+    let len = to_length(rt.to_number(&len_v)?);
+    let out_id = if rt.is_constructor(&this) && this != JsValue::Object(rt.intrinsics.array_ctor) {
+        let v = rt.construct(this, &[JsValue::Number(len as f64)])?;
+        rt.to_object(&v)?
+    } else {
+        if len > u32::MAX as usize {
+            return Err(JsError::range("Invalid array length"));
+        }
+        rt.heap.alloc_object(JsObject::new(
+            Some(rt.intrinsics.array_proto),
+            ObjectKind::Array(ArrayData::with_len(len)),
+        ))
+    };
+    step_from_async_array_like(rt, items_oid, len, 0, out_id, mapping, this_arg, promise);
+    Ok(())
+}
+
+fn step_from_async_iter(rt: &mut JsRuntime, state: Rc<std::cell::RefCell<FromAsyncIterState>>) {
+    let (iter, next_fn, is_async_iter, promise) = {
+        let st = state.borrow();
+        (st.iter.clone(), st.next_fn.clone(), st.is_async_iter, st.promise)
+    };
+    let next_res = match rt.call_function(next_fn, iter, &[]) {
+        Ok(v) => v,
+        Err(e) => {
+            let ev = rt.error_to_js_value(e);
+            rt.reject_promise(promise, ev);
+            return;
+        }
+    };
+    if is_async_iter {
+        let p = rt.promise_resolve_value(next_res);
+        let st_ok = state.clone();
+        let on_ok = rt.create_native_function(
+            "",
+            1,
+            Rc::new(move |rt, _, a| {
+                let res = a.first().cloned().unwrap_or(JsValue::Undefined);
+                handle_from_async_iter_result(rt, st_ok.clone(), res);
+                Ok(JsValue::Undefined)
+            }),
+        );
+        let on_err = rt.create_native_function(
+            "",
+            1,
+            Rc::new(move |rt, _, a| {
+                let r = a.first().cloned().unwrap_or(JsValue::Undefined);
+                rt.reject_promise(promise, r);
+                Ok(JsValue::Undefined)
+            }),
+        );
+        let _ = rt.promise_then(p, Some(JsValue::Object(on_ok)), Some(JsValue::Object(on_err)));
+    } else {
+        handle_from_async_iter_result(rt, state, next_res);
+    }
+}
+
+fn handle_from_async_iter_result(
+    rt: &mut JsRuntime,
+    state: Rc<std::cell::RefCell<FromAsyncIterState>>,
+    iter_result: JsValue,
+) {
+    let (iter, is_async_iter, out_id, k, promise) = {
+        let st = state.borrow();
+        (st.iter.clone(), st.is_async_iter, st.out_id, st.k, st.promise)
+    };
+    let JsValue::Object(res_oid) = iter_result else {
+        let err = rt.error_to_js_value(JsError::type_err("Iterator result is not an object"));
+        rt.reject_promise(promise, err);
+        return;
+    };
+    let done = match rt.get_property(res_oid, "done") {
+        Ok(v) => v.to_boolean(),
+        Err(e) => {
+            let ev = rt.error_to_js_value(e);
+            rt.reject_promise(promise, ev);
+            return;
+        }
+    };
+    if done {
+        if let Err(e) = rt.set_property_key_strict(
+            out_id,
+            PropertyKey::from("length"),
+            JsValue::Number(k as f64),
+            true,
+        ) {
+            let ev = rt.error_to_js_value(e);
+            rt.reject_promise(promise, ev);
+        } else {
+            rt.resolve_promise(promise, JsValue::Object(out_id));
+        }
+        return;
+    }
+    let next_val = match rt.get_property(res_oid, "value") {
+        Ok(v) => v,
+        Err(e) => {
+            let ev = rt.error_to_js_value(e);
+            rt.reject_promise(promise, ev);
+            return;
+        }
+    };
+    if is_async_iter {
+        apply_from_async_iter_value(rt, state, next_val);
+    } else {
+        let p = rt.promise_resolve_value(next_val);
+        let st_ok = state.clone();
+        let on_ok = rt.create_native_function(
+            "",
+            1,
+            Rc::new(move |rt, _, a| {
+                let v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                apply_from_async_iter_value(rt, st_ok.clone(), v);
+                Ok(JsValue::Undefined)
+            }),
+        );
+        let on_err = rt.create_native_function(
+            "",
+            1,
+            Rc::new(move |rt, _, a| {
+                let r = a.first().cloned().unwrap_or(JsValue::Undefined);
+                close_from_async_iter(rt, iter.clone(), false, r, promise);
+                Ok(JsValue::Undefined)
+            }),
+        );
+        let _ = rt.promise_then(p, Some(JsValue::Object(on_ok)), Some(JsValue::Object(on_err)));
+    }
+}
+
+fn apply_from_async_iter_value(
+    rt: &mut JsRuntime,
+    state: Rc<std::cell::RefCell<FromAsyncIterState>>,
+    val: JsValue,
+) {
+    let (iter, is_async_iter, map_fn, this_arg, k, promise) = {
+        let st = state.borrow();
+        (
+            st.iter.clone(),
+            st.is_async_iter,
+            st.map_fn.clone(),
+            st.this_arg.clone(),
+            st.k,
+            st.promise,
+        )
+    };
+    if k >= 9_007_199_254_740_991 {
+        let ev = rt.error_to_js_value(JsError::type_err("Array.fromAsync length exceeded"));
+        close_from_async_iter(rt, iter, is_async_iter, ev, promise);
+        return;
+    }
+    if let Some(mfn) = map_fn {
+        let mapped = match rt.call_function(mfn, this_arg, &[val, JsValue::Number(k as f64)]) {
+            Ok(v) => v,
+            Err(e) => {
+                let ev = rt.error_to_js_value(e);
+                close_from_async_iter(rt, iter, is_async_iter, ev, promise);
+                return;
+            }
+        };
+        let p = rt.promise_resolve_value(mapped);
+        let st_ok = state.clone();
+        let on_ok = rt.create_native_function(
+            "",
+            1,
+            Rc::new(move |rt, _, a| {
+                let v = a.first().cloned().unwrap_or(JsValue::Undefined);
+                finish_from_async_iter_elem(rt, st_ok.clone(), v);
+                Ok(JsValue::Undefined)
+            }),
+        );
+        let on_err = rt.create_native_function(
+            "",
+            1,
+            Rc::new(move |rt, _, a| {
+                let r = a.first().cloned().unwrap_or(JsValue::Undefined);
+                close_from_async_iter(rt, iter.clone(), is_async_iter, r, promise);
+                Ok(JsValue::Undefined)
+            }),
+        );
+        let _ = rt.promise_then(p, Some(JsValue::Object(on_ok)), Some(JsValue::Object(on_err)));
+    } else {
+        finish_from_async_iter_elem(rt, state, val);
+    }
+}
+
+fn finish_from_async_iter_elem(
+    rt: &mut JsRuntime,
+    state: Rc<std::cell::RefCell<FromAsyncIterState>>,
+    val: JsValue,
+) {
+    let (iter, is_async_iter, out_id, k, promise) = {
+        let st = state.borrow();
+        (st.iter.clone(), st.is_async_iter, st.out_id, st.k, st.promise)
+    };
+    if let Err(e) = create_data_property_or_throw(rt, out_id, PropertyKey::String(k.to_string()), val) {
+        let ev = rt.error_to_js_value(e);
+        close_from_async_iter(rt, iter, is_async_iter, ev, promise);
+        return;
+    }
+    state.borrow_mut().k = k + 1;
+    step_from_async_iter(rt, state);
+}
+
+fn step_from_async_array_like(
+    rt: &mut JsRuntime,
+    items_oid: ObjectId,
+    len: usize,
+    k: usize,
+    out_id: ObjectId,
+    map_fn: Option<JsValue>,
+    this_arg: JsValue,
+    promise: ObjectId,
+) {
+    if k >= len {
+        if let Err(e) = rt.set_property_key_strict(
+            out_id,
+            PropertyKey::from("length"),
+            JsValue::Number(len as f64),
+            true,
+        ) {
+            let ev = rt.error_to_js_value(e);
+            rt.reject_promise(promise, ev);
+        } else {
+            rt.resolve_promise(promise, JsValue::Object(out_id));
+        }
+        return;
+    }
+    let raw = match rt.get_property(items_oid, &k.to_string()) {
+        Ok(v) => v,
+        Err(e) => {
+            let ev = rt.error_to_js_value(e);
+            rt.reject_promise(promise, ev);
+            return;
+        }
+    };
+    let p = rt.promise_resolve_value(raw);
+    let mfn_c = map_fn.clone();
+    let ta_c = this_arg.clone();
+    let on_ok = rt.create_native_function(
+        "",
+        1,
+        Rc::new(move |rt, _, a| {
+            let val = a.first().cloned().unwrap_or(JsValue::Undefined);
+            if let Some(ref mfn) = mfn_c {
+                let mapped = match rt.call_function(
+                    mfn.clone(),
+                    ta_c.clone(),
+                    &[val, JsValue::Number(k as f64)],
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let ev = rt.error_to_js_value(e);
+                        rt.reject_promise(promise, ev);
+                        return Ok(JsValue::Undefined);
+                    }
+                };
+                let mp = rt.promise_resolve_value(mapped);
+                let mfn2 = mfn_c.clone();
+                let ta2 = ta_c.clone();
+                let on_m_ok = rt.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, ma| {
+                        let mv = ma.first().cloned().unwrap_or(JsValue::Undefined);
+                        if let Err(e) = create_data_property_or_throw(
+                            rt,
+                            out_id,
+                            PropertyKey::String(k.to_string()),
+                            mv,
+                        ) {
+                            let ev = rt.error_to_js_value(e);
+                            rt.reject_promise(promise, ev);
+                            return Ok(JsValue::Undefined);
+                        }
+                        step_from_async_array_like(
+                            rt,
+                            items_oid,
+                            len,
+                            k + 1,
+                            out_id,
+                            mfn2.clone(),
+                            ta2.clone(),
+                            promise,
+                        );
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+                let on_m_err = rt.create_native_function(
+                    "",
+                    1,
+                    Rc::new(move |rt, _, ma| {
+                        let r = ma.first().cloned().unwrap_or(JsValue::Undefined);
+                        rt.reject_promise(promise, r);
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+                let _ = rt.promise_then(
+                    mp,
+                    Some(JsValue::Object(on_m_ok)),
+                    Some(JsValue::Object(on_m_err)),
+                );
+            } else {
+                if let Err(e) = create_data_property_or_throw(
+                    rt,
+                    out_id,
+                    PropertyKey::String(k.to_string()),
+                    val,
+                ) {
+                    let ev = rt.error_to_js_value(e);
+                    rt.reject_promise(promise, ev);
+                    return Ok(JsValue::Undefined);
+                }
+                step_from_async_array_like(
+                    rt,
+                    items_oid,
+                    len,
+                    k + 1,
+                    out_id,
+                    None,
+                    ta_c.clone(),
+                    promise,
+                );
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let on_err = rt.create_native_function(
+        "",
+        1,
+        Rc::new(move |rt, _, a| {
+            let r = a.first().cloned().unwrap_or(JsValue::Undefined);
+            rt.reject_promise(promise, r);
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let _ = rt.promise_then(p, Some(JsValue::Object(on_ok)), Some(JsValue::Object(on_err)));
 }

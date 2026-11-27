@@ -94,22 +94,27 @@ fn init_number(rt: &mut JsRuntime) {
         1,
         Rc::new(|rt, this, args| {
             let n = this_number(rt, &this)?;
+            let frac_arg = args.first();
+            let f_opt = match frac_arg {
+                None | Some(JsValue::Undefined) => None,
+                Some(v) => Some(to_integer_or_infinity(rt.to_number(v)?)),
+            };
             if !n.is_finite() {
                 return Ok(JsValue::String(number_to_string(n)));
             }
-            match args.first() {
-                None | Some(JsValue::Undefined) => {
-                    let s = format!("{:e}", n);
+            let x = if n == 0.0 { 0.0 } else { n };
+            match f_opt {
+                None => {
+                    let s = format!("{:e}", x);
                     Ok(JsValue::String(normalize_exp(&s)))
                 }
-                Some(v) => {
-                    let f = to_integer_or_infinity(rt.to_number(v)?);
+                Some(f) => {
                     if f < 0.0 || f > 100.0 || !f.is_finite() {
                         return Err(JsError::range(
                             "toExponential() argument must be between 0 and 100",
                         ));
                     }
-                    let s = format!("{:.*e}", f as usize, n);
+                    let s = format!("{:.*e}", f as usize, x);
                     Ok(JsValue::String(normalize_exp(&s)))
                 }
             }
@@ -499,9 +504,12 @@ fn init_math(rt: &mut JsRuntime) {
         "max",
         2,
         Rc::new(|rt, _, args| {
-            let mut max = f64::NEG_INFINITY;
+            let mut coerced = Vec::with_capacity(args.len());
             for a in args {
-                let n = rt.to_number(a)?;
+                coerced.push(rt.to_number(a)?);
+            }
+            let mut max = f64::NEG_INFINITY;
+            for n in coerced {
                 if n.is_nan() {
                     return Ok(JsValue::Number(f64::NAN));
                 }
@@ -519,9 +527,12 @@ fn init_math(rt: &mut JsRuntime) {
         "min",
         2,
         Rc::new(|rt, _, args| {
-            let mut min = f64::INFINITY;
+            let mut coerced = Vec::with_capacity(args.len());
             for a in args {
-                let n = rt.to_number(a)?;
+                coerced.push(rt.to_number(a)?);
+            }
+            let mut min = f64::INFINITY;
+            for n in coerced {
                 if n.is_nan() {
                     return Ok(JsValue::Number(f64::NAN));
                 }
@@ -539,6 +550,9 @@ fn init_math(rt: &mut JsRuntime) {
         "hypot",
         2,
         Rc::new(|rt, _, args| {
+            if args.is_empty() {
+                return Ok(JsValue::Number(0.0));
+            }
             let mut nums = Vec::with_capacity(args.len());
             let mut has_inf = false;
             let mut has_nan = false;
@@ -558,7 +572,8 @@ fn init_math(rt: &mut JsRuntime) {
                 return Ok(JsValue::Number(f64::NAN));
             }
             let sum: f64 = nums.iter().map(|x| x * x).sum();
-            Ok(JsValue::Number(sum.sqrt()))
+            let res = sum.sqrt();
+            Ok(JsValue::Number(if res == 0.0 { 0.0 } else { res }))
         }),
     );
 
@@ -686,12 +701,17 @@ fn init_bigint(rt: &mut JsRuntime) {
         }),
     );
 
-    let ctor = rt.create_native_function(
+    let ctor = rt.create_spec_constructor(
         "BigInt",
         1,
+        proto,
         Rc::new(|rt, _, args| {
+            if matches!(&rt.native_new_target, Some(nt) if !nt.is_undefined()) {
+                return Err(JsError::type_err("BigInt is not a constructor"));
+            }
             let val = args.first().unwrap_or(&JsValue::Undefined);
-            match val {
+            let prim = rt.to_primitive(val, "number")?;
+            match prim {
                 JsValue::Number(n) => {
                     if !n.is_finite() || n.fract() != 0.0 {
                         return Err(JsError::range(format!(
@@ -699,19 +719,11 @@ fn init_bigint(rt: &mut JsRuntime) {
                             n
                         )));
                     }
-                    Ok(JsValue::BigInt(*n as i128))
+                    Ok(JsValue::BigInt(n as i128))
                 }
-                other => Ok(JsValue::BigInt(rt.to_bigint(other)?)),
+                other => Ok(JsValue::BigInt(rt.to_bigint(&other)?)),
             }
         }),
-    );
-    rt.heap.get_obj_mut(ctor).set_own_prop(
-        PropertyKey::from("prototype"),
-        PropEntry::data(JsValue::Object(proto), false, false, false),
-    );
-    rt.heap.get_obj_mut(proto).set_own_prop(
-        PropertyKey::from("constructor"),
-        PropEntry::data(JsValue::Object(ctor), true, false, true),
     );
     set_method(
         rt,
@@ -719,7 +731,7 @@ fn init_bigint(rt: &mut JsRuntime) {
         "asIntN",
         2,
         Rc::new(|rt, _, args| {
-            let bits = to_length(rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?);
+            let bits = to_bigint_index(rt, args.first())?;
             let bi = rt.to_bigint(args.get(1).unwrap_or(&JsValue::Undefined))?;
             if bits == 0 {
                 return Ok(JsValue::BigInt(0));
@@ -744,7 +756,7 @@ fn init_bigint(rt: &mut JsRuntime) {
         "asUintN",
         2,
         Rc::new(|rt, _, args| {
-            let bits = to_length(rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?);
+            let bits = to_bigint_index(rt, args.first())?;
             let bi = rt.to_bigint(args.get(1).unwrap_or(&JsValue::Undefined))?;
             if bits == 0 {
                 return Ok(JsValue::BigInt(0));
@@ -758,6 +770,19 @@ fn init_bigint(rt: &mut JsRuntime) {
     );
 
     set_global(rt, "BigInt", JsValue::Object(ctor));
+}
+
+fn to_bigint_index(rt: &mut JsRuntime, arg: Option<&JsValue>) -> Result<usize, JsError> {
+    match arg {
+        None | Some(JsValue::Undefined) => Ok(0),
+        Some(v) => {
+            let n = to_integer_or_infinity(rt.to_number(v)?);
+            if n < 0.0 || !n.is_finite() || n > 9_007_199_254_740_991.0 {
+                return Err(JsError::range("Invalid BigInt bit width"));
+            }
+            Ok(n as usize)
+        }
+    }
 }
 
 fn format_i128_radix(n: i128, radix: u32) -> String {

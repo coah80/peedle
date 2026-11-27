@@ -221,25 +221,31 @@ fn init_symbol(rt: &mut JsRuntime) {
         0,
         Rc::new(|rt, this, _| this_symbol(rt, &this).map(JsValue::Symbol)),
     );
+    let to_prim_sym = rt.symbols.to_primitive;
+    let to_prim_fn = rt.create_native_function(
+        "[Symbol.toPrimitive]",
+        1,
+        Rc::new(|rt, this, _| this_symbol(rt, &this).map(JsValue::Symbol)),
+    );
+    rt.heap.get_obj_mut(proto).set_own_prop(
+        PropertyKey::Symbol(to_prim_sym),
+        PropEntry::data(JsValue::Object(to_prim_fn), false, false, true),
+    );
 
-    let sym_fn = rt.create_native_function(
+    let sym_fn = rt.create_spec_constructor(
         "Symbol",
         0,
+        proto,
         Rc::new(|rt, _, args| {
+            if matches!(&rt.native_new_target, Some(nt) if !nt.is_undefined()) {
+                return Err(JsError::type_err("Symbol is not a constructor"));
+            }
             let desc = match args.first() {
                 None | Some(JsValue::Undefined) => None,
                 Some(v) => Some(rt.to_string(v)?),
             };
             Ok(JsValue::Symbol(rt.heap.create_symbol(desc)))
         }),
-    );
-    rt.heap.get_obj_mut(sym_fn).set_own_prop(
-        PropertyKey::from("prototype"),
-        PropEntry::data(JsValue::Object(proto), false, false, false),
-    );
-    rt.heap.get_obj_mut(proto).set_own_prop(
-        PropertyKey::from("constructor"),
-        PropEntry::data(JsValue::Object(sym_fn), true, false, true),
     );
 
     let well_known = [
@@ -256,6 +262,8 @@ fn init_symbol(rt: &mut JsRuntime) {
         ("search", rt.symbols.search),
         ("split", rt.symbols.split),
         ("unscopables", rt.symbols.unscopables),
+        ("dispose", rt.symbols.dispose),
+        ("asyncDispose", rt.symbols.async_dispose),
     ];
     for (name, id) in well_known {
         rt.heap.get_obj_mut(sym_fn).set_own_prop(

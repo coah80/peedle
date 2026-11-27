@@ -5,6 +5,7 @@ pub mod events;
 pub mod nodes;
 pub mod state;
 pub mod style_binding;
+pub mod traversal;
 pub mod web_apis;
 
 pub use dom_env::BrowserJsEnv;

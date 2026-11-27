@@ -256,6 +256,7 @@ impl Page {
         self.js_env.dom.borrow_mut().dark_mode = self.dark_mode;
 
         self.fetch_external_stylesheets();
+        self.recompute_if_needed();
         self.fetch_missing_images();
         self.recompute_if_needed();
 
@@ -346,7 +347,7 @@ impl Page {
     }
 
     fn fetch_external_stylesheets(&mut self) {
-        let css_links: Vec<String> = {
+        let css_links: Vec<(NodeId, String)> = {
             let st = self.js_env.dom.borrow();
             let mut out = Vec::new();
             for nid in st.doc.descendants(st.doc.root) {
@@ -363,7 +364,7 @@ impl Page {
                 if is_sheet {
                     if let Some(href) = el.get_attr("href") {
                         if let Some(resolved) = self.resolve_subresource_url(href) {
-                            out.push(resolved);
+                            out.push((nid, resolved));
                         }
                     }
                 }
@@ -371,8 +372,8 @@ impl Page {
             out
         };
 
-        let mut sheets = Vec::new();
-        for css_url in css_links.into_iter().take(24) {
+        let mut sheets = std::collections::HashMap::new();
+        for (nid, css_url) in css_links.into_iter().take(24) {
             let start = Instant::now();
             if let Ok(resp) = self.client.get(&css_url) {
                 self.network_log.push(NetworkEntry {
@@ -383,8 +384,13 @@ impl Page {
                     bytes: resp.body.len(),
                     duration_ms: start.elapsed().as_millis() as u64,
                 });
-                if resp.status < 400 {
-                    sheets.push(parse_stylesheet(&resp.text()));
+                let ct = resp.content_type().to_ascii_lowercase();
+                let mime_ok = ct.is_empty()
+                    || ct.contains("css")
+                    || ct.contains("text/plain")
+                    || ct.contains("octet-stream");
+                if resp.status < 400 && mime_ok {
+                    sheets.insert(nid, parse_stylesheet(&resp.text()));
                 }
             }
         }
@@ -404,12 +410,36 @@ impl Page {
                         if let Some(src) = el.get_attr("src") {
                             if !self.images.contains(src) {
                                 out.push((src.to_string(), self.resolve_subresource_url(src)));
-                            } else if let Some(img) = self.images.get(src) {
-                                if !st.image_sizes.contains_key(src) {
-                                    out.push((src.to_string(), None));
-                                    let _ = img;
+                            } else if !st.image_sizes.contains_key(src) {
+                                out.push((src.to_string(), None));
+                            }
+                        }
+                    } else if el.is_html() && el.tag_is("object") {
+                        if let Some(data_url) = el.get_attr("data") {
+                            let low = data_url.to_ascii_lowercase();
+                            let looks_image = low.starts_with("data:image/")
+                                || low.ends_with(".png")
+                                || low.ends_with(".gif")
+                                || low.ends_with(".jpg")
+                                || low.ends_with(".jpeg")
+                                || low.ends_with(".webp");
+                            if looks_image {
+                                if !self.images.contains(data_url) {
+                                    out.push((
+                                        data_url.to_string(),
+                                        self.resolve_subresource_url(data_url),
+                                    ));
+                                } else if !st.image_sizes.contains_key(data_url) {
+                                    out.push((data_url.to_string(), None));
                                 }
                             }
+                        }
+                    }
+                }
+                if let Some(style) = st.styles.get(nid) {
+                    if let peedle_css::BackgroundImage::Url(ref u) = style.background_image {
+                        if !self.images.contains(u) {
+                            out.push((u.clone(), self.resolve_subresource_url(u)));
                         }
                     }
                 }

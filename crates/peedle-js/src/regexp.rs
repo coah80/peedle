@@ -338,6 +338,14 @@ impl<'a> RegexParser<'a> {
             '(' => self.parse_group(),
             '\\' => self.parse_escape(false),
             '*' | '+' | '?' => Err(JsError::syntax("Nothing to repeat in regular expression")),
+            '{' => {
+                self.pos -= 1;
+                if self.try_parse_brace_quantifier()?.is_some() {
+                    return Err(JsError::syntax("Nothing to repeat in regular expression"));
+                }
+                self.pos += 1;
+                Ok(Node::Literal('{' as u32))
+            }
             other => Ok(Node::Literal(other as u32)),
         }
     }
@@ -659,7 +667,7 @@ impl<'a> RegexParser<'a> {
                 (0, Some(1))
             }
             Some('{') => {
-                if let Some(bounds) = self.try_parse_brace_quantifier() {
+                if let Some(bounds) = self.try_parse_brace_quantifier()? {
                     bounds
                 } else {
                     return Ok(atom);
@@ -673,6 +681,17 @@ impl<'a> RegexParser<'a> {
         } else {
             true
         };
+        if matches!(self.peek(), Some('*' | '+' | '?')) {
+            return Err(JsError::syntax("Nothing to repeat in regular expression"));
+        }
+        if self.peek() == Some('{') {
+            let saved = self.pos;
+            let stacked = self.try_parse_brace_quantifier()?.is_some();
+            self.pos = saved;
+            if stacked {
+                return Err(JsError::syntax("Nothing to repeat in regular expression"));
+            }
+        }
         Ok(Node::Quantifier {
             body: Box::new(atom),
             min,
@@ -683,34 +702,43 @@ impl<'a> RegexParser<'a> {
         })
     }
 
-    fn try_parse_brace_quantifier(&mut self) -> Option<(usize, Option<usize>)> {
+    fn try_parse_brace_quantifier(&mut self) -> Result<Option<(usize, Option<usize>)>, JsError> {
         let saved = self.pos;
         self.pos += 1;
-        let min = self.read_uint()?;
+        let Some(min) = self.read_uint() else {
+            self.pos = saved;
+            return Ok(None);
+        };
         match self.peek() {
             Some('}') => {
                 self.pos += 1;
-                Some((min, Some(min)))
+                Ok(Some((min, Some(min))))
             }
             Some(',') => {
                 self.pos += 1;
                 if self.peek() == Some('}') {
                     self.pos += 1;
-                    Some((min, None))
+                    Ok(Some((min, None)))
                 } else {
-                    let max = self.read_uint()?;
-                    if self.peek() == Some('}') && max >= min {
+                    let Some(max) = self.read_uint() else {
+                        self.pos = saved;
+                        return Ok(None);
+                    };
+                    if self.peek() == Some('}') {
                         self.pos += 1;
-                        Some((min, Some(max)))
+                        if max < min {
+                            return Err(JsError::syntax("Numbers out of order in {} quantifier"));
+                        }
+                        Ok(Some((min, Some(max))))
                     } else {
                         self.pos = saved;
-                        None
+                        Ok(None)
                     }
                 }
             }
             _ => {
                 self.pos = saved;
-                None
+                Ok(None)
             }
         }
     }

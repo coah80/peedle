@@ -8,6 +8,7 @@ use crate::canvas_binding::ensure_canvas;
 use crate::events::{build_event_object, define_getter_setter, dispatch_event_object};
 use crate::state::{Canvas2DHandle, ClassListHandle, NodeHandle, SharedDom};
 use crate::style_binding::create_style_proxy;
+use crate::traversal::throw_dom_exception;
 
 pub fn node_id_of(rt: &JsRuntime, val: &JsValue) -> Option<NodeId> {
     let oid = val.as_object()?;
@@ -113,22 +114,25 @@ pub fn define_node_proto(rt: &mut JsRuntime, dom: SharedDom, node_proto: ObjectI
             let Some(nid) = node_id_of(rt, &this) else {
                 return Ok(JsValue::String(String::new()));
             };
-            let name = match &d.borrow().doc.node(nid).data {
-                NodeData::Element(e) => {
-                    if e.is_html() {
-                        e.tag_name.to_ascii_uppercase()
-                    } else {
-                        e.tag_name.clone()
+            let name = {
+                let st = d.borrow();
+                match &st.doc.node(nid).data {
+                    NodeData::Element(e) => {
+                        if e.is_html() && !st.xml_elements.contains(&nid) {
+                            e.tag_name.to_ascii_uppercase()
+                        } else {
+                            e.tag_name.clone()
+                        }
                     }
+                    NodeData::Text(_) => "#text".to_string(),
+                    NodeData::Comment(_) => "#comment".to_string(),
+                    NodeData::Document { .. } => "#document".to_string(),
+                    NodeData::DocumentFragment | NodeData::ShadowRoot { .. } => {
+                        "#document-fragment".to_string()
+                    }
+                    NodeData::Doctype { name, .. } => name.clone(),
+                    NodeData::ProcessingInstruction { target, .. } => target.clone(),
                 }
-                NodeData::Text(_) => "#text".to_string(),
-                NodeData::Comment(_) => "#comment".to_string(),
-                NodeData::Document { .. } => "#document".to_string(),
-                NodeData::DocumentFragment | NodeData::ShadowRoot { .. } => {
-                    "#document-fragment".to_string()
-                }
-                NodeData::Doctype { name, .. } => name.clone(),
-                NodeData::ProcessingInstruction { target, .. } => target.clone(),
             };
             Ok(JsValue::String(name))
         }),
@@ -317,11 +321,24 @@ pub fn define_node_proto(rt: &mut JsRuntime, dom: SharedDom, node_proto: ObjectI
             let Some(nid) = node_id_of(rt, &this) else {
                 return Ok(JsValue::Null);
             };
-            if nid == d.borrow().doc.root {
-                return Ok(JsValue::Null);
-            }
-            let root = d.borrow().doc.root;
-            Ok(JsValue::Object(wrap_node(rt, &d, root)))
+            let owner = {
+                let st = d.borrow();
+                if matches!(st.doc.node(nid).data, NodeData::Document { .. }) {
+                    None
+                } else {
+                    let mut cur = st.doc.node(nid).parent;
+                    let mut found = None;
+                    while let Some(pid) = cur {
+                        if matches!(st.doc.node(pid).data, NodeData::Document { .. }) {
+                            found = Some(pid);
+                            break;
+                        }
+                        cur = st.doc.node(pid).parent;
+                    }
+                    Some(found.unwrap_or(st.doc.root))
+                }
+            };
+            Ok(wrap_node_opt(rt, &d, owner))
         }),
     );
     define_getter_setter(rt, node_proto, "ownerDocument", Some(get_od), None);
@@ -352,6 +369,37 @@ pub fn define_node_proto(rt: &mut JsRuntime, dom: SharedDom, node_proto: ObjectI
             let Some(child) = args.first().and_then(|v| node_id_of(rt, v)) else {
                 return Err(JsError::type_err("appendChild argument must be a Node"));
             };
+            let bad_hierarchy = {
+                let st = d.borrow();
+                let parent_cannot_have_children = matches!(
+                    st.doc.node(parent).data,
+                    NodeData::Text(_)
+                        | NodeData::Comment(_)
+                        | NodeData::Doctype { .. }
+                        | NodeData::ProcessingInstruction { .. }
+                );
+                let child_is_doc = matches!(st.doc.node(child).data, NodeData::Document { .. });
+                let parent_is_doc = matches!(st.doc.node(parent).data, NodeData::Document { .. });
+                let dup_doc_el = parent_is_doc
+                    && matches!(st.doc.node(child).data, NodeData::Element(_))
+                    && st.doc.element_children(parent).iter().any(|&c| c != child);
+                let text_in_doc = parent_is_doc && matches!(st.doc.node(child).data, NodeData::Text(_));
+                parent_cannot_have_children
+                    || child_is_doc
+                    || dup_doc_el
+                    || text_in_doc
+                    || child == parent
+                    || st.doc.is_ancestor(child, parent)
+            };
+            if bad_hierarchy {
+                return Err(throw_dom_exception(
+                    rt,
+                    &d,
+                    3,
+                    "HierarchyRequestError",
+                    "Invalid node hierarchy",
+                ));
+            }
             {
                 let mut st = d.borrow_mut();
                 st.doc.append_child(parent, child);
@@ -374,6 +422,48 @@ pub fn define_node_proto(rt: &mut JsRuntime, dom: SharedDom, node_proto: ObjectI
                 return Err(JsError::type_err("insertBefore argument must be a Node"));
             };
             let ref_node = args.get(1).and_then(|v| node_id_of(rt, v));
+            let (bad_hierarchy, bad_ref) = {
+                let st = d.borrow();
+                let parent_cannot = matches!(
+                    st.doc.node(parent).data,
+                    NodeData::Text(_)
+                        | NodeData::Comment(_)
+                        | NodeData::Doctype { .. }
+                        | NodeData::ProcessingInstruction { .. }
+                );
+                let child_is_doc = matches!(st.doc.node(child).data, NodeData::Document { .. });
+                let parent_is_doc = matches!(st.doc.node(parent).data, NodeData::Document { .. });
+                let dup_doc_el = parent_is_doc
+                    && matches!(st.doc.node(child).data, NodeData::Element(_))
+                    && st.doc.element_children(parent).iter().any(|&c| c != child);
+                let text_in_doc = parent_is_doc && matches!(st.doc.node(child).data, NodeData::Text(_));
+                let bad_h = parent_cannot
+                    || child_is_doc
+                    || dup_doc_el
+                    || text_in_doc
+                    || child == parent
+                    || st.doc.is_ancestor(child, parent);
+                let bad_r = ref_node.map_or(false, |rn| st.doc.node(rn).parent != Some(parent));
+                (bad_h, bad_r)
+            };
+            if bad_hierarchy {
+                return Err(throw_dom_exception(
+                    rt,
+                    &d,
+                    3,
+                    "HierarchyRequestError",
+                    "Invalid node hierarchy",
+                ));
+            }
+            if bad_ref {
+                return Err(throw_dom_exception(
+                    rt,
+                    &d,
+                    8,
+                    "NotFoundError",
+                    "Reference node is not a child of this node",
+                ));
+            }
             {
                 let mut st = d.borrow_mut();
                 st.doc.insert_before(parent, child, ref_node);
@@ -395,11 +485,18 @@ pub fn define_node_proto(rt: &mut JsRuntime, dom: SharedDom, node_proto: ObjectI
             let Some(child) = args.first().and_then(|v| node_id_of(rt, v)) else {
                 return Err(JsError::type_err("removeChild argument must be a Node"));
             };
+            let not_child = d.borrow().doc.node(child).parent != Some(parent);
+            if not_child {
+                return Err(throw_dom_exception(
+                    rt,
+                    &d,
+                    8,
+                    "NotFoundError",
+                    "child is not a child of this node",
+                ));
+            }
             {
                 let mut st = d.borrow_mut();
-                if st.doc.node(child).parent != Some(parent) {
-                    return Err(JsError::error("NotFoundError: child is not a child of this node"));
-                }
                 st.doc.detach(child);
                 st.mark_dirty();
             }
@@ -587,18 +684,19 @@ pub fn define_element_proto(
             let Some(nid) = node_id_of(rt, &this) else {
                 return Ok(JsValue::String(String::new()));
             };
-            let s = d
-                .borrow()
-                .doc
-                .element(nid)
-                .map(|e| {
-                    if e.is_html() {
-                        e.tag_name.to_ascii_uppercase()
-                    } else {
-                        e.tag_name.clone()
-                    }
-                })
-                .unwrap_or_default();
+            let s = {
+                let st = d.borrow();
+                st.doc
+                    .element(nid)
+                    .map(|e| {
+                        if e.is_html() && !st.xml_elements.contains(&nid) {
+                            e.tag_name.to_ascii_uppercase()
+                        } else {
+                            e.tag_name.clone()
+                        }
+                    })
+                    .unwrap_or_default()
+            };
             Ok(JsValue::String(s))
         }),
     );
@@ -646,7 +744,55 @@ pub fn define_element_proto(
     define_attr_prop(rt, &dom, element_proto, "className", "class");
     define_attr_prop(rt, &dom, html_element_proto, "title", "title");
     define_attr_prop(rt, &dom, html_element_proto, "name", "name");
-    define_attr_prop(rt, &dom, html_element_proto, "type", "type");
+    define_attr_prop(rt, &dom, html_element_proto, "httpEquiv", "http-equiv");
+    define_attr_prop(rt, &dom, html_element_proto, "content", "content");
+
+    let dg = dom.clone();
+    let ds = dom.clone();
+    let get_data_prop = rt.create_native_function(
+        "get data",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::String(String::new()));
+            };
+            let val = {
+                let st = dg.borrow();
+                let raw = st
+                    .doc
+                    .element(nid)
+                    .and_then(|e| e.get_attr("data"))
+                    .unwrap_or("")
+                    .to_string();
+                if raw.is_empty() {
+                    raw
+                } else {
+                    peedle_url::Url::parse(&st.url)
+                        .ok()
+                        .and_then(|b| b.join(&raw).ok())
+                        .map(|u| u.href())
+                        .unwrap_or(raw)
+                }
+            };
+            Ok(JsValue::String(val))
+        }),
+    );
+    let set_data_prop = rt.create_native_function(
+        "set data",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Undefined);
+            };
+            let s = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let mut st = ds.borrow_mut();
+            st.doc.set_attribute(nid, "data", s);
+            st.sub_documents.remove(&nid);
+            st.mark_dirty();
+            Ok(JsValue::Undefined)
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "data", Some(get_data_prop), Some(set_data_prop));
     define_attr_prop(rt, &dom, html_element_proto, "href", "href");
     define_attr_prop(rt, &dom, html_element_proto, "src", "src");
     define_attr_prop(rt, &dom, html_element_proto, "alt", "alt");
@@ -656,6 +802,56 @@ pub fn define_element_proto(
     define_attr_prop(rt, &dom, html_element_proto, "method", "method");
     define_attr_prop(rt, &dom, html_element_proto, "role", "role");
     define_attr_prop(rt, &dom, html_element_proto, "htmlFor", "for");
+
+    let dg = dom.clone();
+    let ds = dom.clone();
+    let get_type = rt.create_native_function(
+        "get type",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::String(String::new()));
+            };
+            let val = dg
+                .borrow()
+                .doc
+                .element(nid)
+                .map(|e| {
+                    let raw = e.get_attr("type").unwrap_or("").to_ascii_lowercase();
+                    if e.tag_is("button") {
+                        match raw.as_str() {
+                            "button" | "reset" | "submit" => raw,
+                            _ => "submit".to_string(),
+                        }
+                    } else if e.tag_is("input") {
+                        if raw.is_empty() {
+                            "text".to_string()
+                        } else {
+                            raw
+                        }
+                    } else {
+                        e.get_attr("type").unwrap_or("").to_string()
+                    }
+                })
+                .unwrap_or_default();
+            Ok(JsValue::String(val))
+        }),
+    );
+    let set_type = rt.create_native_function(
+        "set type",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Undefined);
+            };
+            let s = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let mut st = ds.borrow_mut();
+            st.doc.set_attribute(nid, "type", s);
+            st.mark_dirty();
+            Ok(JsValue::Undefined)
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "type", Some(get_type), Some(set_type));
 
     let dg = dom.clone();
     let ds = dom.clone();
@@ -1598,6 +1794,741 @@ pub fn define_element_proto(
         }),
     );
     define_getter_setter(rt, html_element_proto, "innerText", Some(get_it), Some(set_it));
+
+    define_html_table_form_embed_apis(rt, dom, html_element_proto);
+}
+
+pub fn ensure_subdocument(dom: &SharedDom, host_id: NodeId) -> Option<NodeId> {
+    if let Some(&existing) = dom.borrow().sub_documents.get(&host_id) {
+        return Some(existing);
+    }
+    let (tag, url_attr, base_url, client) = {
+        let st = dom.borrow();
+        let el = st.doc.element(host_id)?;
+        let tag = el.tag_name.clone();
+        let attr = if tag == "iframe" {
+            el.get_attr("src").map(|s| s.to_string())
+        } else if tag == "object" {
+            el.get_attr("data").map(|s| s.to_string())
+        } else {
+            return None;
+        };
+        (tag, attr, st.url.clone(), st.client.clone())
+    };
+    let mut is_svg = false;
+    let body_text = if let Some(ref raw) = url_attr {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "about:blank" {
+            Some(String::new())
+        } else {
+            let resolved = peedle_url::Url::parse(&base_url)
+                .ok()
+                .and_then(|b| b.join(trimmed).ok())
+                .or_else(|| peedle_url::Url::parse(trimmed).ok())
+                .map(|u| u.href());
+            if let Some(u) = resolved {
+                match client.get(&u) {
+                    Ok(resp) if resp.status < 400 => {
+                        let ct = resp.content_type().to_ascii_lowercase();
+                        is_svg = ct.contains("svg") || u.to_ascii_lowercase().contains("svg");
+                        if ct.contains("image/png") || ct.contains("image/gif") || ct.contains("image/jpeg") {
+                            None
+                        } else {
+                            Some(resp.text())
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+    } else if tag == "iframe" {
+        Some(String::new())
+    } else {
+        None
+    };
+
+    let content = body_text?;
+    let mut st = dom.borrow_mut();
+    let sub = st.doc.create_sub_document();
+    if is_svg {
+        for c in st.doc.children(sub) {
+            st.doc.detach(c);
+        }
+        st.xml_documents.insert(sub);
+        let nodes = parse_fragment_into(&mut st.doc, "svg", Namespace::Svg, &content);
+        if nodes.len() == 1 {
+            st.doc.append_child(sub, nodes[0]);
+        } else {
+            let root_svg = st.doc.create_element_ns("svg", Namespace::Svg, Vec::new());
+            for n in nodes {
+                st.doc.append_child(root_svg, n);
+            }
+            st.doc.append_child(sub, root_svg);
+        }
+    } else if !content.trim().is_empty() {
+        let parsed = peedle_html::parse_html(&content);
+        if let Some(src_html) = parsed.document_element() {
+            for c in st.doc.children(sub) {
+                st.doc.detach(c);
+            }
+            let imported = import_foreign_subtree(&mut st.doc, &parsed, src_html);
+            st.doc.append_child(sub, imported);
+        }
+    }
+    st.sub_documents.insert(host_id, sub);
+    Some(sub)
+}
+
+fn import_foreign_subtree(
+    dst: &mut peedle_html::Document,
+    src: &peedle_html::Document,
+    src_id: NodeId,
+) -> NodeId {
+    let new_id = match &src.node(src_id).data {
+        NodeData::Element(e) => {
+            dst.create_element_ns(e.tag_name.clone(), e.namespace, e.attributes.clone())
+        }
+        NodeData::Text(s) => dst.create_text(s.clone()),
+        NodeData::Comment(s) => dst.create_comment(s.clone()),
+        NodeData::Doctype {
+            name,
+            public_id,
+            system_id,
+        } => dst.create_doctype(name.clone(), public_id.clone(), system_id.clone()),
+        NodeData::ProcessingInstruction { target, data } => {
+            dst.create_processing_instruction(target.clone(), data.clone())
+        }
+        _ => dst.create_fragment(),
+    };
+    for c in src.children(src_id) {
+        let cid = import_foreign_subtree(dst, src, c);
+        dst.append_child(new_id, cid);
+    }
+    new_id
+}
+
+fn define_html_table_form_embed_apis(
+    rt: &mut JsRuntime,
+    dom: SharedDom,
+    html_element_proto: ObjectId,
+) {
+    let d = dom.clone();
+    let get_cd = rt.create_native_function(
+        "get contentDocument",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Null);
+            };
+            let sub = ensure_subdocument(&d, nid);
+            Ok(wrap_node_opt(rt, &d, sub))
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "contentDocument", Some(get_cd), None);
+    let _ = rt.set_property(html_element_proto, "getSVGDocument", JsValue::Object(get_cd));
+
+    let d = dom.clone();
+    let get_row_index = rt.create_native_function(
+        "get rowIndex",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Number(-1.0));
+            };
+            let st = d.borrow();
+            let mut cur = st.doc.node(nid).parent;
+            let mut table_id = None;
+            while let Some(p) = cur {
+                if st.doc.element(p).map_or(false, |e| e.tag_is("table")) {
+                    table_id = Some(p);
+                    break;
+                }
+                cur = st.doc.node(p).parent;
+            }
+            let idx = table_id
+                .and_then(|tid| collect_table_rows(&st.doc, tid).iter().position(|&r| r == nid))
+                .map(|i| i as f64)
+                .unwrap_or(-1.0);
+            Ok(JsValue::Number(idx))
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "rowIndex", Some(get_row_index), None);
+
+    let d = dom.clone();
+    let get_sec_row_index = rt.create_native_function(
+        "get sectionRowIndex",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Number(-1.0));
+            };
+            let st = d.borrow();
+            let idx = st
+                .doc
+                .node(nid)
+                .parent
+                .and_then(|p| {
+                    st.doc
+                        .element_children(p)
+                        .into_iter()
+                        .filter(|&c| st.doc.element(c).map_or(false, |e| e.tag_is("tr")))
+                        .position(|r| r == nid)
+                })
+                .map(|i| i as f64)
+                .unwrap_or(-1.0);
+            Ok(JsValue::Number(idx))
+        }),
+    );
+    define_getter_setter(
+        rt,
+        html_element_proto,
+        "sectionRowIndex",
+        Some(get_sec_row_index),
+        None,
+    );
+
+    let svg_proto = dom.borrow().protos.unwrap().svg_element;
+    for attr in ["x", "y", "width", "height", "rx", "ry"] {
+        let d = dom.clone();
+        let gf = rt.create_native_function(
+            attr,
+            0,
+            Rc::new(move |rt, this, _| {
+                let Some(nid) = node_id_of(rt, &this) else {
+                    return Ok(JsValue::Undefined);
+                };
+                let v: f64 = d
+                    .borrow()
+                    .doc
+                    .element(nid)
+                    .and_then(|e| e.get_attr(attr))
+                    .and_then(|s| s.trim_end_matches("px").parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let anim = rt.create_object();
+                let bv = rt.create_object();
+                let _ = rt.set_property(bv, "value", JsValue::Number(v));
+                let av = rt.create_object();
+                let _ = rt.set_property(av, "value", JsValue::Number(v));
+                let _ = rt.set_property(anim, "baseVal", JsValue::Object(bv));
+                let _ = rt.set_property(anim, "animVal", JsValue::Object(av));
+                Ok(JsValue::Object(anim))
+            }),
+        );
+        define_getter_setter(rt, svg_proto, attr, Some(gf), None);
+    }
+
+    let d = dom.clone();
+    let get_num_chars = rt.create_native_function(
+        "getNumberOfChars",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Number(0.0));
+            };
+            let n = d.borrow().doc.text_content(nid).encode_utf16().count();
+            Ok(JsValue::Number(n as f64))
+        }),
+    );
+    let _ = rt.set_property(svg_proto, "getNumberOfChars", JsValue::Object(get_num_chars));
+
+    let get_cw = rt.create_native_function(
+        "get contentWindow",
+        0,
+        Rc::new(|rt, _, _| Ok(JsValue::Object(rt.global_object()))),
+    );
+    define_getter_setter(rt, html_element_proto, "contentWindow", Some(get_cw), None);
+
+    let d = dom.clone();
+    let get_tbodies = rt.create_native_function(
+        "get tBodies",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Object(rt.create_array(Vec::new())));
+            };
+            let list: Vec<NodeId> = {
+                let st = d.borrow();
+                st.doc
+                    .element_children(nid)
+                    .into_iter()
+                    .filter(|&c| st.doc.element(c).map_or(false, |e| e.tag_is("tbody")))
+                    .collect()
+            };
+            Ok(JsValue::Object(wrap_node_list(rt, &d, list)))
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "tBodies", Some(get_tbodies), None);
+
+    for (prop, tag) in [("tHead", "thead"), ("tFoot", "tfoot"), ("caption", "caption")] {
+        let dg = dom.clone();
+        let gf = rt.create_native_function(
+            prop,
+            0,
+            Rc::new(move |rt, this, _| {
+                let Some(nid) = node_id_of(rt, &this) else {
+                    return Ok(JsValue::Null);
+                };
+                let hit = {
+                    let st = dg.borrow();
+                    st.doc
+                        .element_children(nid)
+                        .into_iter()
+                        .find(|&c| st.doc.element(c).map_or(false, |e| e.tag_is(tag)))
+                };
+                Ok(wrap_node_opt(rt, &dg, hit))
+            }),
+        );
+        define_getter_setter(rt, html_element_proto, prop, Some(gf), None);
+    }
+
+    for (mname, tag) in [
+        ("createTHead", "thead"),
+        ("createTFoot", "tfoot"),
+        ("createCaption", "caption"),
+    ] {
+        let d = dom.clone();
+        let cf = rt.create_native_function(
+            mname,
+            0,
+            Rc::new(move |rt, this, _| {
+                let Some(nid) = node_id_of(rt, &this) else {
+                    return Ok(JsValue::Null);
+                };
+                let res = {
+                    let mut st = d.borrow_mut();
+                    if let Some(existing) = st
+                        .doc
+                        .element_children(nid)
+                        .into_iter()
+                        .find(|&c| st.doc.element(c).map_or(false, |e| e.tag_is(tag)))
+                    {
+                        existing
+                    } else {
+                        let created = st.doc.create_element(tag);
+                        st.doc.append_child(nid, created);
+                        st.mark_dirty();
+                        created
+                    }
+                };
+                Ok(JsValue::Object(wrap_node(rt, &d, res)))
+            }),
+        );
+        let _ = rt.set_property(html_element_proto, mname, JsValue::Object(cf));
+    }
+
+    let d = dom.clone();
+    let create_tbody = rt.create_native_function(
+        "createTBody",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Null);
+            };
+            let tb = {
+                let mut st = d.borrow_mut();
+                let tb = st.doc.create_element("tbody");
+                st.doc.append_child(nid, tb);
+                st.mark_dirty();
+                tb
+            };
+            Ok(JsValue::Object(wrap_node(rt, &d, tb)))
+        }),
+    );
+    let _ = rt.set_property(html_element_proto, "createTBody", JsValue::Object(create_tbody));
+
+    for (mname, tag) in [
+        ("deleteTHead", "thead"),
+        ("deleteTFoot", "tfoot"),
+        ("deleteCaption", "caption"),
+    ] {
+        let d = dom.clone();
+        let df = rt.create_native_function(
+            mname,
+            0,
+            Rc::new(move |rt, this, _| {
+                let Some(nid) = node_id_of(rt, &this) else {
+                    return Ok(JsValue::Undefined);
+                };
+                let mut st = d.borrow_mut();
+                if let Some(existing) = st
+                    .doc
+                    .element_children(nid)
+                    .into_iter()
+                    .find(|&c| st.doc.element(c).map_or(false, |e| e.tag_is(tag)))
+                {
+                    st.doc.detach(existing);
+                    st.mark_dirty();
+                }
+                Ok(JsValue::Undefined)
+            }),
+        );
+        let _ = rt.set_property(html_element_proto, mname, JsValue::Object(df));
+    }
+
+    let d = dom.clone();
+    let get_rows = rt.create_native_function(
+        "get rows",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Object(rt.create_array(Vec::new())));
+            };
+            let rows = collect_table_rows(&d.borrow().doc, nid);
+            Ok(JsValue::Object(wrap_node_list(rt, &d, rows)))
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "rows", Some(get_rows), None);
+
+    let d = dom.clone();
+    let insert_row = rt.create_native_function(
+        "insertRow",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Null);
+            };
+            let idx = args
+                .first()
+                .filter(|v| !v.is_undefined())
+                .and_then(|v| rt.to_number(v).ok())
+                .map(|n| n as isize)
+                .unwrap_or(-1);
+            let tr = {
+                let mut st = d.borrow_mut();
+                let rows = collect_table_rows(&st.doc, nid);
+                let is_table = st.doc.element(nid).map_or(false, |e| e.tag_is("table"));
+                if idx < -1 || idx as usize > rows.len() {
+                    drop(st);
+                    return Err(throw_dom_exception(rt, &d, 1, "IndexSizeError", "row index out of bounds"));
+                }
+                let tr = st.doc.create_element("tr");
+                if idx == -1 || idx as usize == rows.len() {
+                    let parent = if is_table {
+                        st.doc
+                            .element_children(nid)
+                            .into_iter()
+                            .rfind(|&c| st.doc.element(c).map_or(false, |e| e.tag_is("tbody")))
+                            .unwrap_or_else(|| {
+                                let tb = st.doc.create_element("tbody");
+                                st.doc.append_child(nid, tb);
+                                tb
+                            })
+                    } else {
+                        nid
+                    };
+                    st.doc.append_child(parent, tr);
+                } else {
+                    let ref_tr = rows[idx as usize];
+                    let parent = st.doc.node(ref_tr).parent.unwrap_or(nid);
+                    st.doc.insert_before(parent, tr, Some(ref_tr));
+                }
+                st.mark_dirty();
+                tr
+            };
+            Ok(JsValue::Object(wrap_node(rt, &d, tr)))
+        }),
+    );
+    let _ = rt.set_property(html_element_proto, "insertRow", JsValue::Object(insert_row));
+
+    let d = dom.clone();
+    let delete_row = rt.create_native_function(
+        "deleteRow",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Undefined);
+            };
+            let idx = args
+                .first()
+                .and_then(|v| rt.to_number(v).ok())
+                .map(|n| n as isize)
+                .unwrap_or(-1);
+            let rows = collect_table_rows(&d.borrow().doc, nid);
+            let target = if idx == -1 {
+                rows.last().copied()
+            } else if idx >= 0 && (idx as usize) < rows.len() {
+                Some(rows[idx as usize])
+            } else {
+                return Err(throw_dom_exception(rt, &d, 1, "IndexSizeError", "row index out of bounds"));
+            };
+            if let Some(tr) = target {
+                let mut st = d.borrow_mut();
+                st.doc.detach(tr);
+                st.mark_dirty();
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let _ = rt.set_property(html_element_proto, "deleteRow", JsValue::Object(delete_row));
+
+    let d = dom.clone();
+    let get_cells = rt.create_native_function(
+        "get cells",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Object(rt.create_array(Vec::new())));
+            };
+            let cells: Vec<NodeId> = {
+                let st = d.borrow();
+                st.doc
+                    .element_children(nid)
+                    .into_iter()
+                    .filter(|&c| {
+                        st.doc
+                            .element(c)
+                            .map_or(false, |e| e.tag_is("td") || e.tag_is("th"))
+                    })
+                    .collect()
+            };
+            Ok(JsValue::Object(wrap_node_list(rt, &d, cells)))
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "cells", Some(get_cells), None);
+
+    let d = dom.clone();
+    let insert_cell = rt.create_native_function(
+        "insertCell",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Null);
+            };
+            let idx = args
+                .first()
+                .filter(|v| !v.is_undefined())
+                .and_then(|v| rt.to_number(v).ok())
+                .map(|n| n as isize)
+                .unwrap_or(-1);
+            let td = {
+                let mut st = d.borrow_mut();
+                let cells: Vec<NodeId> = st
+                    .doc
+                    .element_children(nid)
+                    .into_iter()
+                    .filter(|&c| {
+                        st.doc
+                            .element(c)
+                            .map_or(false, |e| e.tag_is("td") || e.tag_is("th"))
+                    })
+                    .collect();
+                if idx < -1 || idx as usize > cells.len() {
+                    drop(st);
+                    return Err(throw_dom_exception(rt, &d, 1, "IndexSizeError", "cell index out of bounds"));
+                }
+                let td = st.doc.create_element("td");
+                if idx == -1 || idx as usize == cells.len() {
+                    st.doc.append_child(nid, td);
+                } else {
+                    st.doc.insert_before(nid, td, Some(cells[idx as usize]));
+                }
+                st.mark_dirty();
+                td
+            };
+            Ok(JsValue::Object(wrap_node(rt, &d, td)))
+        }),
+    );
+    let _ = rt.set_property(html_element_proto, "insertCell", JsValue::Object(insert_cell));
+
+    let d = dom.clone();
+    let delete_cell = rt.create_native_function(
+        "deleteCell",
+        1,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Undefined);
+            };
+            let idx = args
+                .first()
+                .and_then(|v| rt.to_number(v).ok())
+                .map(|n| n as isize)
+                .unwrap_or(-1);
+            let cells: Vec<NodeId> = {
+                let st = d.borrow();
+                st.doc
+                    .element_children(nid)
+                    .into_iter()
+                    .filter(|&c| {
+                        st.doc
+                            .element(c)
+                            .map_or(false, |e| e.tag_is("td") || e.tag_is("th"))
+                    })
+                    .collect()
+            };
+            let target = if idx == -1 {
+                cells.last().copied()
+            } else if idx >= 0 && (idx as usize) < cells.len() {
+                Some(cells[idx as usize])
+            } else {
+                return Err(throw_dom_exception(rt, &d, 1, "IndexSizeError", "cell index out of bounds"));
+            };
+            if let Some(td) = target {
+                let mut st = d.borrow_mut();
+                st.doc.detach(td);
+                st.mark_dirty();
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let _ = rt.set_property(html_element_proto, "deleteCell", JsValue::Object(delete_cell));
+
+    let d = dom.clone();
+    let get_elements = rt.create_native_function(
+        "get elements",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Object(rt.create_array(Vec::new())));
+            };
+            let controls: Vec<(NodeId, Option<String>, Option<String>)> = {
+                let st = d.borrow();
+                st.doc
+                    .descendants(nid)
+                    .into_iter()
+                    .filter_map(|id| {
+                        let e = st.doc.element(id)?;
+                        if e.is_html()
+                            && matches!(
+                                e.tag_name.as_str(),
+                                "input" | "button" | "select" | "textarea" | "fieldset" | "output" | "object"
+                            )
+                        {
+                            Some((
+                                id,
+                                e.get_attr("name").map(|s| s.to_string()),
+                                e.get_attr("id").map(|s| s.to_string()),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+            let ids: Vec<NodeId> = controls.iter().map(|(id, _, _)| *id).collect();
+            let list = wrap_node_list(rt, &d, ids);
+            let mut by_name: std::collections::HashMap<String, Vec<NodeId>> =
+                std::collections::HashMap::new();
+            for (id, name_opt, id_opt) in controls {
+                if let Some(n) = name_opt {
+                    if !n.is_empty() {
+                        by_name.entry(n).or_default().push(id);
+                    }
+                }
+                if let Some(i) = id_opt {
+                    if !i.is_empty() {
+                        let entry = by_name.entry(i).or_default();
+                        if !entry.contains(&id) {
+                            entry.push(id);
+                        }
+                    }
+                }
+            }
+            for (k, v) in by_name {
+                if v.len() == 1 {
+                    let obj = wrap_node(rt, &d, v[0]);
+                    let _ = rt.set_property(list, &k, JsValue::Object(obj));
+                } else {
+                    let sub = wrap_node_list(rt, &d, v);
+                    let _ = rt.set_property(list, &k, JsValue::Object(sub));
+                }
+            }
+            Ok(JsValue::Object(list))
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "elements", Some(get_elements), None);
+
+    let d = dom.clone();
+    let get_options = rt.create_native_function(
+        "get options",
+        0,
+        Rc::new(move |rt, this, _| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Object(rt.create_array(Vec::new())));
+            };
+            let opts: Vec<NodeId> = {
+                let st = d.borrow();
+                st.doc
+                    .descendants(nid)
+                    .into_iter()
+                    .filter(|&id| st.doc.element(id).map_or(false, |e| e.tag_is("option")))
+                    .collect()
+            };
+            Ok(JsValue::Object(wrap_node_list(rt, &d, opts)))
+        }),
+    );
+    define_getter_setter(rt, html_element_proto, "options", Some(get_options), None);
+
+    let d = dom.clone();
+    let select_add = rt.create_native_function(
+        "add",
+        2,
+        Rc::new(move |rt, this, args| {
+            let Some(nid) = node_id_of(rt, &this) else {
+                return Ok(JsValue::Undefined);
+            };
+            let Some(opt) = args.first().and_then(|v| node_id_of(rt, v)) else {
+                return Ok(JsValue::Undefined);
+            };
+            let before = args.get(1).and_then(|v| node_id_of(rt, v));
+            let mut st = d.borrow_mut();
+            st.doc.insert_before(nid, opt, before);
+            st.mark_dirty();
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let _ = rt.set_property(html_element_proto, "add", JsValue::Object(select_add));
+}
+
+fn collect_table_rows(doc: &peedle_html::Document, container: NodeId) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    let is_table = doc.element(container).map_or(false, |e| e.tag_is("table"));
+    if !is_table {
+        for c in doc.element_children(container) {
+            if doc.element(c).map_or(false, |e| e.tag_is("tr")) {
+                out.push(c);
+            }
+        }
+        return out;
+    }
+    let mut head_rows = Vec::new();
+    let mut body_rows = Vec::new();
+    let mut foot_rows = Vec::new();
+    for c in doc.element_children(container) {
+        let Some(el) = doc.element(c) else {
+            continue;
+        };
+        match el.tag_name.as_str() {
+            "thead" => {
+                for r in doc.element_children(c) {
+                    if doc.element(r).map_or(false, |e| e.tag_is("tr")) {
+                        head_rows.push(r);
+                    }
+                }
+            }
+            "tbody" => {
+                for r in doc.element_children(c) {
+                    if doc.element(r).map_or(false, |e| e.tag_is("tr")) {
+                        body_rows.push(r);
+                    }
+                }
+            }
+            "tfoot" => {
+                for r in doc.element_children(c) {
+                    if doc.element(r).map_or(false, |e| e.tag_is("tr")) {
+                        foot_rows.push(r);
+                    }
+                }
+            }
+            "tr" => body_rows.push(c),
+            _ => {}
+        }
+    }
+    out.extend(head_rows);
+    out.extend(body_rows);
+    out.extend(foot_rows);
+    out
 }
 
 fn define_attr_prop(

@@ -32,6 +32,19 @@ fn local_dt_from_ms(ms: f64) -> Option<DateTime<Local>> {
     dt_from_ms(ms).map(|d| d.with_timezone(&Local))
 }
 
+fn make_local_ms(y: i32, m: i32, d: i32, h: i32, min: i32, s: i32, ms: i32) -> f64 {
+    let utc = make_utc_ms(y, m, d, h, min, s, ms);
+    if !utc.is_finite() {
+        return f64::NAN;
+    }
+    if let Some(dt) = dt_from_ms(utc) {
+        let off = Local.offset_from_utc_datetime(&dt.naive_utc());
+        let adj = utc - (off.local_minus_utc() as f64) * 1000.0;
+        return time_clip(adj);
+    }
+    time_clip(utc)
+}
+
 fn make_utc_ms(y: i32, m: i32, d: i32, h: i32, min: i32, s: i32, ms: i32) -> f64 {
     let total_months = y as i64 * 12 + m as i64;
     let year = total_months.div_euclid(12) as i32;
@@ -462,18 +475,342 @@ pub fn init(rt: &mut JsRuntime) {
         }),
     );
 
-    let sym_tp = rt.symbols.to_primitive;
-    set_symbol_method(
+    set_method(
         rt,
         proto,
-        sym_tp,
+        "toLocaleString",
+        0,
+        Rc::new(|rt, this, _| {
+            let ms = this_time(rt, &this)?;
+            let Some(dt) = local_dt_from_ms(ms) else {
+                return Ok(JsValue::String("Invalid Date".into()));
+            };
+            Ok(JsValue::String(dt.format("%m/%d/%Y, %H:%M:%S").to_string()))
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "toLocaleDateString",
+        0,
+        Rc::new(|rt, this, _| {
+            let ms = this_time(rt, &this)?;
+            let Some(dt) = local_dt_from_ms(ms) else {
+                return Ok(JsValue::String("Invalid Date".into()));
+            };
+            Ok(JsValue::String(dt.format("%m/%d/%Y").to_string()))
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "toLocaleTimeString",
+        0,
+        Rc::new(|rt, this, _| {
+            let ms = this_time(rt, &this)?;
+            let Some(dt) = local_dt_from_ms(ms) else {
+                return Ok(JsValue::String("Invalid Date".into()));
+            };
+            Ok(JsValue::String(dt.format("%H:%M:%S").to_string()))
+        }),
+    );
+
+    set_method(
+        rt,
+        proto,
+        "setMilliseconds",
+        1,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let ms = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            if !t.is_finite() || !ms.is_finite() {
+                return set_this_time(rt, &this, f64::NAN);
+            }
+            let Some(dt) = local_dt_from_ms(t) else {
+                return set_this_time(rt, &this, f64::NAN);
+            };
+            let new_t = make_local_ms(
+                dt.year(),
+                dt.month0() as i32,
+                dt.day() as i32,
+                dt.hour() as i32,
+                dt.minute() as i32,
+                dt.second() as i32,
+                ms.trunc() as i32,
+            );
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setUTCMilliseconds",
+        1,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let ms = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            if !t.is_finite() || !ms.is_finite() {
+                return set_this_time(rt, &this, f64::NAN);
+            }
+            let Some(dt) = dt_from_ms(t) else {
+                return set_this_time(rt, &this, f64::NAN);
+            };
+            let new_t = make_utc_ms(
+                dt.year(),
+                dt.month0() as i32,
+                dt.day() as i32,
+                dt.hour() as i32,
+                dt.minute() as i32,
+                dt.second() as i32,
+                ms.trunc() as i32,
+            );
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setSeconds",
+        2,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let sec = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            let ms_arg = match args.get(1) {
+                Some(v) => Some(rt.to_number(v)?),
+                None => None,
+            };
+            if !t.is_finite() || !sec.is_finite() || ms_arg.is_some_and(|m| !m.is_finite()) {
+                return set_this_time(rt, &this, f64::NAN);
+            }
+            let Some(dt) = local_dt_from_ms(t) else {
+                return set_this_time(rt, &this, f64::NAN);
+            };
+            let ms = ms_arg.map(|m| m.trunc() as i32).unwrap_or((dt.timestamp_subsec_millis() % 1000) as i32);
+            let new_t = make_local_ms(dt.year(), dt.month0() as i32, dt.day() as i32, dt.hour() as i32, dt.minute() as i32, sec.trunc() as i32, ms);
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setUTCSeconds",
+        2,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let sec = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            let ms_arg = match args.get(1) {
+                Some(v) => Some(rt.to_number(v)?),
+                None => None,
+            };
+            if !t.is_finite() || !sec.is_finite() || ms_arg.is_some_and(|m| !m.is_finite()) {
+                return set_this_time(rt, &this, f64::NAN);
+            }
+            let Some(dt) = dt_from_ms(t) else {
+                return set_this_time(rt, &this, f64::NAN);
+            };
+            let ms = ms_arg.map(|m| m.trunc() as i32).unwrap_or((dt.timestamp_subsec_millis() % 1000) as i32);
+            let new_t = make_utc_ms(dt.year(), dt.month0() as i32, dt.day() as i32, dt.hour() as i32, dt.minute() as i32, sec.trunc() as i32, ms);
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setMinutes",
+        3,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let min = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            let sec_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
+            let ms_arg = match args.get(2) { Some(v) => Some(rt.to_number(v)?), None => None };
+            if !t.is_finite() || !min.is_finite() || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
+                return set_this_time(rt, &this, f64::NAN);
+            }
+            let Some(dt) = local_dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
+            let sec = sec_arg.map(|x| x.trunc() as i32).unwrap_or(dt.second() as i32);
+            let ms = ms_arg.map(|x| x.trunc() as i32).unwrap_or((dt.timestamp_subsec_millis() % 1000) as i32);
+            let new_t = make_local_ms(dt.year(), dt.month0() as i32, dt.day() as i32, dt.hour() as i32, min.trunc() as i32, sec, ms);
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setUTCMinutes",
+        3,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let min = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            let sec_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
+            let ms_arg = match args.get(2) { Some(v) => Some(rt.to_number(v)?), None => None };
+            if !t.is_finite() || !min.is_finite() || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
+                return set_this_time(rt, &this, f64::NAN);
+            }
+            let Some(dt) = dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
+            let sec = sec_arg.map(|x| x.trunc() as i32).unwrap_or(dt.second() as i32);
+            let ms = ms_arg.map(|x| x.trunc() as i32).unwrap_or((dt.timestamp_subsec_millis() % 1000) as i32);
+            let new_t = make_utc_ms(dt.year(), dt.month0() as i32, dt.day() as i32, dt.hour() as i32, min.trunc() as i32, sec, ms);
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setHours",
+        4,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let hr = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            let min_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
+            let sec_arg = match args.get(2) { Some(v) => Some(rt.to_number(v)?), None => None };
+            let ms_arg = match args.get(3) { Some(v) => Some(rt.to_number(v)?), None => None };
+            if !t.is_finite() || !hr.is_finite() || min_arg.is_some_and(|x| !x.is_finite()) || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
+                return set_this_time(rt, &this, f64::NAN);
+            }
+            let Some(dt) = local_dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
+            let min = min_arg.map(|x| x.trunc() as i32).unwrap_or(dt.minute() as i32);
+            let sec = sec_arg.map(|x| x.trunc() as i32).unwrap_or(dt.second() as i32);
+            let ms = ms_arg.map(|x| x.trunc() as i32).unwrap_or((dt.timestamp_subsec_millis() % 1000) as i32);
+            let new_t = make_local_ms(dt.year(), dt.month0() as i32, dt.day() as i32, hr.trunc() as i32, min, sec, ms);
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setUTCHours",
+        4,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let hr = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            let min_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
+            let sec_arg = match args.get(2) { Some(v) => Some(rt.to_number(v)?), None => None };
+            let ms_arg = match args.get(3) { Some(v) => Some(rt.to_number(v)?), None => None };
+            if !t.is_finite() || !hr.is_finite() || min_arg.is_some_and(|x| !x.is_finite()) || sec_arg.is_some_and(|x| !x.is_finite()) || ms_arg.is_some_and(|x| !x.is_finite()) {
+                return set_this_time(rt, &this, f64::NAN);
+            }
+            let Some(dt) = dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
+            let min = min_arg.map(|x| x.trunc() as i32).unwrap_or(dt.minute() as i32);
+            let sec = sec_arg.map(|x| x.trunc() as i32).unwrap_or(dt.second() as i32);
+            let ms = ms_arg.map(|x| x.trunc() as i32).unwrap_or((dt.timestamp_subsec_millis() % 1000) as i32);
+            let new_t = make_utc_ms(dt.year(), dt.month0() as i32, dt.day() as i32, hr.trunc() as i32, min, sec, ms);
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setDate",
+        1,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let d = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            if !t.is_finite() || !d.is_finite() { return set_this_time(rt, &this, f64::NAN); }
+            let Some(dt) = local_dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
+            let new_t = make_local_ms(dt.year(), dt.month0() as i32, d.trunc() as i32, dt.hour() as i32, dt.minute() as i32, dt.second() as i32, (dt.timestamp_subsec_millis() % 1000) as i32);
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setUTCDate",
+        1,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let d = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            if !t.is_finite() || !d.is_finite() { return set_this_time(rt, &this, f64::NAN); }
+            let Some(dt) = dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
+            let new_t = make_utc_ms(dt.year(), dt.month0() as i32, d.trunc() as i32, dt.hour() as i32, dt.minute() as i32, dt.second() as i32, (dt.timestamp_subsec_millis() % 1000) as i32);
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setMonth",
+        2,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let m = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            let d_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
+            if !t.is_finite() || !m.is_finite() || d_arg.is_some_and(|x| !x.is_finite()) { return set_this_time(rt, &this, f64::NAN); }
+            let Some(dt) = local_dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
+            let d = d_arg.map(|x| x.trunc() as i32).unwrap_or(dt.day() as i32);
+            let new_t = make_local_ms(dt.year(), m.trunc() as i32, d, dt.hour() as i32, dt.minute() as i32, dt.second() as i32, (dt.timestamp_subsec_millis() % 1000) as i32);
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setUTCMonth",
+        2,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let m = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            let d_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
+            if !t.is_finite() || !m.is_finite() || d_arg.is_some_and(|x| !x.is_finite()) { return set_this_time(rt, &this, f64::NAN); }
+            let Some(dt) = dt_from_ms(t) else { return set_this_time(rt, &this, f64::NAN); };
+            let d = d_arg.map(|x| x.trunc() as i32).unwrap_or(dt.day() as i32);
+            let new_t = make_utc_ms(dt.year(), m.trunc() as i32, d, dt.hour() as i32, dt.minute() as i32, dt.second() as i32, (dt.timestamp_subsec_millis() % 1000) as i32);
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setFullYear",
+        3,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let y = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            let m_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
+            let d_arg = match args.get(2) { Some(v) => Some(rt.to_number(v)?), None => None };
+            if !y.is_finite() || m_arg.is_some_and(|x| !x.is_finite()) || d_arg.is_some_and(|x| !x.is_finite()) {
+                return set_this_time(rt, &this, f64::NAN);
+            }
+            let base = if t.is_finite() { t } else { 0.0 };
+            let Some(dt) = local_dt_from_ms(base) else { return set_this_time(rt, &this, f64::NAN); };
+            let m = m_arg.map(|x| x.trunc() as i32).unwrap_or(if t.is_finite() { dt.month0() as i32 } else { 0 });
+            let d = d_arg.map(|x| x.trunc() as i32).unwrap_or(if t.is_finite() { dt.day() as i32 } else { 1 });
+            let new_t = make_local_ms(y.trunc() as i32, m, d, if t.is_finite() { dt.hour() as i32 } else { 0 }, if t.is_finite() { dt.minute() as i32 } else { 0 }, if t.is_finite() { dt.second() as i32 } else { 0 }, if t.is_finite() { (dt.timestamp_subsec_millis() % 1000) as i32 } else { 0 });
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+    set_method(
+        rt,
+        proto,
+        "setUTCFullYear",
+        3,
+        Rc::new(|rt, this, args| {
+            let t = this_time(rt, &this)?;
+            let y = rt.to_number(args.first().unwrap_or(&JsValue::Undefined))?;
+            let m_arg = match args.get(1) { Some(v) => Some(rt.to_number(v)?), None => None };
+            let d_arg = match args.get(2) { Some(v) => Some(rt.to_number(v)?), None => None };
+            if !y.is_finite() || m_arg.is_some_and(|x| !x.is_finite()) || d_arg.is_some_and(|x| !x.is_finite()) {
+                return set_this_time(rt, &this, f64::NAN);
+            }
+            let base = if t.is_finite() { t } else { 0.0 };
+            let Some(dt) = dt_from_ms(base) else { return set_this_time(rt, &this, f64::NAN); };
+            let m = m_arg.map(|x| x.trunc() as i32).unwrap_or(if t.is_finite() { dt.month0() as i32 } else { 0 });
+            let d = d_arg.map(|x| x.trunc() as i32).unwrap_or(if t.is_finite() { dt.day() as i32 } else { 1 });
+            let new_t = make_utc_ms(y.trunc() as i32, m, d, if t.is_finite() { dt.hour() as i32 } else { 0 }, if t.is_finite() { dt.minute() as i32 } else { 0 }, if t.is_finite() { dt.second() as i32 } else { 0 }, if t.is_finite() { (dt.timestamp_subsec_millis() % 1000) as i32 } else { 0 });
+            set_this_time(rt, &this, new_t)
+        }),
+    );
+
+    let sym_tp = rt.symbols.to_primitive;
+    let tp_fn = rt.create_native_function(
         "[Symbol.toPrimitive]",
         1,
         Rc::new(|rt, this, args| {
             let JsValue::Object(oid) = this else {
                 return Err(JsError::type_err("Date[Symbol.toPrimitive] called on non-object"));
             };
-            let hint = rt.to_string(args.first().unwrap_or(&JsValue::Undefined))?;
+            let Some(JsValue::String(hint)) = args.first() else {
+                return Err(JsError::type_err("Invalid hint for Date[Symbol.toPrimitive]"));
+            };
             let order = match hint.as_str() {
                 "string" | "default" => ["toString", "valueOf"],
                 "number" => ["valueOf", "toString"],
@@ -491,22 +828,25 @@ pub fn init(rt: &mut JsRuntime) {
             Err(JsError::type_err("Cannot convert Date to primitive"))
         }),
     );
+    rt.heap.get_obj_mut(proto).set_own_prop(
+        PropertyKey::Symbol(sym_tp),
+        PropEntry::data(JsValue::Object(tp_fn), false, false, true),
+    );
+    let _ = set_symbol_method;
 
-    let ctor = rt.create_native_constructor(
+    let ctor = rt.create_spec_constructor(
         "Date",
         7,
         proto,
-        Rc::new(|rt, this, args| {
-            let is_new = matches!(
-                this,
-                JsValue::Object(oid) if rt.heap.get_obj(oid).prototype == Some(rt.intrinsics.date_proto)
-            );
+        Rc::new(|rt, _, args| {
+            let is_new = matches!(&rt.native_new_target, Some(nt) if !nt.is_undefined());
             if !is_new {
                 let dt = Local::now();
                 return Ok(JsValue::String(
                     dt.format("%a %b %d %Y %H:%M:%S GMT%z").to_string(),
                 ));
             }
+            let obj_proto = rt.get_prototype_from_new_target(rt.intrinsics.date_proto)?;
             let ms = if args.is_empty() {
                 now_ms()
             } else if args.len() == 1 {
@@ -574,7 +914,7 @@ pub fn init(rt: &mut JsRuntime) {
                 }
             };
             let obj = rt.heap.alloc_object(JsObject::new(
-                Some(rt.intrinsics.date_proto),
+                Some(obj_proto),
                 ObjectKind::Date(ms),
             ));
             Ok(JsValue::Object(obj))

@@ -100,6 +100,7 @@ fn wpt_float_wrapping_and_clear() {
     let f2 = tree.bounding_rect(doc.get_element_by_id("f2").unwrap()).unwrap();
     let f3 = tree.bounding_rect(doc.get_element_by_id("f3").unwrap()).unwrap();
     let clr = tree.bounding_rect(doc.get_element_by_id("clr").unwrap()).unwrap();
+    assert!((f1.x - 0.0).abs() < 1.0 && (f1.y - 0.0).abs() < 1.0, "f1={:?}", f1);
     assert!((f2.x - 90.0).abs() < 1.0);
     assert!((f3.x - 0.0).abs() < 1.0 && (f3.y - 50.0).abs() < 1.0, "f3={:?}", f3);
     assert!(clr.y >= 100.0 - 0.5, "clr={:?}", clr);

@@ -10,6 +10,128 @@ use std::rc::Rc;
 pub fn init(rt: &mut JsRuntime) {
     let proto = rt.intrinsics.function_proto;
 
+    let caller_get = rt.create_native_function(
+        "get caller",
+        0,
+        Rc::new(|rt, this, _| {
+            let JsValue::Object(oid) = this else {
+                return Err(JsError::type_err(
+                    "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions",
+                ));
+            };
+            let is_sloppy_plain = match &rt.heap.get_obj(oid).kind {
+                ObjectKind::Function(f) => {
+                    !f.strict
+                        && !f.is_arrow
+                        && !f.is_generator
+                        && !f.is_async
+                        && !f.is_class_ctor
+                        && f.bound_target.is_none()
+                }
+                _ => false,
+            };
+            if !is_sloppy_plain {
+                return Err(JsError::type_err(
+                    "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions",
+                ));
+            }
+            if let Some(pos) = rt.call_stack_callees.iter().rposition(|&id| id == oid) {
+                if pos > 0 {
+                    let caller_id = rt.call_stack_callees[pos - 1];
+                    let caller_restricted = match &rt.heap.get_obj(caller_id).kind {
+                        ObjectKind::Function(f) => {
+                            f.strict || f.is_async || f.is_generator || f.is_class_ctor
+                        }
+                        _ => true,
+                    };
+                    if caller_restricted {
+                        return Err(JsError::type_err(
+                            "'caller' property cannot be accessed when caller is a strict function",
+                        ));
+                    }
+                    return Ok(JsValue::Object(caller_id));
+                }
+            }
+            Ok(JsValue::Null)
+        }),
+    );
+    let restricted_set = rt.create_native_function(
+        "",
+        0,
+        Rc::new(|rt, this, _| {
+            let is_sloppy_plain = match this {
+                JsValue::Object(oid) => match &rt.heap.get_obj(oid).kind {
+                    ObjectKind::Function(f) => {
+                        !f.strict
+                            && !f.is_arrow
+                            && !f.is_generator
+                            && !f.is_async
+                            && !f.is_class_ctor
+                            && f.bound_target.is_none()
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !is_sloppy_plain {
+                return Err(JsError::type_err(
+                    "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions",
+                ));
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    let args_get = rt.create_native_function(
+        "get arguments",
+        0,
+        Rc::new(|rt, this, _| {
+            let is_sloppy_plain = match this {
+                JsValue::Object(oid) => match &rt.heap.get_obj(oid).kind {
+                    ObjectKind::Function(f) => {
+                        !f.strict
+                            && !f.is_arrow
+                            && !f.is_generator
+                            && !f.is_async
+                            && !f.is_class_ctor
+                            && f.bound_target.is_none()
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !is_sloppy_plain {
+                return Err(JsError::type_err(
+                    "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions",
+                ));
+            }
+            Ok(JsValue::Null)
+        }),
+    );
+    let _ = rt.define_property(
+        proto,
+        PropertyKey::from("caller"),
+        PropertyDescriptor {
+            value: None,
+            writable: None,
+            get: Some(JsValue::Object(caller_get)),
+            set: Some(JsValue::Object(restricted_set)),
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    );
+    let _ = rt.define_property(
+        proto,
+        PropertyKey::from("arguments"),
+        PropertyDescriptor {
+            value: None,
+            writable: None,
+            get: Some(JsValue::Object(args_get)),
+            set: Some(JsValue::Object(restricted_set)),
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    );
+
     set_method(
         rt,
         proto,
@@ -157,10 +279,7 @@ pub fn init(rt: &mut JsRuntime) {
     );
 
     let sym_has_inst = rt.symbols.has_instance;
-    set_symbol_method(
-        rt,
-        proto,
-        sym_has_inst,
+    let has_inst_fn = rt.create_native_function(
         "[Symbol.hasInstance]",
         1,
         Rc::new(|rt, this, args| {
@@ -194,8 +313,13 @@ pub fn init(rt: &mut JsRuntime) {
             Ok(JsValue::Boolean(false))
         }),
     );
+    rt.heap.get_obj_mut(proto).set_own_prop(
+        PropertyKey::Symbol(sym_has_inst),
+        PropEntry::data(JsValue::Object(has_inst_fn), false, false, false),
+    );
+    let _ = set_symbol_method;
 
-    let ctor = rt.create_native_constructor(
+    let ctor = rt.create_spec_constructor(
         "Function",
         1,
         proto,
@@ -212,10 +336,15 @@ pub fn init(rt: &mut JsRuntime) {
                 let body = rt.to_string(&args[args.len() - 1])?;
                 (params.join(","), body)
             };
+            let target_proto = rt.get_prototype_from_new_target(rt.intrinsics.function_proto)?;
             let src = format!("(function anonymous({}) {{\n{}\n}})", params_str, body_str);
             let program = Parser::parse_script(&src)?;
             let chunk = Compiler::compile_program(&program)?;
-            rt.exec_script_chunk(chunk, rt.global_env, program.strict)
+            let res = rt.exec_script_chunk(chunk, rt.global_env, program.strict)?;
+            if let JsValue::Object(fn_id) = res {
+                rt.heap.get_obj_mut(fn_id).prototype = Some(target_proto);
+            }
+            Ok(res)
         }),
     );
 

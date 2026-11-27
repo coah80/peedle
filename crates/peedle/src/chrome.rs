@@ -1,10 +1,17 @@
+use peedle_css::get_computed_property;
 use peedle_engine::Page;
 use peedle_render::{FontFaceKey, FontSystem, Framebuffer, RgbaColor};
 
 pub const TAB_BAR_H: f32 = 34.0;
 pub const TOOLBAR_H: f32 = 42.0;
-pub const CHROME_H: f32 = TAB_BAR_H + TOOLBAR_H;
+pub const BOOKMARK_BAR_H: f32 = 28.0;
 pub const DEVTOOLS_H: f32 = 220.0;
+
+#[derive(Clone, Debug)]
+pub struct Bookmark {
+    pub title: String,
+    pub url: String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DevToolsTab {
@@ -22,9 +29,12 @@ pub enum ChromeHit {
     Forward,
     Reload,
     Omnibox,
+    ToggleBookmark,
+    BookmarkItem(usize),
     ToggleDevTools,
     DevToolsTab(DevToolsTab),
     ConsoleInput,
+    FindInput,
     Content,
     None,
 }
@@ -36,6 +46,12 @@ pub struct ChromeState {
     pub devtools_tab: DevToolsTab,
     pub console_input: String,
     pub console_focused: bool,
+    pub bookmarks_visible: bool,
+    pub bookmarks: Vec<Bookmark>,
+    pub find_open: bool,
+    pub find_query: String,
+    pub find_match_count: usize,
+    pub find_match_index: usize,
 }
 
 impl Default for ChromeState {
@@ -47,13 +63,40 @@ impl Default for ChromeState {
             devtools_tab: DevToolsTab::Elements,
             console_input: String::new(),
             console_focused: false,
+            bookmarks_visible: true,
+            bookmarks: vec![
+                Bookmark {
+                    title: "Example".to_string(),
+                    url: "https://example.com".to_string(),
+                },
+                Bookmark {
+                    title: "Hacker News".to_string(),
+                    url: "https://news.ycombinator.com".to_string(),
+                },
+                Bookmark {
+                    title: "Wikipedia".to_string(),
+                    url: "https://en.wikipedia.org/wiki/Web_browser".to_string(),
+                },
+                Bookmark {
+                    title: "About Peedle".to_string(),
+                    url: "peedle://about".to_string(),
+                },
+            ],
+            find_open: false,
+            find_query: String::new(),
+            find_match_count: 0,
+            find_match_index: 0,
         }
     }
 }
 
-pub fn content_viewport_height(window_h: f32, devtools_open: bool) -> f32 {
-    let dt = if devtools_open { DEVTOOLS_H } else { 0.0 };
-    (window_h - CHROME_H - dt).max(100.0)
+pub fn top_chrome_height(chrome: &ChromeState) -> f32 {
+    TAB_BAR_H + TOOLBAR_H + if chrome.bookmarks_visible { BOOKMARK_BAR_H } else { 0.0 }
+}
+
+pub fn content_viewport_height(window_h: f32, chrome: &ChromeState) -> f32 {
+    let dt = if chrome.devtools_open { DEVTOOLS_H } else { 0.0 };
+    (window_h - top_chrome_height(chrome) - dt).max(100.0)
 }
 
 pub fn hit_test_chrome(
@@ -62,7 +105,7 @@ pub fn hit_test_chrome(
     win_w: f32,
     win_h: f32,
     tab_count: usize,
-    devtools_open: bool,
+    chrome: &ChromeState,
 ) -> ChromeHit {
     if y < TAB_BAR_H {
         let tab_w = ((win_w - 60.0) / tab_count.max(1) as f32).clamp(90.0, 200.0);
@@ -83,7 +126,8 @@ pub fn hit_test_chrome(
         return ChromeHit::None;
     }
 
-    if y < CHROME_H {
+    let toolbar_end = TAB_BAR_H + TOOLBAR_H;
+    if y < toolbar_end {
         if x >= 8.0 && x < 36.0 {
             return ChromeHit::Back;
         }
@@ -97,13 +141,39 @@ pub fn hit_test_chrome(
         if x >= dt_x && x < win_w - 8.0 {
             return ChromeHit::ToggleDevTools;
         }
-        if x >= 108.0 && x < dt_x - 8.0 {
+        let star_x = dt_x - 38.0;
+        if x >= star_x && x < dt_x - 8.0 {
+            return ChromeHit::ToggleBookmark;
+        }
+        if x >= 108.0 && x < star_x {
             return ChromeHit::Omnibox;
         }
         return ChromeHit::None;
     }
 
-    if devtools_open {
+    let top_h = top_chrome_height(chrome);
+    if chrome.bookmarks_visible && y < top_h {
+        let mut bx = 12.0;
+        for (i, bm) in chrome.bookmarks.iter().enumerate() {
+            let bw = (bm.title.chars().count() as f32 * 7.2 + 20.0).clamp(52.0, 150.0);
+            if x >= bx && x < bx + bw {
+                return ChromeHit::BookmarkItem(i);
+            }
+            bx += bw + 6.0;
+        }
+        return ChromeHit::None;
+    }
+
+    if chrome.find_open {
+        let fw = 280.0;
+        let fx = win_w - fw - 16.0;
+        let fy = top_h + 8.0;
+        if x >= fx && x <= fx + fw && y >= fy && y <= fy + 32.0 {
+            return ChromeHit::FindInput;
+        }
+    }
+
+    if chrome.devtools_open {
         let dt_top = win_h - DEVTOOLS_H;
         if y >= dt_top {
             if y < dt_top + 28.0 {
@@ -143,6 +213,7 @@ pub fn draw_chrome(
     let bg_tab_inactive = RgbaColor::new(19, 24, 33, 255);
     let border_c = RgbaColor::new(40, 50, 68, 255);
     let accent = RgbaColor::new(56, 189, 248, 255);
+    let gold = RgbaColor::new(250, 204, 21, 255);
     let text_hi = RgbaColor::new(235, 241, 248, 255);
     let text_dim = RgbaColor::new(148, 163, 184, 255);
 
@@ -187,8 +258,9 @@ pub fn draw_chrome(
     fb.fill_rounded_rect(plus_x, 7.0, 24.0, 22.0, [6.0; 4], bg_tab_inactive);
     fonts.draw_text(fb, "+", plus_x + 7.0, 22.0, FontFaceKey::SansBold, 14.0, text_dim);
 
+    let toolbar_end = TAB_BAR_H + TOOLBAR_H;
     fb.fill_rect(0.0, TAB_BAR_H, w, TOOLBAR_H, bg_bar);
-    fb.fill_rect(0.0, CHROME_H - 1.0, w, 1.0, border_c);
+    fb.fill_rect(0.0, toolbar_end - 1.0, w, 1.0, border_c);
 
     let page = &tabs[active_tab];
     draw_nav_button(fb, fonts, 8.0, TAB_BAR_H + 7.0, "<", page.can_go_back());
@@ -225,7 +297,7 @@ pub fn draw_chrome(
     let text_x = omni_x + 42.0;
     let shown = truncate_chars(
         &chrome.omnibox_text,
-        ((omni_w - 56.0) / 7.5).max(10.0) as usize,
+        ((omni_w - 86.0) / 7.5).max(10.0) as usize,
     );
     let end_x = fonts.draw_text(
         fb,
@@ -239,6 +311,17 @@ pub fn draw_chrome(
     if chrome.omnibox_focused {
         fb.fill_rect(end_x + 1.0, omni_y + 6.0, 1.5, 18.0, accent);
     }
+
+    let is_bookmarked = chrome.bookmarks.iter().any(|b| b.url == page.url);
+    fonts.draw_text(
+        fb,
+        if is_bookmarked { "*" } else { "+" },
+        dt_x - 28.0,
+        omni_y + 20.5,
+        FontFaceKey::MonoBold,
+        14.0,
+        if is_bookmarked { gold } else { text_dim },
+    );
 
     let dt_bg = if chrome.devtools_open {
         RgbaColor::new(30, 58, 95, 255)
@@ -255,6 +338,60 @@ pub fn draw_chrome(
         11.0,
         if chrome.devtools_open { accent } else { text_dim },
     );
+
+    let top_h = top_chrome_height(chrome);
+    if chrome.bookmarks_visible {
+        fb.fill_rect(0.0, toolbar_end, w, BOOKMARK_BAR_H, RgbaColor::new(19, 24, 33, 255));
+        fb.fill_rect(0.0, top_h - 1.0, w, 1.0, border_c);
+        let mut bx = 12.0;
+        for bm in &chrome.bookmarks {
+            let label = truncate_chars(&bm.title, 18);
+            let bw = (label.chars().count() as f32 * 7.2 + 20.0).clamp(52.0, 150.0);
+            if bx + bw > w - 12.0 {
+                break;
+            }
+            fb.fill_rounded_rect(bx, toolbar_end + 4.0, bw, 20.0, [5.0; 4], RgbaColor::new(28, 35, 48, 255));
+            fonts.draw_text(
+                fb,
+                &label,
+                bx + 10.0,
+                toolbar_end + 17.5,
+                FontFaceKey::SansRegular,
+                11.5,
+                text_dim,
+            );
+            bx += bw + 6.0;
+        }
+    }
+
+    let vh = content_viewport_height(h, chrome);
+    let content_h = page.js_env.dom.borrow().layout.content_height;
+    if content_h > vh + 1.0 {
+        let track_h = vh - 8.0;
+        let thumb_h = ((vh / content_h) * track_h).clamp(24.0, track_h);
+        let max_scroll = (content_h - vh).max(1.0);
+        let thumb_y = top_h + 4.0 + (page.scroll_y / max_scroll) * (track_h - thumb_h);
+        fb.fill_rounded_rect(w - 9.0, thumb_y, 6.0, thumb_h, [3.0; 4], RgbaColor::new(100, 116, 139, 175));
+    }
+
+    if chrome.find_open {
+        let fw = 280.0;
+        let fx = w - fw - 16.0;
+        let fy = top_h + 8.0;
+        fb.fill_rounded_rect(fx, fy, fw, 32.0, [8.0; 4], RgbaColor::new(19, 24, 33, 245));
+        fb.stroke_rounded_rect(fx, fy, fw, 32.0, [8.0; 4], [1.0; 4], [accent; 4]);
+        let q = truncate_chars(&chrome.find_query, 24);
+        let end = fonts.draw_text(fb, &q, fx + 10.0, fy + 20.0, FontFaceKey::SansRegular, 12.5, text_hi);
+        fb.fill_rect(end + 1.0, fy + 8.0, 1.5, 16.0, accent);
+        let counter = if chrome.find_query.is_empty() {
+            String::new()
+        } else if chrome.find_match_count == 0 {
+            "0/0".to_string()
+        } else {
+            format!("{}/{}", chrome.find_match_index + 1, chrome.find_match_count)
+        };
+        fonts.draw_text(fb, &counter, fx + fw - 48.0, fy + 20.0, FontFaceKey::MonoRegular, 11.0, text_dim);
+    }
 
     if let Some(ref href) = page.hovered_href {
         let dt_off = if chrome.devtools_open { DEVTOOLS_H } else { 0.0 };
@@ -334,17 +471,44 @@ fn draw_devtools(
     let max_y = top + h - 36.0;
     match tab {
         DevToolsTab::Elements => {
+            let split_x = (w * 0.58).max(260.0);
             let mut lines = Vec::new();
             let st = page.js_env.dom.borrow();
             if let Some(root_el) = st.doc.document_element() {
-                collect_dom_lines(&st.doc, root_el, 0, &mut lines, 12);
+                collect_dom_lines(&st.doc, root_el, 0, &mut lines, 10);
             }
             for line in lines {
-                if y > max_y {
+                if y > max_y + 20.0 {
                     break;
                 }
-                fonts.draw_text(fb, &truncate_chars(&line, 110), 12.0, y, FontFaceKey::MonoRegular, 11.5, text_hi);
+                fonts.draw_text(fb, &truncate_chars(&line, 66), 12.0, y, FontFaceKey::MonoRegular, 11.5, text_hi);
                 y += 16.0;
+            }
+            fb.fill_rect(split_x, top + 28.0, 1.0, h - 28.0, border);
+            let inspect_node = page.hovered_node.or_else(|| st.doc.body());
+            let mut sy = top + 46.0;
+            if let Some(nid) = inspect_node {
+                if let Some(el) = st.doc.element(nid) {
+                    let hdr = format!("<{}> computed", el.tag_name);
+                    fonts.draw_text(fb, &hdr, split_x + 12.0, sy, FontFaceKey::MonoBold, 11.5, accent);
+                    sy += 18.0;
+                }
+                if let Some(r) = st.layout.bounding_rect(nid) {
+                    let box_line = format!("box: {:.0}x{:.0} @ ({:.0}, {:.0})", r.width, r.height, r.x, r.y);
+                    fonts.draw_text(fb, &box_line, split_x + 12.0, sy, FontFaceKey::MonoRegular, 11.0, text_dim);
+                    sy += 16.0;
+                }
+                if let Some(cs) = st.styles.get(nid) {
+                    for prop in ["display", "position", "color", "background-color", "font-size", "margin", "padding"] {
+                        if sy > top + h - 10.0 {
+                            break;
+                        }
+                        let val = get_computed_property(cs, prop);
+                        let row = format!("{}: {}", prop, truncate_chars(&val, 34));
+                        fonts.draw_text(fb, &row, split_x + 12.0, sy, FontFaceKey::MonoRegular, 11.0, text_hi);
+                        sy += 15.0;
+                    }
+                }
             }
         }
         DevToolsTab::Console => {
@@ -378,7 +542,7 @@ fn draw_devtools(
         }
         DevToolsTab::Network => {
             for entry in page.network_log.iter().take(10) {
-                if y > max_y {
+                if y > max_y + 20.0 {
                     break;
                 }
                 let row = format!(
@@ -409,7 +573,7 @@ fn collect_dom_lines(
             s.push_str(&format!(" id=\"{}\"", id_attr));
         }
         if let Some(cls) = el.get_attr("class") {
-            s.push_str(&format!(" class=\"{}\"", truncate_chars(cls, 28)));
+            s.push_str(&format!(" class=\"{}\"", truncate_chars(cls, 24)));
         }
         s.push('>');
         out.push(s);

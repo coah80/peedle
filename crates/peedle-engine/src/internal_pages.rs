@@ -140,12 +140,14 @@ const ABOUT_HTML: &str = r##"<!DOCTYPE html>
   <div class="card">
     <h1>Peedle 0.1.0</h1>
     <table>
-      <tr><td class="k">HTML Engine</td><td class="v">peedle-html (WHATWG HTML5)</td></tr>
-      <tr><td class="k">CSS Engine</td><td class="v">peedle-css (CSS3/4 + Selectors L4)</td></tr>
+      <tr><td class="k">URL Engine</td><td class="v">peedle-url (WHATWG URL, 100% WPT parser &amp; setters)</td></tr>
+      <tr><td class="k">HTML Engine</td><td class="v">peedle-html (WHATWG HTML5, 100% html5lib tree-construction)</td></tr>
+      <tr><td class="k">CSS Engine</td><td class="v">peedle-css (CSS3/4 Cascade, Nesting, Selectors L4)</td></tr>
       <tr><td class="k">Layout Engine</td><td class="v">peedle-layout (Block, Inline, Float, Flex, Grid, Table)</td></tr>
-      <tr><td class="k">JS Engine</td><td class="v">peedle-js (ES2024 Bytecode VM)</td></tr>
+      <tr><td class="k">JS Engine</td><td class="v">peedle-js (ES2024 Bytecode VM, GC, RegExp, Promises, Proxy)</td></tr>
+      <tr><td class="k">DOM &amp; Web APIs</td><td class="v">peedle-dom (DOM L4, Events, Canvas2D, Fetch, Storage, Crypto)</td></tr>
       <tr><td class="k">Renderer</td><td class="v">peedle-render (Software AA 2D + Fontdue + SVG + Canvas2D)</td></tr>
-      <tr><td class="k">Networking</td><td class="v">peedle-net (HTTP/1.1 + rustls TLS + WebSockets)</td></tr>
+      <tr><td class="k">Networking</td><td class="v">peedle-net (HTTP/1.1 + rustls TLS + Cookies + WebSockets)</td></tr>
     </table>
   </div>
 </body>

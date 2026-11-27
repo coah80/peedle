@@ -8,6 +8,10 @@ use peedle_url::Url;
 use crate::events::{build_event_object, define_getter_setter};
 use crate::nodes::{node_id_of, wrap_node, wrap_node_list, wrap_node_opt};
 use crate::state::{RangeData, SharedDom};
+use crate::traversal::{
+    define_full_range_proto, is_valid_xml_name, throw_dom_exception, NodeIteratorData,
+    TreeWalkerData,
+};
 
 pub fn define_document_proto(
     rt: &mut JsRuntime,
@@ -262,9 +266,27 @@ pub fn define_document_proto(
     let create_el = rt.create_native_function(
         "createElement",
         1,
-        Rc::new(move |rt, _, args| {
+        Rc::new(move |rt, this, args| {
             let tag = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
-            let nid = d.borrow_mut().doc.create_element(tag);
+            if !is_valid_xml_name(&tag) {
+                return Err(throw_dom_exception(
+                    rt,
+                    &d,
+                    5,
+                    "InvalidCharacterError",
+                    "Invalid tag name",
+                ));
+            }
+            let is_xml = node_id_of(rt, &this)
+                .map_or(false, |doc_id| d.borrow().xml_documents.contains(&doc_id));
+            let nid = if is_xml {
+                let mut st = d.borrow_mut();
+                let id = st.doc.create_element_ns(tag, Namespace::Html, Vec::new());
+                st.xml_elements.insert(id);
+                id
+            } else {
+                d.borrow_mut().doc.create_element(tag)
+            };
             Ok(JsValue::Object(wrap_node(rt, &d, nid)))
         }),
     );
@@ -275,19 +297,178 @@ pub fn define_document_proto(
         "createElementNS",
         2,
         Rc::new(move |rt, _, args| {
-            let ns_uri = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
-            let tag = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
-            let ns = Namespace::from_uri(&ns_uri);
-            let final_tag = if ns == Namespace::Html {
-                tag.to_ascii_lowercase()
+            let ns_arg = args.first().cloned().unwrap_or(JsValue::Null);
+            let ns_uri = if ns_arg.is_nullish() {
+                String::new()
             } else {
-                tag
+                rt.to_string(&ns_arg)?
             };
-            let nid = d.borrow_mut().doc.create_element_ns(final_tag, ns, Vec::new());
+            let tag = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            if !is_valid_xml_name(&tag) {
+                return Err(throw_dom_exception(
+                    rt,
+                    &d,
+                    5,
+                    "InvalidCharacterError",
+                    "Invalid qualified name",
+                ));
+            }
+            if let Some(colon) = tag.find(':') {
+                let prefix = &tag[..colon];
+                let local = &tag[colon + 1..];
+                if prefix.is_empty() || local.is_empty() || local.contains(':') {
+                    return Err(throw_dom_exception(
+                        rt,
+                        &d,
+                        14,
+                        "NamespaceError",
+                        "Invalid qualified name",
+                    ));
+                }
+                if ns_uri.is_empty() {
+                    return Err(throw_dom_exception(
+                        rt,
+                        &d,
+                        14,
+                        "NamespaceError",
+                        "Prefix requires non-null namespace",
+                    ));
+                }
+                if prefix == "xml" && ns_uri != "http://www.w3.org/XML/1998/namespace" {
+                    return Err(throw_dom_exception(
+                        rt,
+                        &d,
+                        14,
+                        "NamespaceError",
+                        "xml prefix requires XML namespace",
+                    ));
+                }
+                if (prefix == "xmlns" || tag == "xmlns")
+                    && ns_uri != "http://www.w3.org/2000/xmlns/"
+                {
+                    return Err(throw_dom_exception(
+                        rt,
+                        &d,
+                        14,
+                        "NamespaceError",
+                        "xmlns requires XMLNS namespace",
+                    ));
+                }
+            } else if tag == "xmlns" && ns_uri != "http://www.w3.org/2000/xmlns/" {
+                return Err(throw_dom_exception(
+                    rt,
+                    &d,
+                    14,
+                    "NamespaceError",
+                    "xmlns requires XMLNS namespace",
+                ));
+            }
+            let is_html_ns = ns_uri == "http://www.w3.org/1999/xhtml";
+            let ns = if ns_uri.is_empty() {
+                Namespace::Html
+            } else {
+                Namespace::from_uri(&ns_uri)
+            };
+            let mut st = d.borrow_mut();
+            let nid = st.doc.create_element_ns(tag, ns, Vec::new());
+            if !is_html_ns {
+                st.xml_elements.insert(nid);
+            }
+            drop(st);
             Ok(JsValue::Object(wrap_node(rt, &d, nid)))
         }),
     );
     let _ = rt.set_property(doc_proto, "createElementNS", JsValue::Object(create_el_ns));
+
+    let d = dom.clone();
+    let create_pi = rt.create_native_function(
+        "createProcessingInstruction",
+        2,
+        Rc::new(move |rt, _, args| {
+            let target = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let data = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            if !is_valid_xml_name(&target) || data.contains("?>") {
+                return Err(throw_dom_exception(
+                    rt,
+                    &d,
+                    5,
+                    "InvalidCharacterError",
+                    "Invalid processing instruction",
+                ));
+            }
+            let nid = d.borrow_mut().doc.create_processing_instruction(target, data);
+            Ok(JsValue::Object(wrap_node(rt, &d, nid)))
+        }),
+    );
+    let _ = rt.set_property(
+        doc_proto,
+        "createProcessingInstruction",
+        JsValue::Object(create_pi),
+    );
+
+    let d = dom.clone();
+    let create_ni = rt.create_native_function(
+        "createNodeIterator",
+        1,
+        Rc::new(move |rt, _, args| {
+            let Some(root) = args.first().and_then(|v| node_id_of(rt, v)) else {
+                return Err(JsError::type_err("createNodeIterator requires root Node"));
+            };
+            let what_to_show = args
+                .get(1)
+                .filter(|v| !v.is_undefined())
+                .and_then(|v| rt.to_number(v).ok())
+                .map(|n| (n as i64) as u32)
+                .unwrap_or(0xFFFF_FFFF);
+            let filter = args.get(2).cloned().unwrap_or(JsValue::Null);
+            let proto = d.borrow().protos.unwrap().node_iterator_proto;
+            let obj = rt.create_object_with_proto(Some(proto));
+            rt.set_host_data(
+                obj,
+                NodeIteratorData {
+                    root,
+                    what_to_show,
+                    filter,
+                    reference: root,
+                    pointer_before: true,
+                    detached: false,
+                },
+            );
+            Ok(JsValue::Object(obj))
+        }),
+    );
+    let _ = rt.set_property(doc_proto, "createNodeIterator", JsValue::Object(create_ni));
+
+    let d = dom.clone();
+    let create_tw = rt.create_native_function(
+        "createTreeWalker",
+        1,
+        Rc::new(move |rt, _, args| {
+            let Some(root) = args.first().and_then(|v| node_id_of(rt, v)) else {
+                return Err(JsError::type_err("createTreeWalker requires root Node"));
+            };
+            let what_to_show = args
+                .get(1)
+                .filter(|v| !v.is_undefined())
+                .and_then(|v| rt.to_number(v).ok())
+                .map(|n| (n as i64) as u32)
+                .unwrap_or(0xFFFF_FFFF);
+            let filter = args.get(2).cloned().unwrap_or(JsValue::Null);
+            let proto = d.borrow().protos.unwrap().tree_walker_proto;
+            let obj = rt.create_object_with_proto(Some(proto));
+            rt.set_host_data(
+                obj,
+                TreeWalkerData {
+                    root,
+                    what_to_show,
+                    filter,
+                    current: root,
+                },
+            );
+            Ok(JsValue::Object(obj))
+        }),
+    );
+    let _ = rt.set_property(doc_proto, "createTreeWalker", JsValue::Object(create_tw));
 
     let d = dom.clone();
     let create_text = rt.create_native_function(
@@ -497,6 +678,69 @@ pub fn define_document_proto(
     define_getter_setter(rt, doc_proto, "styleSheets", Some(get_sheets), None);
 
     let d = dom.clone();
+    let get_doctype = rt.create_native_function(
+        "get doctype",
+        0,
+        Rc::new(move |rt, this, _| {
+            let dt = {
+                let st = d.borrow();
+                let root = node_id_of(rt, &this).unwrap_or(st.doc.root);
+                st.doc.children(root).into_iter().find(|&c| {
+                    matches!(st.doc.node(c).data, NodeData::Doctype { .. })
+                })
+            };
+            Ok(wrap_node_opt(rt, &d, dt))
+        }),
+    );
+    define_getter_setter(rt, doc_proto, "doctype", Some(get_doctype), None);
+
+    for (prop, tag) in [
+        ("forms", "form"),
+        ("images", "img"),
+        ("scripts", "script"),
+    ] {
+        let d = dom.clone();
+        let gf = rt.create_native_function(
+            prop,
+            0,
+            Rc::new(move |rt, this, _| {
+                let list = {
+                    let st = d.borrow();
+                    let root = node_id_of(rt, &this).unwrap_or(st.doc.root);
+                    st.doc.get_elements_by_tag_name(root, tag)
+                };
+                Ok(JsValue::Object(wrap_node_list(rt, &d, list)))
+            }),
+        );
+        define_getter_setter(rt, doc_proto, prop, Some(gf), None);
+    }
+
+    let d = dom.clone();
+    let get_links = rt.create_native_function(
+        "get links",
+        0,
+        Rc::new(move |rt, this, _| {
+            let list = {
+                let st = d.borrow();
+                let root = node_id_of(rt, &this).unwrap_or(st.doc.root);
+                st.doc
+                    .descendants(root)
+                    .into_iter()
+                    .filter(|&id| {
+                        st.doc.element(id).map_or(false, |e| {
+                            e.is_html()
+                                && (e.tag_is("a") || e.tag_is("area"))
+                                && e.get_attr("href").is_some()
+                        })
+                    })
+                    .collect()
+            };
+            Ok(JsValue::Object(wrap_node_list(rt, &d, list)))
+        }),
+    );
+    define_getter_setter(rt, doc_proto, "links", Some(get_links), None);
+
+    let d = dom.clone();
     let impl_obj = rt.create_object();
     let create_html_doc = rt.create_native_function(
         "createHTMLDocument",
@@ -524,69 +768,92 @@ pub fn define_document_proto(
         }),
     );
     let _ = rt.set_property(impl_obj, "createHTMLDocument", JsValue::Object(create_html_doc));
-    let _ = rt.set_property(doc_proto, "implementation", JsValue::Object(impl_obj));
-
-    define_range_proto(rt, dom, range_proto);
-}
-
-fn define_range_proto(rt: &mut JsRuntime, dom: SharedDom, range_proto: ObjectId) {
-    let set_start = rt.create_native_function(
-        "setStart",
-        2,
-        Rc::new(|rt, this, args| {
-            let Some(oid) = this.as_object() else {
-                return Ok(JsValue::Undefined);
-            };
-            let Some(nid) = args.first().and_then(|v| node_id_of(rt, v)) else {
-                return Ok(JsValue::Undefined);
-            };
-            let off = args.get(1).and_then(|v| rt.to_number(v).ok()).unwrap_or(0.0) as usize;
-            if let Some(r) = rt.get_host_data_mut::<RangeData>(oid) {
-                r.start_container = nid;
-                r.start_offset = off;
-            }
-            Ok(JsValue::Undefined)
-        }),
-    );
-    let _ = rt.set_property(range_proto, "setStart", JsValue::Object(set_start));
-
-    let set_end = rt.create_native_function(
-        "setEnd",
-        2,
-        Rc::new(|rt, this, args| {
-            let Some(oid) = this.as_object() else {
-                return Ok(JsValue::Undefined);
-            };
-            let Some(nid) = args.first().and_then(|v| node_id_of(rt, v)) else {
-                return Ok(JsValue::Undefined);
-            };
-            let off = args.get(1).and_then(|v| rt.to_number(v).ok()).unwrap_or(0.0) as usize;
-            if let Some(r) = rt.get_host_data_mut::<RangeData>(oid) {
-                r.end_container = nid;
-                r.end_offset = off;
-            }
-            Ok(JsValue::Undefined)
-        }),
-    );
-    let _ = rt.set_property(range_proto, "setEnd", JsValue::Object(set_end));
 
     let d = dom.clone();
-    let create_ctx_frag = rt.create_native_function(
-        "createContextualFragment",
-        1,
+    let create_doc = rt.create_native_function(
+        "createDocument",
+        3,
         Rc::new(move |rt, _, args| {
-            let html = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
-            let frag = {
-                let mut st = d.borrow_mut();
-                let f = st.doc.create_fragment();
-                let nodes = parse_fragment_into(&mut st.doc, "div", Namespace::Html, &html);
-                for n in nodes {
-                    st.doc.append_child(f, n);
-                }
-                f
+            let ns_arg = args.first().cloned().unwrap_or(JsValue::Null);
+            let ns_uri = if ns_arg.is_nullish() {
+                String::new()
+            } else {
+                rt.to_string(&ns_arg)?
             };
-            Ok(JsValue::Object(wrap_node(rt, &d, frag)))
+            let qname_arg = args.get(1).cloned().unwrap_or(JsValue::Null);
+            let qname = if qname_arg.is_nullish() {
+                String::new()
+            } else {
+                rt.to_string(&qname_arg)?
+            };
+            let doctype_id = args.get(2).and_then(|v| node_id_of(rt, v));
+
+            if !qname.is_empty() && !is_valid_xml_name(&qname) {
+                return Err(throw_dom_exception(
+                    rt,
+                    &d,
+                    5,
+                    "InvalidCharacterError",
+                    "Invalid qualified name",
+                ));
+            }
+            let sub = {
+                let mut st = d.borrow_mut();
+                let sub = st.doc.create_sub_document();
+                for c in st.doc.children(sub) {
+                    st.doc.detach(c);
+                }
+                st.xml_documents.insert(sub);
+                if let Some(dt) = doctype_id {
+                    st.doc.append_child(sub, dt);
+                }
+                if !qname.is_empty() {
+                    let is_html_ns = ns_uri == "http://www.w3.org/1999/xhtml";
+                    let ns = if ns_uri.is_empty() {
+                        Namespace::Html
+                    } else {
+                        Namespace::from_uri(&ns_uri)
+                    };
+                    let root_el = st.doc.create_element_ns(qname, ns, Vec::new());
+                    if !is_html_ns {
+                        st.xml_elements.insert(root_el);
+                    }
+                    st.doc.append_child(sub, root_el);
+                }
+                sub
+            };
+            Ok(JsValue::Object(wrap_node(rt, &d, sub)))
         }),
     );
-    let _ = rt.set_property(range_proto, "createContextualFragment", JsValue::Object(create_ctx_frag));
+    let _ = rt.set_property(impl_obj, "createDocument", JsValue::Object(create_doc));
+
+    let d = dom.clone();
+    let create_dt = rt.create_native_function(
+        "createDocumentType",
+        3,
+        Rc::new(move |rt, _, args| {
+            let qname = args.first().map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let pub_id = args.get(1).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            let sys_id = args.get(2).map(|v| rt.to_string(v)).transpose()?.unwrap_or_default();
+            if !is_valid_xml_name(&qname) {
+                return Err(throw_dom_exception(
+                    rt,
+                    &d,
+                    5,
+                    "InvalidCharacterError",
+                    "Invalid doctype name",
+                ));
+            }
+            let nid = d.borrow_mut().doc.create_doctype(qname, pub_id, sys_id);
+            Ok(JsValue::Object(wrap_node(rt, &d, nid)))
+        }),
+    );
+    let _ = rt.set_property(impl_obj, "createDocumentType", JsValue::Object(create_dt));
+
+    let has_feat = rt.create_native_function("hasFeature", 2, Rc::new(|_, _, _| Ok(JsValue::Boolean(true))));
+    let _ = rt.set_property(impl_obj, "hasFeature", JsValue::Object(has_feat));
+
+    let _ = rt.set_property(doc_proto, "implementation", JsValue::Object(impl_obj));
+
+    define_full_range_proto(rt, dom, range_proto);
 }

@@ -63,11 +63,13 @@ impl<'a> Parser<'a> {
             }
             body.push(stmt);
         }
-        Ok(Program {
+        let program = Program {
             body,
             is_module,
             strict: parser.strict,
-        })
+        };
+        validate_program_early_errors(&program)?;
+        Ok(program)
     }
 
     fn advance(&mut self, allow_regexp: bool) -> Result<Token, JsError> {
@@ -301,6 +303,21 @@ impl<'a> Parser<'a> {
                     self.parse_expr_or_label_stmt()
                 }
             }
+            TokenKind::Ident(s, false) if s == "using" => {
+                if self.is_using_decl_start()? {
+                    self.parse_var_decl(VarKind::Using, true)
+                } else {
+                    self.parse_expr_or_label_stmt()
+                }
+            }
+            TokenKind::KwAwait if self.in_async => {
+                if self.is_await_using_decl_start()? {
+                    self.advance(true)?;
+                    self.parse_var_decl(VarKind::AwaitUsing, true)
+                } else {
+                    self.parse_expr_or_label_stmt()
+                }
+            }
             TokenKind::KwFunction => {
                 let func = self.parse_function(true, true)?;
                 Ok(Stmt::FuncDecl(func))
@@ -338,9 +355,86 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_sub_stmt(&mut self, allow_annex_b_func: bool) -> Result<Stmt, JsError> {
+        match &self.cur.kind {
+            TokenKind::KwConst | TokenKind::KwClass => {
+                return Err(JsError::syntax(
+                    "Lexical declaration cannot appear in a single-statement context",
+                ));
+            }
+            TokenKind::Ident(s, false) if s == "let" && self.is_let_decl_start()? => {
+                return Err(JsError::syntax(
+                    "Lexical declaration cannot appear in a single-statement context",
+                ));
+            }
+            TokenKind::Ident(s, false) if s == "using" && self.is_using_decl_start()? => {
+                return Err(JsError::syntax(
+                    "Lexical declaration cannot appear in a single-statement context",
+                ));
+            }
+            TokenKind::KwAwait if self.in_async && self.is_await_using_decl_start()? => {
+                return Err(JsError::syntax(
+                    "Lexical declaration cannot appear in a single-statement context",
+                ));
+            }
+            TokenKind::KwFunction => {
+                let next = self.peek_next(true)?;
+                let is_gen = next.kind == TokenKind::Star;
+                if !allow_annex_b_func || is_gen {
+                    return Err(JsError::syntax(
+                        "Function declaration cannot appear in a single-statement context",
+                    ));
+                }
+            }
+            TokenKind::Ident(s, false) if s == "async" => {
+                let next = self.peek_next(true)?;
+                if !next.preceded_by_newline && next.kind == TokenKind::KwFunction {
+                    return Err(JsError::syntax(
+                        "Async function declaration cannot appear in a single-statement context",
+                    ));
+                }
+            }
+            _ => {}
+        }
+        self.parse_stmt()
+    }
+
+    fn is_using_decl_start(&self) -> Result<bool, JsError> {
+        let next = self.peek_next(true)?;
+        if next.preceded_by_newline {
+            return Ok(false);
+        }
+        Ok(matches!(
+            next.kind,
+            TokenKind::Ident(_, _) | TokenKind::KwYield | TokenKind::KwAwait
+        ))
+    }
+
+    fn is_await_using_decl_start(&self) -> Result<bool, JsError> {
+        let mut lex = self.lexer.clone();
+        let t1 = lex.next_token(true)?;
+        if t1.preceded_by_newline {
+            return Ok(false);
+        }
+        if !matches!(&t1.kind, TokenKind::Ident(s, false) if s == "using") {
+            return Ok(false);
+        }
+        let t2 = lex.next_token(true)?;
+        if t2.preceded_by_newline {
+            return Ok(false);
+        }
+        Ok(matches!(
+            t2.kind,
+            TokenKind::Ident(_, _) | TokenKind::KwYield | TokenKind::KwAwait
+        ))
+    }
+
     fn is_let_decl_start(&self) -> Result<bool, JsError> {
         let next = self.peek_next(true)?;
         if next.preceded_by_newline {
+            if self.in_async && matches!(next.kind, TokenKind::KwAwait) {
+                return Ok(true);
+            }
             return Ok(matches!(
                 next.kind,
                 TokenKind::LBrace | TokenKind::LBracket
@@ -392,9 +486,10 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LParen, true)?;
         let test = self.parse_expr(true)?;
         self.expect(&TokenKind::RParen, true)?;
-        let consequent = Box::new(self.parse_stmt()?);
+        let allow_annex = !self.strict;
+        let consequent = Box::new(self.parse_sub_stmt(allow_annex)?);
         let alternate = if self.eat(&TokenKind::KwElse, true)? {
-            Some(Box::new(self.parse_stmt()?))
+            Some(Box::new(self.parse_sub_stmt(allow_annex)?))
         } else {
             None
         };
@@ -410,13 +505,13 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LParen, true)?;
         let test = self.parse_expr(true)?;
         self.expect(&TokenKind::RParen, true)?;
-        let body = Box::new(self.parse_stmt()?);
+        let body = Box::new(self.parse_sub_stmt(false)?);
         Ok(Stmt::While { test, body })
     }
 
     fn parse_do_while(&mut self) -> Result<Stmt, JsError> {
         self.advance(true)?;
-        let body = Box::new(self.parse_stmt()?);
+        let body = Box::new(self.parse_sub_stmt(false)?);
         self.expect(&TokenKind::KwWhile, true)?;
         self.expect(&TokenKind::LParen, true)?;
         let test = self.parse_expr(true)?;
@@ -457,7 +552,7 @@ impl<'a> Parser<'a> {
                 self.advance(true)?;
                 let right = self.parse_expr(true)?;
                 self.expect(&TokenKind::RParen, true)?;
-                let body = Box::new(self.parse_stmt()?);
+                let body = Box::new(self.parse_sub_stmt(false)?);
                 return Ok(Stmt::ForIn {
                     left: ForInOfLeft::VarDecl {
                         kind,
@@ -471,7 +566,7 @@ impl<'a> Parser<'a> {
                 self.advance(true)?;
                 let right = self.parse_assign_expr(true)?;
                 self.expect(&TokenKind::RParen, true)?;
-                let body = Box::new(self.parse_stmt()?);
+                let body = Box::new(self.parse_sub_stmt(false)?);
                 return Ok(Stmt::ForOf {
                     left: ForInOfLeft::VarDecl {
                         kind,
@@ -501,10 +596,18 @@ impl<'a> Parser<'a> {
                 decls.push(VarDeclarator { pattern: pat, init });
             }
             if self.cur.kind == TokenKind::KwIn && decls.len() == 1 {
+                if kind != VarKind::Var
+                    || self.strict
+                    || !matches!(decls[0].pattern, Pattern::Ident(_))
+                {
+                    return Err(JsError::syntax(
+                        "Invalid initializer in for-in loop declaration",
+                    ));
+                }
                 self.advance(true)?;
                 let right = self.parse_expr(true)?;
                 self.expect(&TokenKind::RParen, true)?;
-                let body = Box::new(self.parse_stmt()?);
+                let body = Box::new(self.parse_sub_stmt(false)?);
                 let decl = decls.pop().unwrap();
                 return Ok(Stmt::ForIn {
                     left: ForInOfLeft::VarDecl {
@@ -528,7 +631,7 @@ impl<'a> Parser<'a> {
             let left_pat = expr_to_pattern(expr)?;
             let right = self.parse_expr(true)?;
             self.expect(&TokenKind::RParen, true)?;
-            let body = Box::new(self.parse_stmt()?);
+            let body = Box::new(self.parse_sub_stmt(false)?);
             return Ok(Stmt::ForIn {
                 left: ForInOfLeft::Pattern(left_pat),
                 right,
@@ -540,7 +643,7 @@ impl<'a> Parser<'a> {
             let left_pat = expr_to_pattern(expr)?;
             let right = self.parse_assign_expr(true)?;
             self.expect(&TokenKind::RParen, true)?;
-            let body = Box::new(self.parse_stmt()?);
+            let body = Box::new(self.parse_sub_stmt(false)?);
             return Ok(Stmt::ForOf {
                 left: ForInOfLeft::Pattern(left_pat),
                 right,
@@ -568,7 +671,7 @@ impl<'a> Parser<'a> {
             Some(self.parse_expr(true)?)
         };
         self.expect(&TokenKind::RParen, true)?;
-        let body = Box::new(self.parse_stmt()?);
+        let body = Box::new(self.parse_sub_stmt(false)?);
         Ok(Stmt::For {
             init,
             test,
@@ -724,9 +827,18 @@ impl<'a> Parser<'a> {
 
     fn parse_expr_or_label_stmt(&mut self) -> Result<Stmt, JsError> {
         if let Some(label) = self.peek_label_ident()? {
+            if (label == "await" && self.in_async)
+                || (label == "yield" && (self.in_generator || self.strict))
+            {
+                return Err(JsError::syntax(format!(
+                    "Invalid label identifier '{}'",
+                    label
+                )));
+            }
             self.advance(true)?;
             self.advance(true)?;
-            let body = Box::new(self.parse_stmt()?);
+            let allow_annex = !self.strict;
+            let body = Box::new(self.parse_sub_stmt(allow_annex)?);
             return Ok(Stmt::Labeled { label, body });
         }
         let expr = self.parse_expr(true)?;
@@ -1136,6 +1248,12 @@ impl<'a> Parser<'a> {
                     pat
                 }
             } else if let PropKey::Ident(ref name) = key {
+                if is_reserved_word(name, self.strict) {
+                    return Err(JsError::syntax(format!(
+                        "Unexpected reserved word '{}' in destructuring pattern",
+                        name
+                    )));
+                }
                 let base = Pattern::Ident(name.clone());
                 if self.eat(&TokenKind::Eq, true)? {
                     let right = self.parse_assign_expr(true)?;
@@ -1743,8 +1861,10 @@ impl<'a> Parser<'a> {
                 }
             }
             TokenKind::Ident(s, escaped) => {
-                if escaped && ((self.in_async && s == "await") || (self.in_generator && s == "yield")) {
-                    return Err(JsError::syntax(format!("Escaped keyword '{}' not allowed here", s)));
+                if is_reserved_word(&s, self.strict)
+                    || (escaped && ((self.in_async && s == "await") || (self.in_generator && s == "yield")))
+                {
+                    return Err(JsError::syntax(format!("Unexpected reserved word '{}'", s)));
                 }
                 self.advance(false)?;
                 Ok(Expr::Ident(s))
@@ -1876,6 +1996,12 @@ impl<'a> Parser<'a> {
                     shorthand: false,
                 });
             } else if let PropKey::Ident(ref name) = key {
+                if is_reserved_word(name, self.strict) {
+                    return Err(JsError::syntax(format!(
+                        "Unexpected reserved word '{}' in shorthand property",
+                        name
+                    )));
+                }
                 let value = if self.eat(&TokenKind::Eq, true)? {
                     let right = self.parse_assign_expr(true)?;
                     Expr::Assign {
@@ -1957,8 +2083,10 @@ impl<'a> Parser<'a> {
     fn parse_binding_ident(&mut self) -> Result<String, JsError> {
         match self.cur.kind.clone() {
             TokenKind::Ident(s, escaped) => {
-                if escaped && ((self.in_async && s == "await") || (self.in_generator && s == "yield")) {
-                    return Err(JsError::syntax(format!("Escaped keyword '{}' not allowed as binding", s)));
+                if is_reserved_word(&s, self.strict)
+                    || (escaped && ((self.in_async && s == "await") || (self.in_generator && s == "yield")))
+                {
+                    return Err(JsError::syntax(format!("Unexpected reserved word '{}'", s)));
                 }
                 self.advance(false)?;
                 Ok(s)
@@ -2281,5 +2409,866 @@ fn expr_to_pattern(expr: Expr) -> Result<Pattern, JsError> {
             })
         }
         _ => Err(JsError::syntax("Invalid destructuring assignment target")),
+    }
+}
+
+fn is_reserved_word(s: &str, strict: bool) -> bool {
+    matches!(
+        s,
+        "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+    ) || (strict
+        && matches!(
+            s,
+            "implements"
+                | "interface"
+                | "let"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "static"
+                | "yield"
+        ))
+}
+
+#[derive(Clone, Copy)]
+struct ValidationCtx {
+    strict: bool,
+    allow_super_call: bool,
+    allow_super_prop: bool,
+    in_static_block: bool,
+    forbid_yield_expr: bool,
+    forbid_await_expr: bool,
+}
+
+fn validate_program_early_errors(prog: &Program) -> Result<(), JsError> {
+    let ctx = ValidationCtx {
+        strict: prog.strict,
+        allow_super_call: false,
+        allow_super_prop: false,
+        in_static_block: false,
+        forbid_yield_expr: false,
+        forbid_await_expr: false,
+    };
+    validate_stmt_list(&prog.body, ctx, true, None)?;
+    Ok(())
+}
+
+fn collect_pattern_names(pat: &Pattern, out: &mut Vec<String>) {
+    match pat {
+        Pattern::Ident(s) => out.push(s.clone()),
+        Pattern::Array { elements, rest } => {
+            for el in elements.iter().flatten() {
+                collect_pattern_names(el, out);
+            }
+            if let Some(r) = rest {
+                collect_pattern_names(r, out);
+            }
+        }
+        Pattern::Object { props, rest } => {
+            for p in props {
+                collect_pattern_names(&p.value, out);
+            }
+            if let Some(r) = rest {
+                collect_pattern_names(r, out);
+            }
+        }
+        Pattern::Assign { left, .. } => collect_pattern_names(left, out),
+        Pattern::Member(_) => {}
+    }
+}
+
+fn collect_var_declared_names(stmt: &Stmt, out: &mut Vec<String>) {
+    match stmt {
+        Stmt::VarDecl {
+            kind: VarKind::Var,
+            decls,
+        } => {
+            for d in decls {
+                collect_pattern_names(&d.pattern, out);
+            }
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                collect_var_declared_names(s, out);
+            }
+        }
+        Stmt::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            collect_var_declared_names(consequent, out);
+            if let Some(alt) = alternate {
+                collect_var_declared_names(alt, out);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::With { body, .. }
+        | Stmt::Labeled { body, .. } => {
+            collect_var_declared_names(body, out);
+        }
+        Stmt::For { init, body, .. } => {
+            if let Some(ForInit::VarDecl {
+                kind: VarKind::Var,
+                decls,
+            }) = init
+            {
+                for d in decls {
+                    collect_pattern_names(&d.pattern, out);
+                }
+            }
+            collect_var_declared_names(body, out);
+        }
+        Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
+            if let ForInOfLeft::VarDecl {
+                kind: VarKind::Var,
+                pattern,
+            } = left
+            {
+                collect_pattern_names(pattern, out);
+            }
+            collect_var_declared_names(body, out);
+        }
+        Stmt::Switch { cases, .. } => {
+            for c in cases {
+                for s in &c.consequent {
+                    collect_var_declared_names(s, out);
+                }
+            }
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            for s in block {
+                collect_var_declared_names(s, out);
+            }
+            if let Some(h) = handler {
+                for s in &h.body {
+                    collect_var_declared_names(s, out);
+                }
+            }
+            if let Some(f) = finalizer {
+                for s in f {
+                    collect_var_declared_names(s, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_strict_binding_name(name: &str, strict: bool) -> Result<(), JsError> {
+    if strict && (name == "eval" || name == "arguments") {
+        return Err(JsError::syntax(format!(
+            "Unexpected '{}' in strict mode",
+            name
+        )));
+    }
+    Ok(())
+}
+
+fn validate_stmt_list(
+    stmts: &[Stmt],
+    ctx: ValidationCtx,
+    is_top_or_fn_body: bool,
+    param_names: Option<&std::collections::HashSet<String>>,
+) -> Result<(), JsError> {
+    let mut lex_names = std::collections::HashSet::<String>::new();
+    let mut annex_b_funcs = std::collections::HashSet::<String>::new();
+    let mut var_names = Vec::<String>::new();
+
+    for s in stmts {
+        match s {
+            Stmt::VarDecl { kind, decls } => {
+                if *kind != VarKind::Var {
+                    for d in decls {
+                        let mut names = Vec::new();
+                        collect_pattern_names(&d.pattern, &mut names);
+                        for n in names {
+                            if n == "let" {
+                                return Err(JsError::syntax(
+                                    "let is disallowed as a lexically bound name",
+                                ));
+                            }
+                            check_strict_binding_name(&n, ctx.strict)?;
+                            if !lex_names.insert(n.clone()) || annex_b_funcs.contains(&n) {
+                                return Err(JsError::syntax(format!(
+                                    "Identifier '{}' has already been declared",
+                                    n
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    collect_var_declared_names(s, &mut var_names);
+                }
+            }
+            Stmt::ClassDecl(cls) => {
+                if let Some(ref n) = cls.name {
+                    check_strict_binding_name(n, true)?;
+                    if !lex_names.insert(n.clone()) || annex_b_funcs.contains(n) {
+                        return Err(JsError::syntax(format!(
+                            "Identifier '{}' has already been declared",
+                            n
+                        )));
+                    }
+                }
+            }
+            Stmt::FuncDecl(f) => {
+                if let Some(ref n) = f.name {
+                    let fn_strict = ctx.strict || f.strict;
+                    check_strict_binding_name(n, fn_strict)?;
+                    if !is_top_or_fn_body {
+                        let is_plain = !f.is_async && !f.is_generator;
+                        if ctx.strict || !is_plain {
+                            if !lex_names.insert(n.clone()) || annex_b_funcs.contains(n) {
+                                return Err(JsError::syntax(format!(
+                                    "Identifier '{}' has already been declared",
+                                    n
+                                )));
+                            }
+                        } else {
+                            if lex_names.contains(n) {
+                                return Err(JsError::syntax(format!(
+                                    "Identifier '{}' has already been declared",
+                                    n
+                                )));
+                            }
+                            annex_b_funcs.insert(n.clone());
+                        }
+                    }
+                }
+            }
+            _ => {
+                collect_var_declared_names(s, &mut var_names);
+            }
+        }
+    }
+
+    for vn in &var_names {
+        check_strict_binding_name(vn, ctx.strict)?;
+        if lex_names.contains(vn) || annex_b_funcs.contains(vn) {
+            return Err(JsError::syntax(format!(
+                "Identifier '{}' has already been declared",
+                vn
+            )));
+        }
+    }
+
+    if let Some(pnames) = param_names {
+        for ln in &lex_names {
+            if pnames.contains(ln) {
+                return Err(JsError::syntax(format!(
+                    "Identifier '{}' has already been declared",
+                    ln
+                )));
+            }
+        }
+    }
+
+    for s in stmts {
+        validate_stmt(s, ctx)?;
+    }
+    Ok(())
+}
+
+fn validate_stmt(stmt: &Stmt, ctx: ValidationCtx) -> Result<(), JsError> {
+    match stmt {
+        Stmt::Block(stmts) => validate_stmt_list(stmts, ctx, false, None),
+        Stmt::VarDecl { decls, .. } => {
+            for d in decls {
+                validate_pattern(&d.pattern, ctx)?;
+                if let Some(ref init) = d.init {
+                    validate_expr(init, ctx)?;
+                }
+            }
+            Ok(())
+        }
+        Stmt::Expr(e) | Stmt::Throw(e) => validate_expr(e, ctx),
+        Stmt::Return(Some(e)) => validate_expr(e, ctx),
+        Stmt::Return(None) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Debugger | Stmt::Empty => {
+            Ok(())
+        }
+        Stmt::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            validate_expr(test, ctx)?;
+            validate_stmt(consequent, ctx)?;
+            if let Some(alt) = alternate {
+                validate_stmt(alt, ctx)?;
+            }
+            Ok(())
+        }
+        Stmt::While { test, body } | Stmt::DoWhile { test, body } => {
+            validate_expr(test, ctx)?;
+            validate_stmt(body, ctx)
+        }
+        Stmt::With { object, body } => {
+            if ctx.strict {
+                return Err(JsError::syntax("Strict mode code may not include a with statement"));
+            }
+            validate_expr(object, ctx)?;
+            validate_stmt(body, ctx)
+        }
+        Stmt::Labeled { body, .. } => validate_stmt(body, ctx),
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            let mut head_lex = std::collections::HashSet::new();
+            if let Some(fi) = init {
+                match fi {
+                    ForInit::VarDecl { kind, decls } => {
+                        for d in decls {
+                            validate_pattern(&d.pattern, ctx)?;
+                            if let Some(ref e) = d.init {
+                                validate_expr(e, ctx)?;
+                            }
+                            if *kind != VarKind::Var {
+                                let mut names = Vec::new();
+                                collect_pattern_names(&d.pattern, &mut names);
+                                for n in names {
+                                    if n == "let" {
+                                        return Err(JsError::syntax(
+                                            "let is disallowed as a lexically bound name",
+                                        ));
+                                    }
+                                    check_strict_binding_name(&n, ctx.strict)?;
+                                    if !head_lex.insert(n.clone()) {
+                                        return Err(JsError::syntax(format!(
+                                            "Identifier '{}' has already been declared",
+                                            n
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ForInit::Expr(e) => validate_expr(e, ctx)?,
+                }
+            }
+            if !head_lex.is_empty() {
+                let mut body_vars = Vec::new();
+                collect_var_declared_names(body, &mut body_vars);
+                for vn in body_vars {
+                    if head_lex.contains(&vn) {
+                        return Err(JsError::syntax(format!(
+                            "Identifier '{}' has already been declared",
+                            vn
+                        )));
+                    }
+                }
+            }
+            if let Some(t) = test {
+                validate_expr(t, ctx)?;
+            }
+            if let Some(u) = update {
+                validate_expr(u, ctx)?;
+            }
+            validate_stmt(body, ctx)
+        }
+        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body, .. } => {
+            let mut head_lex = std::collections::HashSet::new();
+            match left {
+                ForInOfLeft::VarDecl { kind, pattern } => {
+                    validate_pattern(pattern, ctx)?;
+                    if *kind != VarKind::Var {
+                        let mut names = Vec::new();
+                        collect_pattern_names(pattern, &mut names);
+                        for n in names {
+                            if n == "let" {
+                                return Err(JsError::syntax(
+                                    "let is disallowed as a lexically bound name",
+                                ));
+                            }
+                            check_strict_binding_name(&n, ctx.strict)?;
+                            if !head_lex.insert(n.clone()) {
+                                return Err(JsError::syntax(format!(
+                                    "Identifier '{}' has already been declared",
+                                    n
+                                )));
+                            }
+                        }
+                    }
+                }
+                ForInOfLeft::Pattern(p) => validate_pattern(p, ctx)?,
+            }
+            if !head_lex.is_empty() {
+                let mut body_vars = Vec::new();
+                collect_var_declared_names(body, &mut body_vars);
+                for vn in body_vars {
+                    if head_lex.contains(&vn) {
+                        return Err(JsError::syntax(format!(
+                            "Identifier '{}' has already been declared",
+                            vn
+                        )));
+                    }
+                }
+            }
+            validate_expr(right, ctx)?;
+            validate_stmt(body, ctx)
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            validate_expr(discriminant, ctx)?;
+            let mut all_stmts = Vec::new();
+            for c in cases {
+                if let Some(ref t) = c.test {
+                    validate_expr(t, ctx)?;
+                }
+                all_stmts.extend(c.consequent.iter().cloned());
+            }
+            validate_stmt_list(&all_stmts, ctx, false, None)
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            validate_stmt_list(block, ctx, false, None)?;
+            if let Some(h) = handler {
+                let mut catch_names = std::collections::HashSet::new();
+                let mut is_simple_catch = false;
+                if let Some(ref p) = h.param {
+                    validate_pattern(p, ctx)?;
+                    is_simple_catch = matches!(p, Pattern::Ident(_));
+                    let mut names = Vec::new();
+                    collect_pattern_names(p, &mut names);
+                    for n in names {
+                        check_strict_binding_name(&n, ctx.strict)?;
+                        if !catch_names.insert(n.clone()) {
+                            return Err(JsError::syntax(format!(
+                                "Identifier '{}' has already been declared",
+                                n
+                            )));
+                        }
+                    }
+                }
+                if !is_simple_catch && !catch_names.is_empty() {
+                    let mut body_vars = Vec::new();
+                    for s in &h.body {
+                        collect_var_declared_names(s, &mut body_vars);
+                    }
+                    for vn in body_vars {
+                        if catch_names.contains(&vn) {
+                            return Err(JsError::syntax(format!(
+                                "Identifier '{}' has already been declared",
+                                vn
+                            )));
+                        }
+                    }
+                }
+                validate_stmt_list(
+                    &h.body,
+                    ctx,
+                    false,
+                    if catch_names.is_empty() {
+                        None
+                    } else {
+                        Some(&catch_names)
+                    },
+                )?;
+            }
+            if let Some(fin) = finalizer {
+                validate_stmt_list(fin, ctx, false, None)?;
+            }
+            Ok(())
+        }
+        Stmt::FuncDecl(f) => validate_function(f, ctx, false, false),
+        Stmt::ClassDecl(c) => validate_class(c, ctx),
+        Stmt::Import(_) | Stmt::Export(_) => Ok(()),
+    }
+}
+
+fn validate_function(
+    func: &FuncNode,
+    outer_ctx: ValidationCtx,
+    allow_super_call: bool,
+    allow_super_prop: bool,
+) -> Result<(), JsError> {
+    let fn_strict = outer_ctx.strict || func.strict;
+    if let Some(ref n) = func.name {
+        check_strict_binding_name(n, fn_strict)?;
+    }
+    let has_simple_params = func
+        .params
+        .iter()
+        .all(|p| !p.rest && matches!(p.pattern, Pattern::Ident(_)));
+    let forbid_dupes = fn_strict || func.is_arrow || !has_simple_params;
+
+    let mut param_names = std::collections::HashSet::new();
+    let param_ctx = ValidationCtx {
+        strict: fn_strict,
+        allow_super_call: if func.is_arrow {
+            outer_ctx.allow_super_call
+        } else {
+            allow_super_call
+        },
+        allow_super_prop: if func.is_arrow {
+            outer_ctx.allow_super_prop
+        } else {
+            allow_super_prop
+        },
+        in_static_block: if func.is_arrow {
+            outer_ctx.in_static_block
+        } else {
+            false
+        },
+        forbid_yield_expr: func.is_generator || (func.is_arrow && outer_ctx.forbid_yield_expr),
+        forbid_await_expr: func.is_async
+            || (func.is_arrow && (outer_ctx.forbid_await_expr || outer_ctx.in_static_block)),
+    };
+
+    for p in &func.params {
+        validate_pattern(&p.pattern, param_ctx)?;
+        let mut names = Vec::new();
+        collect_pattern_names(&p.pattern, &mut names);
+        for n in names {
+            check_strict_binding_name(&n, fn_strict)?;
+            if func.is_async && n == "await" {
+                return Err(JsError::syntax("Cannot use 'await' as parameter name in async function"));
+            }
+            if func.is_generator && n == "yield" {
+                return Err(JsError::syntax("Cannot use 'yield' as parameter name in generator"));
+            }
+            if forbid_dupes && !param_names.insert(n.clone()) {
+                return Err(JsError::syntax(format!(
+                    "Duplicate parameter name '{}' not allowed in this context",
+                    n
+                )));
+            }
+            param_names.insert(n);
+        }
+    }
+
+    let body_ctx = ValidationCtx {
+        strict: fn_strict,
+        allow_super_call: if func.is_arrow {
+            outer_ctx.allow_super_call
+        } else {
+            allow_super_call
+        },
+        allow_super_prop: if func.is_arrow {
+            outer_ctx.allow_super_prop
+        } else {
+            allow_super_prop
+        },
+        in_static_block: false,
+        forbid_yield_expr: false,
+        forbid_await_expr: false,
+    };
+
+    match &func.body {
+        FuncBody::Block(stmts) => validate_stmt_list(stmts, body_ctx, true, Some(&param_names)),
+        FuncBody::Expr(e) => validate_expr(e, body_ctx),
+    }
+}
+
+fn validate_class(cls: &ClassNode, outer_ctx: ValidationCtx) -> Result<(), JsError> {
+    let cls_ctx = ValidationCtx {
+        strict: true,
+        ..outer_ctx
+    };
+    if let Some(ref n) = cls.name {
+        check_strict_binding_name(n, true)?;
+    }
+    if let Some(ref sup) = cls.super_class {
+        validate_expr(sup, cls_ctx)?;
+    }
+    let has_super = cls.super_class.is_some();
+    for el in &cls.elements {
+        match el {
+            ClassElement::Method {
+                key,
+                kind,
+                func,
+                is_static,
+                ..
+            } => {
+                if let PropKey::Computed(e) = key {
+                    validate_expr(e, cls_ctx)?;
+                }
+                let is_derived_ctor = *kind == MethodKind::Constructor && !*is_static && has_super;
+                validate_function(func, cls_ctx, is_derived_ctor, true)?;
+            }
+            ClassElement::Field { key, init, .. } => {
+                if let PropKey::Computed(e) = key {
+                    validate_expr(e, cls_ctx)?;
+                }
+                if let Some(e) = init {
+                    let field_ctx = ValidationCtx {
+                        strict: true,
+                        allow_super_call: false,
+                        allow_super_prop: true,
+                        in_static_block: false,
+                        forbid_yield_expr: false,
+                        forbid_await_expr: false,
+                    };
+                    validate_expr(e, field_ctx)?;
+                }
+            }
+            ClassElement::StaticBlock(stmts) => {
+                let sb_ctx = ValidationCtx {
+                    strict: true,
+                    allow_super_call: false,
+                    allow_super_prop: true,
+                    in_static_block: true,
+                    forbid_yield_expr: true,
+                    forbid_await_expr: true,
+                };
+                validate_stmt_list(stmts, sb_ctx, true, None)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_pattern(pat: &Pattern, ctx: ValidationCtx) -> Result<(), JsError> {
+    match pat {
+        Pattern::Ident(n) => {
+            if is_reserved_word(n, ctx.strict) {
+                return Err(JsError::syntax(format!("Unexpected reserved word '{}'", n)));
+            }
+            if ctx.in_static_block && n == "await" {
+                return Err(JsError::syntax("Cannot use 'await' in class static block"));
+            }
+            Ok(())
+        }
+        Pattern::Array { elements, rest } => {
+            for el in elements.iter().flatten() {
+                validate_pattern(el, ctx)?;
+            }
+            if let Some(r) = rest {
+                validate_pattern(r, ctx)?;
+            }
+            Ok(())
+        }
+        Pattern::Object { props, rest } => {
+            for p in props {
+                if let PropKey::Computed(e) = &p.key {
+                    validate_expr(e, ctx)?;
+                }
+                validate_pattern(&p.value, ctx)?;
+            }
+            if let Some(r) = rest {
+                validate_pattern(r, ctx)?;
+            }
+            Ok(())
+        }
+        Pattern::Assign { left, right } => {
+            validate_pattern(left, ctx)?;
+            validate_expr(right, ctx)
+        }
+        Pattern::Member(e) => validate_expr(e, ctx),
+    }
+}
+
+fn validate_expr(expr: &Expr, ctx: ValidationCtx) -> Result<(), JsError> {
+    match expr {
+        Expr::Ident(n) => {
+            if is_reserved_word(n, ctx.strict) {
+                return Err(JsError::syntax(format!("Unexpected reserved word '{}'", n)));
+            }
+            if ctx.in_static_block && n == "await" {
+                return Err(JsError::syntax("Cannot use 'await' in class static block"));
+            }
+            Ok(())
+        }
+        Expr::Yield { arg, .. } => {
+            if ctx.forbid_yield_expr {
+                return Err(JsError::syntax("Yield expression not allowed in parameters"));
+            }
+            if let Some(a) = arg {
+                validate_expr(a, ctx)?;
+            }
+            Ok(())
+        }
+        Expr::Await(a) => {
+            if ctx.forbid_await_expr {
+                return Err(JsError::syntax("Await expression not allowed here"));
+            }
+            validate_expr(a, ctx)
+        }
+        Expr::Call { callee, args, .. } => {
+            if matches!(callee.as_ref(), Expr::Super) {
+                if !ctx.allow_super_call {
+                    return Err(JsError::syntax("super() call unexpected here"));
+                }
+            } else {
+                validate_expr(callee, ctx)?;
+            }
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => validate_expr(e, ctx)?,
+                }
+            }
+            Ok(())
+        }
+        Expr::Member {
+            object, property, ..
+        } => {
+            if matches!(object.as_ref(), Expr::Super) {
+                if !ctx.allow_super_prop {
+                    return Err(JsError::syntax("super property access unexpected here"));
+                }
+            } else {
+                validate_expr(object, ctx)?;
+            }
+            if let MemberProp::Computed(e) = property {
+                validate_expr(e, ctx)?;
+            }
+            Ok(())
+        }
+        Expr::Super => Err(JsError::syntax("'super' keyword unexpected here")),
+        Expr::Function(f) => validate_function(f, ctx, false, false),
+        Expr::Arrow(f) => validate_function(f, ctx, ctx.allow_super_call, ctx.allow_super_prop),
+        Expr::Class(c) => validate_class(c, ctx),
+        Expr::Array(elems) => {
+            for el in elems {
+                match el {
+                    ArrayElem::Hole => {}
+                    ArrayElem::Expr(e) | ArrayElem::Spread(e) => validate_expr(e, ctx)?,
+                }
+            }
+            Ok(())
+        }
+        Expr::Object(props) => {
+            for p in props {
+                match p {
+                    ObjectProp::Property { key, value, .. } => {
+                        if let PropKey::Computed(e) = key {
+                            validate_expr(e, ctx)?;
+                        }
+                        validate_expr(value, ctx)?;
+                    }
+                    ObjectProp::Method { key, func, .. } => {
+                        if let PropKey::Computed(e) = key {
+                            validate_expr(e, ctx)?;
+                        }
+                        validate_function(func, ctx, false, true)?;
+                    }
+                    ObjectProp::Spread(e) => validate_expr(e, ctx)?,
+                }
+            }
+            Ok(())
+        }
+        Expr::Template { tag, exprs, .. } => {
+            if let Some(t) = tag {
+                validate_expr(t, ctx)?;
+            }
+            for e in exprs {
+                validate_expr(e, ctx)?;
+            }
+            Ok(())
+        }
+        Expr::OptionalChain(e)
+        | Expr::DynamicImport(e)
+        | Expr::Unary { arg: e, .. }
+        | Expr::Update { arg: e, .. }
+        | Expr::PrivateIn { right: e, .. } => validate_expr(e, ctx),
+        Expr::New { callee, args } => {
+            validate_expr(callee, ctx)?;
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => validate_expr(e, ctx)?,
+                }
+            }
+            Ok(())
+        }
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            validate_expr(left, ctx)?;
+            validate_expr(right, ctx)
+        }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            validate_expr(test, ctx)?;
+            validate_expr(consequent, ctx)?;
+            validate_expr(alternate, ctx)
+        }
+        Expr::Assign { left, right, .. } => {
+            match left {
+                AssignTarget::Ident(n) => {
+                    check_strict_binding_name(n, ctx.strict)?;
+                }
+                AssignTarget::Member { object, property } => {
+                    if matches!(object.as_ref(), Expr::Super) {
+                        if !ctx.allow_super_prop {
+                            return Err(JsError::syntax("super property access unexpected here"));
+                        }
+                    } else {
+                        validate_expr(object, ctx)?;
+                    }
+                    if let MemberProp::Computed(e) = property {
+                        validate_expr(e, ctx)?;
+                    }
+                }
+                AssignTarget::Pattern(p) => validate_pattern(p, ctx)?,
+            }
+            validate_expr(right, ctx)
+        }
+        Expr::Sequence(es) => {
+            for e in es {
+                validate_expr(e, ctx)?;
+            }
+            Ok(())
+        }
+        Expr::Undefined
+        | Expr::Null
+        | Expr::Bool(_)
+        | Expr::Number(_)
+        | Expr::BigInt(_)
+        | Expr::String(_)
+        | Expr::RegExp { .. }
+        | Expr::This
+        | Expr::NewTarget
+        | Expr::ImportMeta => Ok(()),
     }
 }

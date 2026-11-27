@@ -8,6 +8,9 @@ use crate::events::define_getter_setter;
 use crate::state::{ClassListHandle, SharedDom, StyleDeclHandle};
 
 pub fn camel_to_kebab(s: &str) -> String {
+    if s == "cssFloat" || s == "styleFloat" {
+        return "float".to_string();
+    }
     if s.starts_with("--") {
         return s.to_string();
     }
