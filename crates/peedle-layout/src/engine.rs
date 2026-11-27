@@ -286,16 +286,24 @@ impl LayoutEngine {
                 if let Some(before_style) = styles.before(node_id) {
                     if before_style.display != Display::None {
                         if let Some(ref content) = before_style.content {
+                            let pkind = match before_style.display {
+                                Display::Block | Display::FlowRoot | Display::ListItem => BoxKind::Block,
+                                Display::InlineBlock => BoxKind::InlineBlock,
+                                Display::Flex | Display::InlineFlex => BoxKind::Flex,
+                                Display::Grid | Display::InlineGrid => BoxKind::Grid,
+                                _ => BoxKind::Inline,
+                            };
+                            let pbox = self.tree.alloc(None, pkind, before_style.clone());
                             if !content.is_empty() {
-                                let pbox = self.tree.alloc(None, BoxKind::Inline, before_style.clone());
+                                let tstyle = inherited_only_style(before_style, Display::Inline);
                                 let tbox = self.tree.alloc(
                                     None,
                                     BoxKind::Text(content.clone()),
-                                    before_style.clone(),
+                                    tstyle,
                                 );
                                 self.tree.get_mut(pbox).children.push(tbox);
-                                raw_children.push(pbox);
                             }
+                            raw_children.push(pbox);
                         }
                     }
                 }
@@ -312,16 +320,24 @@ impl LayoutEngine {
                 if let Some(after_style) = styles.after(node_id) {
                     if after_style.display != Display::None {
                         if let Some(ref content) = after_style.content {
+                            let pkind = match after_style.display {
+                                Display::Block | Display::FlowRoot | Display::ListItem => BoxKind::Block,
+                                Display::InlineBlock => BoxKind::InlineBlock,
+                                Display::Flex | Display::InlineFlex => BoxKind::Flex,
+                                Display::Grid | Display::InlineGrid => BoxKind::Grid,
+                                _ => BoxKind::Inline,
+                            };
+                            let pbox = self.tree.alloc(None, pkind, after_style.clone());
                             if !content.is_empty() {
-                                let pbox = self.tree.alloc(None, BoxKind::Inline, after_style.clone());
+                                let tstyle = inherited_only_style(after_style, Display::Inline);
                                 let tbox = self.tree.alloc(
                                     None,
                                     BoxKind::Text(content.clone()),
-                                    after_style.clone(),
+                                    tstyle,
                                 );
                                 self.tree.get_mut(pbox).children.push(tbox);
-                                raw_children.push(pbox);
                             }
+                            raw_children.push(pbox);
                         }
                     }
                 }
@@ -646,6 +662,62 @@ impl LayoutEngine {
         }
     }
 
+    fn is_self_collapsing_empty(&self, id: LayoutBoxId, content_w: f32, cb_height: f32) -> bool {
+        let b = self.tree.get(id);
+        if !matches!(b.kind, BoxKind::Block | BoxKind::AnonymousBlock) {
+            return false;
+        }
+        if matches!(b.style.position, Position::Absolute | Position::Fixed)
+            || b.style.float != Float::None
+            || b.style.clear != Clear::None
+        {
+            return false;
+        }
+        let ctx = self.calc_ctx(&b.style, content_w);
+        let pad_v = b.style.padding_top.resolve_or(&ctx, 0.0)
+            + b.style.padding_bottom.resolve_or(&ctx, 0.0);
+        let bord_v = b.style.border_top_width + b.style.border_bottom_width;
+        if pad_v > 0.0 || bord_v > 0.0 {
+            return false;
+        }
+        if let Some(eh) = self.resolve_explicit_height(&b.style, cb_height) {
+            if eh > 0.0 {
+                return false;
+            }
+        }
+        if let Some(mh) = b.style.min_height.resolve(&self.calc_ctx(&b.style, cb_height.max(0.0))) {
+            if mh > 0.0 {
+                return false;
+            }
+        }
+        for &cid in &b.children {
+            let ck = &self.tree.get(cid).kind;
+            match ck {
+                BoxKind::Text(t) if t.chars().all(|c| c.is_ascii_whitespace()) => {}
+                _ => {
+                    if !self.is_self_collapsing_empty(cid, content_w, -1.0) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn collect_empty_margins(&self, id: LayoutBoxId, content_w: f32, pos: &mut f32, neg: &mut f32) {
+        let b = self.tree.get(id);
+        let ctx = self.calc_ctx(&b.style, content_w);
+        let mt = b.style.margin_top.resolve_or(&ctx, 0.0);
+        let mb = b.style.margin_bottom.resolve_or(&ctx, 0.0);
+        *pos = pos.max(mt.max(0.0)).max(mb.max(0.0));
+        *neg = neg.min(mt.min(0.0)).min(mb.min(0.0));
+        for &cid in &b.children {
+            if matches!(self.tree.get(cid).kind, BoxKind::Block | BoxKind::AnonymousBlock) {
+                self.collect_empty_margins(cid, content_w, pos, neg);
+            }
+        }
+    }
+
     fn layout_block_children(
         &mut self,
         container_id: LayoutBoxId,
@@ -656,8 +728,23 @@ impl LayoutEngine {
         cb_height: f32,
         explicit_h: Option<f32>,
     ) -> f32 {
-        let mut cursor_y = content_y;
-        let mut prev_margin_bottom = 0.0f32;
+        let container_box = self.tree.get(container_id);
+        let container_establishes_bfc = container_box.style.overflow_x != peedle_css::Overflow::Visible
+            || container_box.style.overflow_y != peedle_css::Overflow::Visible
+            || container_box.style.display == Display::FlowRoot
+            || container_box.style.display == Display::InlineBlock
+            || container_box.style.float != Float::None
+            || matches!(container_box.style.position, Position::Absolute | Position::Fixed)
+            || matches!(container_box.kind, BoxKind::TableCell { .. } | BoxKind::Flex | BoxKind::Grid);
+        let collapse_first_top = !container_establishes_bfc
+            && self.tree.root != Some(container_id)
+            && container_box.dims.border.top == 0.0
+            && container_box.dims.padding.top == 0.0;
+        let container_mt = container_box.dims.margin.top;
+
+        let mut base_y = content_y;
+        let mut pending_pos = 0.0f32;
+        let mut pending_neg = 0.0f32;
         let mut has_prev = false;
         let mut abs_children = Vec::new();
 
@@ -667,22 +754,27 @@ impl LayoutEngine {
                 abs_children.push(cid);
                 continue;
             }
-            if cs.clear != Clear::None {
-                cursor_y = self.float_ctx.clear_y(cs.clear, cursor_y);
-            }
             if cs.float != Float::None {
+                let mut float_y = if has_prev {
+                    base_y + pending_pos + pending_neg
+                } else {
+                    base_y
+                };
+                if cs.clear != Clear::None {
+                    float_y = self.float_ctx.clear_y(cs.clear, float_y);
+                }
                 self.layout_box(
                     cid,
                     content_w,
                     cb_height,
                     content_x,
-                    cursor_y,
+                    float_y,
                     SizeConstraint::Available(content_w),
                 );
                 let mb = self.tree.get(cid).dims.margin_box();
                 let (target_x, target_y) = self.float_ctx.place_float(
                     cs.float,
-                    cursor_y,
+                    float_y,
                     mb.width,
                     mb.height,
                     content_x,
@@ -700,37 +792,63 @@ impl LayoutEngine {
                 continue;
             }
 
+            if self.is_self_collapsing_empty(cid, content_w, cb_height) {
+                self.collect_empty_margins(cid, content_w, &mut pending_pos, &mut pending_neg);
+                let empty_y = base_y + pending_pos + pending_neg;
+                self.layout_box(
+                    cid,
+                    content_w,
+                    cb_height,
+                    content_x,
+                    empty_y,
+                    SizeConstraint::Available(content_w),
+                );
+                has_prev = true;
+                continue;
+            }
+
             let cctx = self.calc_ctx(&cs, content_w);
             let mt = cs.margin_top.resolve_or(&cctx, 0.0);
-            let collapsed_y = if has_prev {
-                let adj = if prev_margin_bottom >= 0.0 && mt >= 0.0 {
-                    prev_margin_bottom.min(mt)
-                } else if prev_margin_bottom < 0.0 && mt < 0.0 {
-                    prev_margin_bottom.max(mt)
-                } else {
-                    0.0
-                };
-                cursor_y - adj
+            let comb_margin = if has_prev {
+                pending_pos.max(mt.max(0.0)) + pending_neg.min(mt.min(0.0))
+            } else if collapse_first_top && container_mt >= 0.0 && mt >= 0.0 && mt <= container_mt {
+                0.0
             } else {
-                cursor_y
+                mt
             };
+            let mut border_top_y = base_y + comb_margin;
+            if cs.clear != Clear::None {
+                let float_bottom = self.float_ctx.clear_y(cs.clear, f32::NEG_INFINITY);
+                if float_bottom > border_top_y {
+                    border_top_y = float_bottom;
+                }
+            }
+            let origin_y = border_top_y - mt;
 
             self.layout_box(
                 cid,
                 content_w,
                 cb_height,
                 content_x,
-                collapsed_y,
+                origin_y,
                 SizeConstraint::Available(content_w),
             );
-            self.apply_relative_offset(cid, content_w, cb_height);
 
-            let mb = self.tree.get(cid).dims.margin_box();
-            cursor_y = mb.bottom();
-            prev_margin_bottom = self.tree.get(cid).dims.margin.bottom;
+            let bb = self.tree.get(cid).dims.border_box();
+            base_y = bb.bottom();
+            let mb = self.tree.get(cid).dims.margin.bottom;
+            pending_pos = mb.max(0.0);
+            pending_neg = mb.min(0.0);
             has_prev = true;
+
+            self.apply_relative_offset(cid, content_w, cb_height);
         }
 
+        let cursor_y = if has_prev {
+            base_y + pending_pos + pending_neg
+        } else {
+            base_y
+        };
         let total_h = (cursor_y - content_y).max(0.0);
 
         self.tree.get_mut(container_id).dims.content.height = explicit_h.unwrap_or(total_h);
@@ -955,6 +1073,18 @@ impl LayoutEngine {
                         let dx = cur_x - mb.x;
                         let dy = cur_y - mb.y;
                         self.translate_subtree(item_id, dx, dy);
+                    }
+                    let final_mb = self.tree.get(item_id).dims.margin_box();
+                    if matches!(item_kind, BoxKind::Replaced(_))
+                        && item_style.vertical_align == peedle_css::VerticalAlign::Baseline
+                    {
+                        let strut_ascent = container_style.font_size * 0.82
+                            + (base_line_h - container_style.font_size) * 0.5;
+                        let target_y = cur_y + (strut_ascent - final_mb.height).max(0.0);
+                        let dy = target_y - final_mb.y;
+                        if dy.abs() > 0.01 {
+                            self.translate_subtree(item_id, 0.0, dy);
+                        }
                     }
                     let final_mb = self.tree.get(item_id).dims.margin_box();
                     line_box_items.push(item_id);
@@ -1433,7 +1563,7 @@ fn tokenize_inline_text(text: &str, preserve_spaces: bool, preserve_newlines: bo
             last_was_space = false;
             continue;
         }
-        if c.is_whitespace() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0C') {
             if !word.is_empty() {
                 out.push(std::mem::take(&mut word));
             }

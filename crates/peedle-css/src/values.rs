@@ -815,8 +815,15 @@ fn parse_percent_or_number(tok: &Token, max_val: f32) -> Option<f32> {
 }
 
 fn parse_hsl_fn(inner: &[Token]) -> Option<Color> {
+    let legacy_commas = inner.iter().any(|t| matches!(t, Token::Comma));
     let (ch, alpha) = split_color_args(inner);
     if ch.len() != 3 {
+        return None;
+    }
+    if legacy_commas
+        && (!matches!(ch[1], Token::Percentage { .. })
+            || !matches!(ch[2], Token::Percentage { .. }))
+    {
         return None;
     }
     let h = parse_angle_deg(ch[0])?.rem_euclid(360.0);

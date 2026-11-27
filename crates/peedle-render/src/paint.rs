@@ -43,6 +43,27 @@ pub fn paint_layout(
     }
 }
 
+fn is_inline_only_container(tree: &LayoutTree, id: LayoutBoxId) -> bool {
+    let b = tree.get(id);
+    if b.style.background_color.a > 0
+        || !matches!(b.style.background_image, BackgroundImage::None)
+        || b.dims.border.horizontal() > 0.0
+        || b.dims.border.vertical() > 0.0
+    {
+        return false;
+    }
+    !b.children.is_empty()
+        && b.children.iter().all(|&c| {
+            let cb = tree.get(c);
+            cb.style.float == peedle_css::Float::None
+                && cb.style.position == peedle_css::Position::Static
+                && matches!(
+                    cb.kind,
+                    BoxKind::Inline | BoxKind::InlineBlock | BoxKind::Text(_) | BoxKind::Replaced(_)
+                )
+        })
+}
+
 fn to_rgba(c: Color) -> RgbaColor {
     RgbaColor::new(c.r, c.g, c.b, c.a)
 }
@@ -160,29 +181,57 @@ fn paint_box(
                             peedle_css::BackgroundRepeat::RepeatY => (false, true),
                             _ => (true, true),
                         };
-                        let max_cols = if rep_x && tw >= 1.0 {
-                            ((bb.width / tw).ceil() as usize).min(2048)
+                        let (area_x, area_y, area_w, area_h) = if b.style.background_attachment_fixed {
+                            (0.0f32, 0.0f32, fb.width as f32, fb.height as f32)
                         } else {
-                            1
+                            (rx, ry, bb.width, bb.height)
                         };
-                        let max_rows = if rep_y && th >= 1.0 {
-                            ((bb.height / th).ceil() as usize).min(2048)
-                        } else {
-                            1
+                        let ctx_x = CalcContext {
+                            font_size: b.style.font_size,
+                            root_font_size: 16.0,
+                            viewport_width: fb.width as f32,
+                            viewport_height: fb.height as f32,
+                            percentage_base: (area_w - tw).max(0.0),
                         };
+                        let ctx_y = CalcContext {
+                            percentage_base: (area_h - th).max(0.0),
+                            ..ctx_x
+                        };
+                        let bg_ox = area_x + b.style.background_position_x.resolve_or(&ctx_x, 0.0);
+                        let bg_oy = area_y + b.style.background_position_y.resolve_or(&ctx_y, 0.0);
+
                         if img.width == 1 && img.height == 1 && rep_x && rep_y {
                             let c = RgbaColor::new(img.rgba[0], img.rgba[1], img.rgba[2], img.rgba[3])
                                 .with_alpha(alpha);
                             fb.fill_rounded_rect(rx, ry, bb.width, bb.height, radii, c);
                         } else {
-                            for row in 0..max_rows {
-                                for col in 0..max_cols {
+                            let (c_start, c_end) = if rep_x && tw >= 1.0 {
+                                let s = ((rx - bg_ox) / tw).floor() as i32;
+                                let e = ((rx + bb.width - bg_ox) / tw).ceil() as i32;
+                                (s, e.min(s + 2048))
+                            } else {
+                                (0, 1)
+                            };
+                            let (r_start, r_end) = if rep_y && th >= 1.0 {
+                                let s = ((ry - bg_oy) / th).floor() as i32;
+                                let e = ((ry + bb.height - bg_oy) / th).ceil() as i32;
+                                (s, e.min(s + 2048))
+                            } else {
+                                (0, 1)
+                            };
+                            for row in r_start..r_end {
+                                for col in c_start..c_end {
+                                    let tx = bg_ox + col as f32 * tw;
+                                    let ty = bg_oy + row as f32 * th;
+                                    if tx + tw <= rx || tx >= rx + bb.width || ty + th <= ry || ty >= ry + bb.height {
+                                        continue;
+                                    }
                                     fb.blit_rgba(
                                         img.width,
                                         img.height,
                                         &img.rgba,
-                                        rx + col as f32 * tw,
-                                        ry + row as f32 * th,
+                                        tx,
+                                        ty,
                                         tw,
                                         th,
                                         alpha,
@@ -308,7 +357,24 @@ fn paint_box(
     }
 
     let mut ordered_children = b.children.clone();
-    ordered_children.sort_by_key(|&cid| tree.get(cid).style.z_index.unwrap_or(0));
+    ordered_children.sort_by_key(|&cid| {
+        let cb = tree.get(cid);
+        let z = cb.style.z_index.unwrap_or(0);
+        let positioned = cb.style.position != peedle_css::Position::Static;
+        if positioned && z < 0 {
+            (0i32, z)
+        } else if positioned {
+            (4i32, z)
+        } else if cb.style.float != peedle_css::Float::None {
+            (2i32, 0)
+        } else if matches!(cb.kind, BoxKind::Inline | BoxKind::InlineBlock | BoxKind::Text(_) | BoxKind::Replaced(_))
+            || is_inline_only_container(tree, cid)
+        {
+            (3i32, 0)
+        } else {
+            (1i32, 0)
+        }
+    });
 
     let (scroll_dx, scroll_dy) = b
         .node

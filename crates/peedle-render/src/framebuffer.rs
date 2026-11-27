@@ -347,17 +347,67 @@ impl Framebuffer {
             return;
         }
 
-        if widths[0] > 0.0 {
-            self.fill_rect(x, y, w, widths[0], colors[0]);
+        let [bt, br, bb, bl] = widths;
+        let clip = self.current_clip();
+        let x0 = (x.floor() as i32).max(clip.x);
+        let y0 = (y.floor() as i32).max(clip.y);
+        let x1 = ((x + w).ceil() as i32).min(clip.x + clip.w);
+        let y1 = ((y + h).ceil() as i32).min(clip.y + clip.h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
         }
-        if widths[1] > 0.0 {
-            self.fill_rect(x + w - widths[1], y, widths[1], h, colors[1]);
-        }
-        if widths[2] > 0.0 {
-            self.fill_rect(x, y + h - widths[2], w, widths[2], colors[2]);
-        }
-        if widths[3] > 0.0 {
-            self.fill_rect(x, y, widths[3], h, colors[3]);
+
+        let inner_l = x + bl;
+        let inner_r = x + w - br;
+        let inner_t = y + bt;
+        let inner_b = y + h - bb;
+
+        for py in y0..y1 {
+            let cy = py as f32 + 0.5;
+            let in_top = bt > 0.0 && cy < inner_t;
+            let in_bot = bb > 0.0 && cy >= inner_b;
+            for px in x0..x1 {
+                let cx = px as f32 + 0.5;
+                let in_left = bl > 0.0 && cx < inner_l;
+                let in_right = br > 0.0 && cx >= inner_r;
+                if !in_top && !in_bot && !in_left && !in_right {
+                    continue;
+                }
+                let mut best_side: Option<usize> = None;
+                let mut best_ratio = f32::INFINITY;
+                if in_top {
+                    let r = (cy - y) / bt;
+                    if r < best_ratio {
+                        best_ratio = r;
+                        best_side = Some(0);
+                    }
+                }
+                if in_right {
+                    let r = (x + w - cx) / br;
+                    if r < best_ratio {
+                        best_ratio = r;
+                        best_side = Some(1);
+                    }
+                }
+                if in_bot {
+                    let r = (y + h - cy) / bb;
+                    if r < best_ratio {
+                        best_ratio = r;
+                        best_side = Some(2);
+                    }
+                }
+                if in_left {
+                    let r = (cx - x) / bl;
+                    if r < best_ratio {
+                        best_side = Some(3);
+                    }
+                }
+                if let Some(side) = best_side {
+                    if colors[side].a > 0 {
+                        self.blend_pixel(px, py, colors[side]);
+                    }
+                }
+            }
         }
     }
 

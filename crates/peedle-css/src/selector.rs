@@ -1259,7 +1259,10 @@ fn matches_pseudo_class(
     scope: Option<NodeId>,
 ) -> bool {
     match pc {
-        PseudoClass::Root => doc.document_element() == Some(node),
+        PseudoClass::Root => doc
+            .node(node)
+            .parent
+            .map_or(false, |p| matches!(doc.node(p).data, NodeData::Document { .. })),
         PseudoClass::Empty => {
             for child in doc.children(node) {
                 match &doc.node(child).data {
@@ -1271,13 +1274,21 @@ fn matches_pseudo_class(
             true
         }
         PseudoClass::FirstChild => {
-            doc.node(node).parent.is_some() && prev_element_sibling(doc, node).is_none()
+            doc.node(node)
+                .parent
+                .map_or(false, |p| doc.element(p).is_some())
+                && prev_element_sibling(doc, node).is_none()
         }
         PseudoClass::LastChild => {
-            doc.node(node).parent.is_some() && next_element_sibling(doc, node).is_none()
+            doc.node(node)
+                .parent
+                .map_or(false, |p| doc.element(p).is_some())
+                && next_element_sibling(doc, node).is_none()
         }
         PseudoClass::OnlyChild => {
-            doc.node(node).parent.is_some()
+            doc.node(node)
+                .parent
+                .map_or(false, |p| doc.element(p).is_some())
                 && prev_element_sibling(doc, node).is_none()
                 && next_element_sibling(doc, node).is_none()
         }
@@ -1285,6 +1296,9 @@ fn matches_pseudo_class(
             let Some(parent) = doc.node(node).parent else {
                 return false;
             };
+            if doc.element(parent).is_none() {
+                return false;
+            }
             if let Some(ref filter) = of {
                 if !matches_selector_list(doc, node, filter, scope) {
                     return false;
@@ -1309,6 +1323,9 @@ fn matches_pseudo_class(
             let Some(parent) = doc.node(node).parent else {
                 return false;
             };
+            if doc.element(parent).is_none() {
+                return false;
+            }
             if let Some(ref filter) = of {
                 if !matches_selector_list(doc, node, filter, scope) {
                     return false;
@@ -1333,6 +1350,9 @@ fn matches_pseudo_class(
             let Some(parent) = doc.node(node).parent else {
                 return false;
             };
+            if doc.element(parent).is_none() {
+                return false;
+            }
             doc.element_children(parent)
                 .into_iter()
                 .find(|&id| {
@@ -1345,6 +1365,9 @@ fn matches_pseudo_class(
             let Some(parent) = doc.node(node).parent else {
                 return false;
             };
+            if doc.element(parent).is_none() {
+                return false;
+            }
             doc.element_children(parent)
                 .into_iter()
                 .rev()
@@ -1358,6 +1381,9 @@ fn matches_pseudo_class(
             let Some(parent) = doc.node(node).parent else {
                 return false;
             };
+            if doc.element(parent).is_none() {
+                return false;
+            }
             let count = doc
                 .element_children(parent)
                 .into_iter()
@@ -1372,6 +1398,9 @@ fn matches_pseudo_class(
             let Some(parent) = doc.node(node).parent else {
                 return false;
             };
+            if doc.element(parent).is_none() {
+                return false;
+            }
             let mut idx = 0usize;
             for sib in doc.element_children(parent) {
                 let same = doc
@@ -1390,6 +1419,9 @@ fn matches_pseudo_class(
             let Some(parent) = doc.node(node).parent else {
                 return false;
             };
+            if doc.element(parent).is_none() {
+                return false;
+            }
             let mut idx = 0usize;
             for sib in doc.element_children(parent).into_iter().rev() {
                 let same = doc
@@ -1426,8 +1458,12 @@ fn matches_pseudo_class(
         PseudoClass::Checked => {
             if el.tag_is("option") {
                 el.has_attr("selected")
+            } else if el.tag_is("input") {
+                let ty = el.get_attr("type").unwrap_or("text");
+                (ty.eq_ignore_ascii_case("checkbox") || ty.eq_ignore_ascii_case("radio"))
+                    && el.is_checked()
             } else {
-                el.is_checked()
+                false
             }
         }
         PseudoClass::Disabled => is_form_control(el) && is_effectively_disabled(doc, node, el),

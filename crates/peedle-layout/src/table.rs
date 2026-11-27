@@ -6,13 +6,18 @@ use crate::engine::{LayoutEngine, SizeConstraint};
 pub fn layout_table(
     engine: &mut LayoutEngine,
     id: LayoutBoxId,
-    _cb_width: f32,
+    cb_width: f32,
     cb_height: f32,
 ) {
     let style = engine.tree.get(id).style.clone();
     let content_x = engine.tree.get(id).dims.content.x;
     let content_y = engine.tree.get(id).dims.content.y;
-    let table_w = engine.tree.get(id).dims.content.width;
+    let dims = engine.tree.get(id).dims;
+    let table_w = if style.width == LengthPercentageAuto::Auto {
+        (cb_width - dims.margin.horizontal() - dims.border.horizontal() - dims.padding.horizontal()).max(0.0)
+    } else {
+        dims.content.width
+    };
     let explicit_h = engine.resolve_explicit_height(&style, cb_height);
 
     let (sx, sy) = if style.border_collapse == BorderCollapse::Collapse {
@@ -21,24 +26,13 @@ pub fn layout_table(
         (style.border_spacing_x, style.border_spacing_y)
     };
 
-    let mut rows: Vec<LayoutBoxId> = Vec::new();
-    collect_table_rows(engine, id, &mut rows);
+    let mut row_entries: Vec<(Option<LayoutBoxId>, Vec<(LayoutBoxId, usize)>)> = Vec::new();
+    collect_table_rows_and_cells(engine, id, &mut row_entries);
 
-    let mut row_cells: Vec<Vec<(LayoutBoxId, usize)>> = Vec::new();
     let mut num_cols = 0usize;
-    for &rid in &rows {
-        let mut cells = Vec::new();
-        let mut cols_in_row = 0usize;
-        for &cid in &engine.tree.get(rid).children {
-            let colspan = match engine.tree.get(cid).kind {
-                BoxKind::TableCell { colspan, .. } => colspan.max(1),
-                _ => 1,
-            };
-            cells.push((cid, colspan));
-            cols_in_row += colspan;
-        }
+    for (_, cells) in &row_entries {
+        let cols_in_row: usize = cells.iter().map(|(_, cs)| *cs).sum();
         num_cols = num_cols.max(cols_in_row);
-        row_cells.push(cells);
     }
 
     if num_cols == 0 {
@@ -47,14 +41,17 @@ pub fn layout_table(
     }
 
     let mut col_preferred = vec![0.0f32; num_cols];
-    for cells in &row_cells {
+    for (_, cells) in &row_entries {
         let mut col = 0usize;
         for &(cid, colspan) in cells {
             if colspan == 1 && col < num_cols {
                 let cs = engine.tree.get(cid).style.clone();
                 let cctx = engine.calc_ctx(&cs, table_w);
                 let pref = if let Some(w) = cs.width.resolve(&cctx) {
-                    w
+                    w + cs.padding_left.resolve_or(&cctx, 0.0)
+                        + cs.padding_right.resolve_or(&cctx, 0.0)
+                        + cs.border_left_width
+                        + cs.border_right_width
                 } else {
                     engine.measure_intrinsic_width(cid, table_w)
                         + cs.padding_left.resolve_or(&cctx, 0.0)
@@ -62,7 +59,7 @@ pub fn layout_table(
                         + cs.border_left_width
                         + cs.border_right_width
                 };
-                col_preferred[col] = col_preferred[col].max(pref.max(24.0));
+                col_preferred[col] = col_preferred[col].max(pref);
             }
             col += colspan;
         }
@@ -89,8 +86,7 @@ pub fn layout_table(
     }
 
     let mut cursor_y = sy;
-    for (r_idx, &rid) in rows.iter().enumerate() {
-        let cells = &row_cells[r_idx];
+    for (rid_opt, cells) in &row_entries {
         let mut col = 0usize;
         let mut cursor_x = sx;
         let mut row_h = 0.0f32;
@@ -119,11 +115,13 @@ pub fn layout_table(
             b.dims.content.height = (row_h - extra_h).max(b.dims.content.height);
         }
 
-        let rbox = engine.tree.get_mut(rid);
-        rbox.dims.content.x = content_x;
-        rbox.dims.content.y = content_y + cursor_y;
-        rbox.dims.content.width = actual_table_w;
-        rbox.dims.content.height = row_h;
+        if let Some(rid) = *rid_opt {
+            let rbox = engine.tree.get_mut(rid);
+            rbox.dims.content.x = content_x;
+            rbox.dims.content.y = content_y + cursor_y;
+            rbox.dims.content.width = actual_table_w;
+            rbox.dims.content.height = row_h;
+        }
 
         cursor_y += row_h + sy;
     }
@@ -131,13 +129,46 @@ pub fn layout_table(
     engine.tree.get_mut(id).dims.content.height = explicit_h.unwrap_or(cursor_y);
 }
 
-fn collect_table_rows(engine: &LayoutEngine, parent: LayoutBoxId, out: &mut Vec<LayoutBoxId>) {
+fn collect_table_rows_and_cells(
+    engine: &LayoutEngine,
+    parent: LayoutBoxId,
+    out: &mut Vec<(Option<LayoutBoxId>, Vec<(LayoutBoxId, usize)>)>,
+) {
     let kids = engine.tree.get(parent).children.clone();
+    let mut anon_cells: Vec<(LayoutBoxId, usize)> = Vec::new();
     for cid in kids {
         match engine.tree.get(cid).kind {
-            BoxKind::TableRow => out.push(cid),
-            BoxKind::TableRowGroup => collect_table_rows(engine, cid, out),
-            _ => {}
+            BoxKind::TableRow => {
+                if !anon_cells.is_empty() {
+                    out.push((None, std::mem::take(&mut anon_cells)));
+                }
+                let mut cells = Vec::new();
+                for &cell_id in &engine.tree.get(cid).children {
+                    let colspan = match engine.tree.get(cell_id).kind {
+                        BoxKind::TableCell { colspan, .. } => colspan.max(1),
+                        BoxKind::Text(ref t) if t.trim().is_empty() => continue,
+                        _ => 1,
+                    };
+                    cells.push((cell_id, colspan));
+                }
+                out.push((Some(cid), cells));
+            }
+            BoxKind::TableRowGroup => {
+                if !anon_cells.is_empty() {
+                    out.push((None, std::mem::take(&mut anon_cells)));
+                }
+                collect_table_rows_and_cells(engine, cid, out);
+            }
+            BoxKind::Text(ref t) if t.trim().is_empty() => {}
+            BoxKind::TableCell { colspan, .. } => {
+                anon_cells.push((cid, colspan.max(1)));
+            }
+            _ => {
+                anon_cells.push((cid, 1));
+            }
         }
+    }
+    if !anon_cells.is_empty() {
+        out.push((None, anon_cells));
     }
 }

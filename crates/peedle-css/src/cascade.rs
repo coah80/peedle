@@ -518,7 +518,7 @@ fn compute_element_style(
     }
     style.custom_properties = resolved_custom;
 
-    let mut expanded_winners: HashMap<String, (CascadeKey, Vec<Token>)> = HashMap::new();
+    let mut expanded_lists: HashMap<String, Vec<(CascadeKey, Vec<Token>)>> = HashMap::new();
     let mut ua_winners: HashMap<String, (CascadeKey, Vec<Token>)> = HashMap::new();
 
     for (key, decl) in normal_entries {
@@ -546,19 +546,19 @@ fn compute_element_style(
                 }
             }
 
-            let rep = expanded_winners
-                .get(&prop_name)
-                .map_or(true, |(k, _)| sub_key >= *k);
-            if rep {
-                expanded_winners.insert(prop_name, (sub_key, prop_val));
-            }
+            expanded_lists
+                .entry(prop_name)
+                .or_default()
+                .push((sub_key, prop_val));
         }
     }
 
-    if let Some((_, val)) = expanded_winners.remove("font-size") {
-        let effective = resolve_revert("font-size", val, &ua_winners);
-        if let Some(tokens) = effective {
-            apply_font_size(&mut style, parent, root_font_size, viewport, &tokens);
+    if let Some(mut entries) = expanded_lists.remove("font-size") {
+        entries.sort_by_key(|(k, _)| *k);
+        for (_, val) in entries {
+            if let Some(tokens) = resolve_revert("font-size", val, &ua_winners) {
+                apply_font_size(&mut style, parent, root_font_size, viewport, &tokens);
+            }
         }
     }
 
@@ -570,17 +570,23 @@ fn compute_element_style(
         percentage_base: 0.0,
     };
 
-    if let Some((_, val)) = expanded_winners.remove("color") {
-        if let Some(tokens) = resolve_revert("color", val, &ua_winners) {
-            apply_color_prop(&mut style, parent, &tokens);
+    if let Some(mut entries) = expanded_lists.remove("color") {
+        entries.sort_by_key(|(k, _)| *k);
+        for (_, val) in entries {
+            if let Some(tokens) = resolve_revert("color", val, &ua_winners) {
+                apply_color_prop(&mut style, parent, &tokens);
+            }
         }
     }
 
-    for (prop, (_, val)) in expanded_winners {
-        let Some(tokens) = resolve_revert(&prop, val, &ua_winners) else {
-            continue;
-        };
-        apply_longhand(&mut style, parent, &prop, &tokens, &ctx);
+    for (prop, mut entries) in expanded_lists {
+        entries.sort_by_key(|(k, _)| *k);
+        for (_, val) in entries {
+            let Some(tokens) = resolve_revert(&prop, val, &ua_winners) else {
+                continue;
+            };
+            apply_longhand(&mut style, parent, &prop, &tokens, &ctx);
+        }
     }
 
     if matches!(style.border_top_style, BorderStyle::None | BorderStyle::Hidden) {
@@ -1096,11 +1102,14 @@ fn expand_background(tokens: &[Token]) -> Vec<(String, Vec<Token>)> {
         ("background-image".into(), tokenize("none")),
         ("background-repeat".into(), tokenize("repeat")),
         ("background-size".into(), tokenize("auto")),
+        ("background-attachment".into(), tokenize("scroll")),
+        ("background-position".into(), tokenize("0% 0%")),
     ];
     let layers = split_commas(tokens);
     let last_layer = layers.last().copied().unwrap_or(tokens);
     let first_layer = layers.first().copied().unwrap_or(tokens);
 
+    let mut pos_tokens: Vec<Token> = Vec::new();
     for g in split_whitespace_groups(first_layer) {
         if parse_background_image(g, Color::BLACK).is_some() {
             if !matches!(g.first(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("none")) {
@@ -1121,7 +1130,31 @@ fn expand_background(tokens: &[Token]) -> Vec<(String, Vec<Token>)> {
                 out.push(("background-size".into(), g.to_vec()));
                 continue;
             }
+            if matches!(lower.as_str(), "fixed" | "scroll" | "local") {
+                out.push(("background-attachment".into(), g.to_vec()));
+                continue;
+            }
+            if matches!(lower.as_str(), "left" | "right" | "top" | "bottom" | "center") {
+                if !pos_tokens.is_empty() {
+                    pos_tokens.push(Token::Whitespace);
+                }
+                pos_tokens.extend_from_slice(g);
+                continue;
+            }
         }
+        if matches!(
+            g.first(),
+            Some(Token::Dimension { .. } | Token::Percentage { .. } | Token::Number { .. })
+        ) {
+            if !pos_tokens.is_empty() {
+                pos_tokens.push(Token::Whitespace);
+            }
+            pos_tokens.extend_from_slice(g);
+            continue;
+        }
+    }
+    if !pos_tokens.is_empty() {
+        out.push(("background-position".into(), pos_tokens));
     }
 
     let mut color_count = 0usize;
@@ -2092,6 +2125,11 @@ fn apply_longhand(
                     .unwrap_or(LengthPercentageAuto::Percent(50.0));
             }
         }
+        "background-attachment" => {
+            if let Some(s) = ident.as_deref() {
+                style.background_attachment_fixed = s == "fixed";
+            }
+        }
         "opacity" => match trimmed.first() {
             Some(Token::Number { value, .. }) => style.opacity = value.clamp(0.0, 1.0),
             Some(Token::Percentage { value, .. }) => style.opacity = (value / 100.0).clamp(0.0, 1.0),
@@ -2350,18 +2388,40 @@ fn apply_longhand(
                 style.cursor = match s {
                     "auto" => Cursor::Auto,
                     "default" => Cursor::Default,
+                    "none" => Cursor::None,
+                    "context-menu" => Cursor::ContextMenu,
+                    "help" => Cursor::Help,
                     "pointer" => Cursor::Pointer,
+                    "progress" => Cursor::Progress,
+                    "wait" => Cursor::Wait,
+                    "cell" => Cursor::Cell,
+                    "crosshair" => Cursor::Crosshair,
                     "text" => Cursor::Text,
+                    "vertical-text" => Cursor::VerticalText,
+                    "alias" => Cursor::Alias,
+                    "copy" => Cursor::Copy,
                     "move" => Cursor::Move,
+                    "no-drop" => Cursor::NoDrop,
                     "not-allowed" => Cursor::NotAllowed,
                     "grab" => Cursor::Grab,
                     "grabbing" => Cursor::Grabbing,
-                    "crosshair" => Cursor::Crosshair,
-                    "wait" => Cursor::Wait,
-                    "help" => Cursor::Help,
+                    "e-resize" => Cursor::EResize,
+                    "n-resize" => Cursor::NResize,
+                    "ne-resize" => Cursor::NeResize,
+                    "nw-resize" => Cursor::NwResize,
+                    "s-resize" => Cursor::SResize,
+                    "se-resize" => Cursor::SeResize,
+                    "sw-resize" => Cursor::SwResize,
+                    "w-resize" => Cursor::WResize,
+                    "ew-resize" => Cursor::EwResize,
+                    "ns-resize" => Cursor::NsResize,
+                    "nesw-resize" => Cursor::NeswResize,
+                    "nwse-resize" => Cursor::NwseResize,
                     "col-resize" => Cursor::ColResize,
                     "row-resize" => Cursor::RowResize,
-                    "none" => Cursor::None,
+                    "all-scroll" => Cursor::AllScroll,
+                    "zoom-in" => Cursor::ZoomIn,
+                    "zoom-out" => Cursor::ZoomOut,
                     _ => return,
                 };
             }

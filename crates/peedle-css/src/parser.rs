@@ -122,12 +122,19 @@ pub enum MediaFeature {
     Height(RangeOp, f32),
     WidthRange(f32, RangeOp, RangeOp, f32),
     HeightRange(f32, RangeOp, RangeOp, f32),
+    MinColor(i32),
+    MaxColor(i32),
+    Color(i32),
+    MinMonochrome(i32),
+    MaxMonochrome(i32),
+    Monochrome(i32),
     PrefersColorScheme(bool),
     OrientationLandscape,
     OrientationPortrait,
     Hover(bool),
     Pointer(String),
     Unknown(bool),
+    Invalid,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,6 +154,17 @@ impl MediaCondition {
             MediaCondition::Or(list) => list.iter().any(|c| c.evaluate(vp)),
         }
     }
+
+    pub fn has_invalid(&self) -> bool {
+        match self {
+            MediaCondition::Feature(MediaFeature::Invalid) => true,
+            MediaCondition::Feature(_) => false,
+            MediaCondition::Not(inner) => inner.has_invalid(),
+            MediaCondition::And(list) | MediaCondition::Or(list) => {
+                list.iter().any(|c| c.has_invalid())
+            }
+        }
+    }
 }
 
 impl MediaFeature {
@@ -164,12 +182,19 @@ impl MediaFeature {
             MediaFeature::HeightRange(lo, op1, op2, hi) => {
                 eval_cmp(*lo, *op1, vp.height) && eval_cmp(vp.height, *op2, *hi)
             }
+            MediaFeature::MinColor(v) => 8 >= *v,
+            MediaFeature::MaxColor(v) => 8 <= *v,
+            MediaFeature::Color(v) => 8 == *v,
+            MediaFeature::MinMonochrome(v) => 0 >= *v,
+            MediaFeature::MaxMonochrome(v) => 0 <= *v,
+            MediaFeature::Monochrome(v) => 0 == *v,
             MediaFeature::PrefersColorScheme(dark) => vp.dark_mode == *dark,
             MediaFeature::OrientationLandscape => vp.width >= vp.height,
             MediaFeature::OrientationPortrait => vp.height > vp.width,
             MediaFeature::Hover(want_hover) => *want_hover,
             MediaFeature::Pointer(kind) => kind.eq_ignore_ascii_case("fine"),
             MediaFeature::Unknown(val) => *val,
+            MediaFeature::Invalid => false,
         }
     }
 }
@@ -193,6 +218,9 @@ pub struct MediaQuery {
 
 impl MediaQuery {
     pub fn matches(&self, vp: &Viewport) -> bool {
+        if self.condition.as_ref().map_or(false, |c| c.has_invalid()) {
+            return false;
+        }
         let type_ok = matches!(self.media_type, MediaType::All | MediaType::Screen);
         let cond_ok = self.condition.as_ref().map_or(true, |c| c.evaluate(vp));
         let raw = type_ok && cond_ok;
@@ -1238,7 +1266,7 @@ fn parse_single_media_query(tokens: &[Token]) -> MediaQuery {
     } else {
         Some(
             parse_media_condition(rest)
-                .unwrap_or(MediaCondition::Feature(MediaFeature::Unknown(false))),
+                .unwrap_or(MediaCondition::Feature(MediaFeature::Invalid)),
         )
     };
 
@@ -1251,7 +1279,12 @@ fn parse_single_media_query(tokens: &[Token]) -> MediaQuery {
 
 fn parse_media_condition(tokens: &[Token]) -> Option<MediaCondition> {
     let mut p = CondParser::new(tokens);
-    p.parse_media_expr()
+    let cond = p.parse_media_expr()?;
+    p.skip_ws();
+    if p.peek().is_some() {
+        return None;
+    }
+    Some(cond)
 }
 
 fn parse_supports_condition_tokens(tokens: &[Token]) -> Option<SupportsCondition> {
@@ -1528,6 +1561,54 @@ fn parse_media_feature(tokens: &[Token]) -> MediaFeature {
                 .and_then(|t| parse_media_length_px(t))
                 .map(|v| MediaFeature::Height(RangeOp::Eq, v))
                 .unwrap_or(MediaFeature::Unknown(false)),
+            "min-color" => match val {
+                Some(Token::Number {
+                    value,
+                    kind: crate::tokenizer::NumericKind::Integer,
+                    ..
+                }) if *value >= 0.0 => MediaFeature::MinColor(*value as i32),
+                _ => MediaFeature::Invalid,
+            },
+            "max-color" => match val {
+                Some(Token::Number {
+                    value,
+                    kind: crate::tokenizer::NumericKind::Integer,
+                    ..
+                }) if *value >= 0.0 => MediaFeature::MaxColor(*value as i32),
+                _ => MediaFeature::Invalid,
+            },
+            "color" => match val {
+                Some(Token::Number {
+                    value,
+                    kind: crate::tokenizer::NumericKind::Integer,
+                    ..
+                }) if *value >= 0.0 => MediaFeature::Color(*value as i32),
+                _ => MediaFeature::Invalid,
+            },
+            "min-monochrome" => match val {
+                Some(Token::Number {
+                    value,
+                    kind: crate::tokenizer::NumericKind::Integer,
+                    ..
+                }) if *value >= 0.0 => MediaFeature::MinMonochrome(*value as i32),
+                _ => MediaFeature::Invalid,
+            },
+            "max-monochrome" => match val {
+                Some(Token::Number {
+                    value,
+                    kind: crate::tokenizer::NumericKind::Integer,
+                    ..
+                }) if *value >= 0.0 => MediaFeature::MaxMonochrome(*value as i32),
+                _ => MediaFeature::Invalid,
+            },
+            "monochrome" => match val {
+                Some(Token::Number {
+                    value,
+                    kind: crate::tokenizer::NumericKind::Integer,
+                    ..
+                }) if *value >= 0.0 => MediaFeature::Monochrome(*value as i32),
+                _ => MediaFeature::Invalid,
+            },
             "prefers-color-scheme" => match val {
                 Some(Token::Ident(s)) if s.eq_ignore_ascii_case("dark") => {
                     MediaFeature::PrefersColorScheme(true)
@@ -1535,7 +1616,7 @@ fn parse_media_feature(tokens: &[Token]) -> MediaFeature {
                 Some(Token::Ident(s)) if s.eq_ignore_ascii_case("light") => {
                     MediaFeature::PrefersColorScheme(false)
                 }
-                _ => MediaFeature::Unknown(false),
+                _ => MediaFeature::Invalid,
             },
             "orientation" => match val {
                 Some(Token::Ident(s)) if s.eq_ignore_ascii_case("landscape") => {
@@ -1544,7 +1625,7 @@ fn parse_media_feature(tokens: &[Token]) -> MediaFeature {
                 Some(Token::Ident(s)) if s.eq_ignore_ascii_case("portrait") => {
                     MediaFeature::OrientationPortrait
                 }
-                _ => MediaFeature::Unknown(false),
+                _ => MediaFeature::Invalid,
             },
             "hover" => match val {
                 Some(Token::Ident(s)) if s.eq_ignore_ascii_case("hover") => {
@@ -1553,13 +1634,13 @@ fn parse_media_feature(tokens: &[Token]) -> MediaFeature {
                 Some(Token::Ident(s)) if s.eq_ignore_ascii_case("none") => {
                     MediaFeature::Hover(false)
                 }
-                _ => MediaFeature::Unknown(false),
+                _ => MediaFeature::Invalid,
             },
             "pointer" => match val {
                 Some(Token::Ident(s)) => MediaFeature::Pointer(s.clone()),
-                _ => MediaFeature::Unknown(false),
+                _ => MediaFeature::Invalid,
             },
-            _ => MediaFeature::Unknown(false),
+            _ => MediaFeature::Invalid,
         };
     }
 
@@ -1571,12 +1652,13 @@ fn parse_media_feature(tokens: &[Token]) -> MediaFeature {
         if let Token::Ident(s) = non_ws[0] {
             return match s.to_ascii_lowercase().as_str() {
                 "color" | "hover" | "pointer" => MediaFeature::Unknown(true),
-                _ => MediaFeature::Unknown(false),
+                "monochrome" => MediaFeature::Unknown(false),
+                _ => MediaFeature::Invalid,
             };
         }
     }
 
-    MediaFeature::Unknown(false)
+    MediaFeature::Invalid
 }
 
 fn read_range_op(tokens: &[&Token], idx: usize) -> Option<(RangeOp, usize)> {
