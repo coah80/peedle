@@ -264,3 +264,31 @@ fn wpt_table_respects_min_word_width() {
     assert!(c1.width >= 95.0, "column 1 must preserve unbroken word width: {:?}", c1);
     assert!(c2.x >= c1.right() - 0.5, "columns must not overlap: c1={:?} c2={:?}", c1, c2);
 }
+
+#[test]
+fn wpt_ellipsis_fits_and_inline_flex_shrinks_to_fit() {
+    let (doc, tree) = run_layout(
+        r#"
+            <div id="fit">crates</div>
+            <button id="btn"><span>Star</span><span>0</span></button>
+        "#,
+        r#"
+            body { margin: 0; font-size: 14px; }
+            #fit { display: inline-block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            #btn { display: inline-flex; gap: 6px; padding: 4px 10px; }
+        "#,
+        800.0,
+        400.0,
+    );
+    let fit_box = tree.box_of(doc.get_element_by_id("fit").unwrap()).unwrap();
+    let mut joined = String::new();
+    for &cid in &fit_box.children {
+        for f in &tree.get(cid).text_fragments {
+            joined.push_str(&f.text);
+        }
+    }
+    assert_eq!(joined, "crates", "fitting text must not be elided");
+
+    let btn = tree.bounding_rect(doc.get_element_by_id("btn").unwrap()).unwrap();
+    assert!(btn.width < 150.0, "inline-flex must shrink-to-fit instead of stretching: {:?}", btn);
+}

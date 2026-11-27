@@ -524,6 +524,9 @@ impl LayoutEngine {
                     } else if matches!(
                         kind,
                         BoxKind::InlineBlock | BoxKind::Table
+                    ) || matches!(
+                        style.display,
+                        Display::InlineFlex | Display::InlineGrid | Display::InlineTable
                     ) || style.float != Float::None
                     {
                         self.measure_intrinsic_width(id, avail_w).min((avail_w - pb_h).max(0.0))
@@ -1198,7 +1201,7 @@ impl LayoutEngine {
                             item_style.font_size,
                             item_style.font_weight,
                         );
-                        if use_ellipsis && cur_x + w > line_right - ellipsis_w {
+                        if use_ellipsis && cur_x + w > line_right + 0.5 {
                             let avail = (line_right - ellipsis_w - cur_x).max(0.0);
                             let mut kept = String::new();
                             for ch in tok.chars() {

@@ -1,10 +1,16 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use peedle_html::parse_html;
 
 use crate::fonts::FontSystem;
 use crate::framebuffer::Framebuffer;
 use crate::svg::render_svg_node;
+
+fn shared_svg_fonts() -> &'static FontSystem {
+    static FONTS: OnceLock<FontSystem> = OnceLock::new();
+    FONTS.get_or_init(FontSystem::load_system_fonts)
+}
 
 #[derive(Clone, Debug)]
 pub struct DecodedImage {
@@ -63,8 +69,7 @@ impl DecodedImage {
             .unwrap_or(64.0)
             .clamp(1.0, 1024.0) as u32;
         let mut fb = Framebuffer::new(w, h);
-        let fonts = FontSystem::load_system_fonts();
-        render_svg_node(&doc, svg_id, &mut fb, &fonts, 0.0, 0.0, w as f32, h as f32);
+        render_svg_node(&doc, svg_id, &mut fb, shared_svg_fonts(), 0.0, 0.0, w as f32, h as f32);
         Ok(Self {
             width: w,
             height: h,
