@@ -5,7 +5,7 @@ DEST="${1:-/Applications/Peedle.app}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/release/peedle"
 
-if [ ! -x "$BIN" ]; then
+if [ "${2:-}" != "--skip-build" ]; then
     cargo build --release --bin peedle --manifest-path "$ROOT/Cargo.toml"
 fi
 
