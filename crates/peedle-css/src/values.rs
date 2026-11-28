@@ -358,11 +358,12 @@ pub enum GridTrackSize {
     Repeat(GridRepeatCount, Vec<GridTrackSize>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GridPlacement {
     Auto,
     Line(i32),
     Span(u32),
+    Named(String),
 }
 
 impl Default for GridPlacement {
@@ -1792,15 +1793,23 @@ pub fn parse_filters(tokens: &[Token], ctx: &CalcContext, current: Color) -> Vec
 }
 
 pub fn parse_grid_tracks(tokens: &[Token], ctx: &CalcContext) -> Vec<GridTrackSize> {
+    parse_grid_tracks_with_names(tokens, ctx).0
+}
+
+pub fn parse_grid_tracks_with_names(
+    tokens: &[Token],
+    ctx: &CalcContext,
+) -> (Vec<GridTrackSize>, Vec<Vec<String>>) {
     let trimmed = trim_ws(tokens);
     if trimmed.len() == 1 {
         if let Token::Ident(s) = &trimmed[0] {
             if s.eq_ignore_ascii_case("none") {
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
         }
     }
     let mut tracks = Vec::new();
+    let mut line_names: Vec<Vec<String>> = vec![Vec::new()];
     let mut i = 0;
     while i < trimmed.len() {
         match &trimmed[i] {
@@ -1810,6 +1819,11 @@ pub fn parse_grid_tracks(tokens: &[Token], ctx: &CalcContext) -> Vec<GridTrackSi
             Token::OpenSquare => {
                 i += 1;
                 while i < trimmed.len() && trimmed[i] != Token::CloseSquare {
+                    if let Token::Ident(name) = &trimmed[i] {
+                        if let Some(slot) = line_names.last_mut() {
+                            slot.push(name.clone());
+                        }
+                    }
                     i += 1;
                 }
                 i += 1;
@@ -1829,6 +1843,7 @@ pub fn parse_grid_tracks(tokens: &[Token], ctx: &CalcContext) -> Vec<GridTrackSi
                 }
                 let end = if depth == 0 { i - 1 } else { i };
                 let inner = &trimmed[start..end];
+                let prev_len = tracks.len();
                 match lower.as_str() {
                     "minmax" => {
                         let args = split_commas(inner);
@@ -1876,16 +1891,20 @@ pub fn parse_grid_tracks(tokens: &[Token], ctx: &CalcContext) -> Vec<GridTrackSi
                     }
                     _ => {}
                 }
+                if tracks.len() > prev_len {
+                    line_names.push(Vec::new());
+                }
             }
             tok => {
                 if let Some(tr) = parse_single_track_token(tok, ctx) {
                     tracks.push(tr);
+                    line_names.push(Vec::new());
                 }
                 i += 1;
             }
         }
     }
-    tracks
+    (tracks, line_names)
 }
 
 fn parse_single_track(tokens: &[Token], ctx: &CalcContext) -> Option<GridTrackSize> {
@@ -1935,6 +1954,7 @@ pub fn parse_grid_placement(tokens: &[Token]) -> Option<GridPlacement> {
     if non_ws.len() == 1 {
         return match non_ws[0] {
             Token::Ident(s) if s.eq_ignore_ascii_case("auto") => Some(GridPlacement::Auto),
+            Token::Ident(s) if !s.eq_ignore_ascii_case("span") => Some(GridPlacement::Named(s.clone())),
             Token::Number { value, .. } => Some(GridPlacement::Line(value.round() as i32)),
             _ => None,
         };

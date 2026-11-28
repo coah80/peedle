@@ -99,6 +99,22 @@ pub fn extract_gsub_ligatures(font_bytes: &[u8]) -> Option<Arc<FontLigatures>> {
 static WEB_FONT_CACHE: OnceLock<Mutex<Vec<(String, u16, Arc<Font>, Option<Arc<FontLigatures>>)>>> =
     OnceLock::new();
 
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFFC}'
+    )
+}
+
 pub fn register_web_font_arc(family: &str, font: Arc<Font>) {
     register_web_font_arc_weighted_with_ligatures(family, 400, font, None);
 }
@@ -140,8 +156,8 @@ static SHARED_LAYOUT_FONTS: OnceLock<SharedLayoutFonts> = OnceLock::new();
 fn shared_fonts() -> &'static SharedLayoutFonts {
     SHARED_LAYOUT_FONTS.get_or_init(|| SharedLayoutFonts {
         sans: load_first(&[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
             "/System/Library/Fonts/Supplemental/Arial.ttf",
             "/System/Library/Fonts/SFNS.ttf",
@@ -150,8 +166,8 @@ fn shared_fonts() -> &'static SharedLayoutFonts {
             "C:\\Windows\\Fonts\\arial.ttf",
         ]),
         sans_bold: load_first(&[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
             "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
             "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
@@ -168,8 +184,8 @@ fn shared_fonts() -> &'static SharedLayoutFonts {
             "C:\\Windows\\Fonts\\ariali.ttf",
         ]),
         serif: load_first(&[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
             "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
             "/System/Library/Fonts/Supplemental/Georgia.ttf",
             "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
@@ -177,8 +193,8 @@ fn shared_fonts() -> &'static SharedLayoutFonts {
             "C:\\Windows\\Fonts\\times.ttf",
         ]),
         serif_bold: load_first(&[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
             "/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf",
             "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
             "/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf",
@@ -186,8 +202,8 @@ fn shared_fonts() -> &'static SharedLayoutFonts {
             "C:\\Windows\\Fonts\\timesbd.ttf",
         ]),
         mono: load_first(&[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
             "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
             "/System/Library/Fonts/Monaco.ttf",
             "/System/Library/Fonts/Supplemental/Courier New.ttf",
@@ -196,8 +212,8 @@ fn shared_fonts() -> &'static SharedLayoutFonts {
             "C:\\Windows\\Fonts\\cour.ttf",
         ]),
         mono_bold: load_first(&[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
             "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
             "C:\\Windows\\Fonts\\consolab.ttf",
             "C:\\Windows\\Fonts\\courbd.ttf",
@@ -261,7 +277,7 @@ impl TextMeasurer {
         }
     }
 
-    fn pick_kind(&self, families: &[String], weight: u16) -> u16 {
+    fn pick_kind(&self, families: &[String], weight: u16, italic: bool) -> u16 {
         let bold = weight >= 600;
         for fam in families {
             let low = fam.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
@@ -302,10 +318,22 @@ impl TextMeasurer {
                 || low.contains("avenir")
                 || low.contains("segoe")
             {
-                return if bold { 1 } else { 0 };
+                if bold {
+                    return 1;
+                }
+                if italic && self.sans_italic.is_some() {
+                    return 6;
+                }
+                return 0;
             }
         }
-        if bold { 1 } else { 0 }
+        if bold {
+            1
+        } else if italic && self.sans_italic.is_some() {
+            6
+        } else {
+            0
+        }
     }
 
     fn font_for(&self, kind: u16) -> Option<&Arc<Font>> {
@@ -360,7 +388,18 @@ impl TextMeasurer {
     }
 
     pub fn measure_str(&mut self, text: &str, families: &[String], font_size: f32, weight: u16) -> f32 {
-        let kind = self.pick_kind(families, weight);
+        self.measure_str_styled(text, families, font_size, weight, false)
+    }
+
+    pub fn measure_str_styled(
+        &mut self,
+        text: &str,
+        families: &[String],
+        font_size: f32,
+        weight: u16,
+        italic: bool,
+    ) -> f32 {
+        let kind = self.pick_kind(families, weight, italic);
         let px_key = (font_size.max(4.0) * 4.0).round() as u32;
         let px = px_key as f32 / 4.0;
         if kind >= 100 {
@@ -375,6 +414,9 @@ impl TextMeasurer {
                             total += font_arc.metrics_indexed(gid, px).advance_width;
                         }
                         ShapedGlyph::Char(c) => {
+                            if is_default_ignorable(c) {
+                                continue;
+                            }
                             if let Some(&adv) = self.width_cache.get(&(kind, px_key, c)) {
                                 total += adv;
                             } else {
@@ -393,6 +435,9 @@ impl TextMeasurer {
         }
         let mut total = 0.0f32;
         for c in text.chars() {
+            if is_default_ignorable(c) {
+                continue;
+            }
             if let Some(&adv) = self.width_cache.get(&(kind, px_key, c)) {
                 total += adv;
             } else {

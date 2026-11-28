@@ -37,6 +37,22 @@ impl Default for FontSystem {
     }
 }
 
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFFC}'
+    )
+}
+
 impl FontSystem {
     pub fn load_system_fonts() -> Self {
         let base = SYSTEM_FONT_CACHE.get_or_init(Self::load_system_fonts_uncached);
@@ -55,8 +71,8 @@ impl FontSystem {
             (
                 FontFaceKey::SansRegular,
                 &[
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                     "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
                     "/System/Library/Fonts/Supplemental/Arial.ttf",
                     "/System/Library/Fonts/SFNS.ttf",
@@ -68,8 +84,8 @@ impl FontSystem {
             (
                 FontFaceKey::SansBold,
                 &[
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
                     "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
                     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
                     "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
@@ -92,8 +108,8 @@ impl FontSystem {
             (
                 FontFaceKey::SerifRegular,
                 &[
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
                     "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
                     "/System/Library/Fonts/Supplemental/Georgia.ttf",
                     "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
@@ -104,8 +120,8 @@ impl FontSystem {
             (
                 FontFaceKey::SerifBold,
                 &[
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
                     "/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf",
                     "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
                     "/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf",
@@ -116,8 +132,8 @@ impl FontSystem {
             (
                 FontFaceKey::MonoRegular,
                 &[
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
                     "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
                     "/System/Library/Fonts/Monaco.ttf",
                     "/System/Library/Fonts/Supplemental/Courier New.ttf",
@@ -129,8 +145,8 @@ impl FontSystem {
             (
                 FontFaceKey::MonoBold,
                 &[
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
                     "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
                     "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
                     "C:\\Windows\\Fonts\\consolab.ttf",
                     "C:\\Windows\\Fonts\\courbd.ttf",
@@ -370,6 +386,9 @@ impl FontSystem {
                         width += primary.metrics_indexed(gid, px).advance_width;
                     }
                     ShapedGlyph::Char(c) => {
+                        if is_default_ignorable(c) {
+                            continue;
+                        }
                         if let Some((_, f)) = self.resolve_glyph_font(key, c) {
                             width += f.metrics(c, px).advance_width;
                         }
@@ -380,6 +399,9 @@ impl FontSystem {
         }
         let mut width = 0.0f32;
         for c in text.chars() {
+            if is_default_ignorable(c) {
+                continue;
+            }
             if let Some((_, f)) = self.resolve_glyph_font(key, c) {
                 width += f.metrics(c, px).advance_width;
             }
@@ -413,6 +435,7 @@ impl FontSystem {
         let actual_px = px_key as f32 / 4.0;
         let mut pen_x = x;
 
+        let mut cache = self.glyph_cache.lock().unwrap();
         if let Some(ligs) = self.ligatures.get(&key) {
             for sg in ligs.apply(primary, text) {
                 match sg {
@@ -426,23 +449,19 @@ impl FontSystem {
                         pen_x += metrics.advance_width;
                     }
                     ShapedGlyph::Char(c) => {
+                        if is_default_ignorable(c) {
+                            continue;
+                        }
                         let Some((use_key, use_font)) = self.resolve_glyph_font(key, c) else {
                             continue;
                         };
-                        let (metrics, bitmap) = {
-                            let mut cache = self.glyph_cache.lock().unwrap();
-                            if let Some(hit) = cache.get(&(use_key, c, px_key)) {
-                                hit.clone()
-                            } else {
-                                let entry = use_font.rasterize(c, actual_px);
-                                cache.insert((use_key, c, px_key), entry.clone());
-                                entry
-                            }
-                        };
+                        let (metrics, bitmap) = cache
+                            .entry((use_key, c, px_key))
+                            .or_insert_with(|| use_font.rasterize(c, actual_px));
                         if metrics.width > 0 && metrics.height > 0 {
                             let gx = (pen_x + metrics.xmin as f32).round() as i32;
                             let gy = (baseline_y - metrics.ymin as f32 - metrics.height as f32).round() as i32;
-                            fb.blit_alpha_mask(gx, gy, metrics.width, metrics.height, &bitmap, color);
+                            fb.blit_alpha_mask(gx, gy, metrics.width, metrics.height, bitmap, color);
                         }
                         pen_x += metrics.advance_width;
                     }
@@ -452,23 +471,19 @@ impl FontSystem {
         }
 
         for c in text.chars() {
+            if is_default_ignorable(c) {
+                continue;
+            }
             let Some((use_key, use_font)) = self.resolve_glyph_font(key, c) else {
                 continue;
             };
-            let (metrics, bitmap) = {
-                let mut cache = self.glyph_cache.lock().unwrap();
-                if let Some(hit) = cache.get(&(use_key, c, px_key)) {
-                    hit.clone()
-                } else {
-                    let entry = use_font.rasterize(c, actual_px);
-                    cache.insert((use_key, c, px_key), entry.clone());
-                    entry
-                }
-            };
+            let (metrics, bitmap) = cache
+                .entry((use_key, c, px_key))
+                .or_insert_with(|| use_font.rasterize(c, actual_px));
             if metrics.width > 0 && metrics.height > 0 {
                 let gx = (pen_x + metrics.xmin as f32).round() as i32;
                 let gy = (baseline_y - metrics.ymin as f32 - metrics.height as f32).round() as i32;
-                fb.blit_alpha_mask(gx, gy, metrics.width, metrics.height, &bitmap, color);
+                fb.blit_alpha_mask(gx, gy, metrics.width, metrics.height, bitmap, color);
             }
             pen_x += metrics.advance_width;
         }

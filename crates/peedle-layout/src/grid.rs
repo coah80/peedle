@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
 use peedle_css::{
-    AlignItems, GridPlacement, GridRepeatCount, GridTrackSize, LengthPercentageAuto, Position,
+    AlignItems, AlignSelf, GridPlacement, GridRepeatCount, GridTrackSize, LengthPercentageAuto,
+    Position,
 };
 
-use crate::box_tree::LayoutBoxId;
+use crate::box_tree::{BoxKind, LayoutBoxId};
 use crate::engine::{LayoutEngine, SizeConstraint};
 
 pub fn layout_grid_container(
@@ -70,8 +71,22 @@ pub fn layout_grid_container(
             }
         }
 
-        let (c_start, c_span) = resolve_placement(cs.grid_column_start, cs.grid_column_end, num_cols);
-        let (r_start, r_span) = resolve_placement(cs.grid_row_start, cs.grid_row_end, 100);
+        let (c_start, c_span) = resolve_placement(
+            &cs.grid_column_start,
+            &cs.grid_column_end,
+            num_cols,
+            &style.grid_column_line_names,
+            &area_map,
+            true,
+        );
+        let (r_start, r_span) = resolve_placement(
+            &cs.grid_row_start,
+            &cs.grid_row_end,
+            100,
+            &style.grid_row_line_names,
+            &area_map,
+            false,
+        );
 
         let (row, col) = match (r_start, c_start) {
             (Some(r), Some(c)) => (r, c.min(num_cols - 1)),
@@ -167,7 +182,8 @@ pub fn layout_grid_container(
             child_cb_h
         };
 
-        let constraint = if cs.width == LengthPercentageAuto::Auto {
+        let is_replaced = matches!(engine.tree.get(cid).kind, BoxKind::Replaced(_));
+        let constraint = if cs.width == LengthPercentageAuto::Auto && !is_replaced {
             SizeConstraint::DefiniteBorderBox((cell_w - mh).max(0.0))
         } else {
             SizeConstraint::Available((cell_w - mh).max(0.0))
@@ -217,14 +233,31 @@ pub fn layout_grid_container(
         let free_x = (cell_w - cur_bb.width - ml).max(0.0);
         let free_y = (cell_h - cur_bb.height - mt).max(0.0);
 
-        let ox = match style.justify_items {
+        let eff_justify = match cs.justify_self {
+            AlignSelf::Auto => style.justify_items,
+            AlignSelf::Center => AlignItems::Center,
+            AlignSelf::FlexEnd | AlignSelf::End => AlignItems::FlexEnd,
+            AlignSelf::FlexStart | AlignSelf::Start => AlignItems::FlexStart,
+            AlignSelf::Stretch => AlignItems::Stretch,
+            AlignSelf::Baseline => AlignItems::Baseline,
+        };
+        let eff_align = match cs.align_self {
+            AlignSelf::Auto => style.align_items,
+            AlignSelf::Center => AlignItems::Center,
+            AlignSelf::FlexEnd | AlignSelf::End => AlignItems::FlexEnd,
+            AlignSelf::FlexStart | AlignSelf::Start => AlignItems::FlexStart,
+            AlignSelf::Stretch => AlignItems::Stretch,
+            AlignSelf::Baseline => AlignItems::Baseline,
+        };
+
+        let ox = match eff_justify {
             AlignItems::Center => free_x * 0.5,
-            AlignItems::FlexEnd => free_x,
+            AlignItems::FlexEnd | AlignItems::End => free_x,
             _ => 0.0,
         };
-        let oy = match style.align_items {
+        let oy = match eff_align {
             AlignItems::Center => free_y * 0.5,
-            AlignItems::FlexEnd => free_y,
+            AlignItems::FlexEnd | AlignItems::End => free_y,
             _ => 0.0,
         };
 
@@ -448,10 +481,44 @@ fn resolve_track_sizes(
     sizes
 }
 
+fn find_named_line(
+    line_names: &[Vec<String>],
+    area_map: &HashMap<String, (usize, usize, usize, usize)>,
+    name: &str,
+    is_start: bool,
+    is_col: bool,
+) -> Option<usize> {
+    let suffix = if is_start { "-start" } else { "-end" };
+    let suffixed = format!("{}{}", name, suffix);
+    for (idx, names) in line_names.iter().enumerate() {
+        if names.iter().any(|n| n == name) {
+            return Some(idx);
+        }
+    }
+    for (idx, names) in line_names.iter().enumerate() {
+        if names.iter().any(|n| n == &suffixed) {
+            return Some(idx);
+        }
+    }
+    if let Some(&(ar, ars, ac, acs)) = area_map.get(name) {
+        return Some(if is_col {
+            if is_start { ac } else { ac + acs }
+        } else if is_start {
+            ar
+        } else {
+            ar + ars
+        });
+    }
+    None
+}
+
 fn resolve_placement(
-    start: GridPlacement,
-    end: GridPlacement,
+    start: &GridPlacement,
+    end: &GridPlacement,
     max_tracks: usize,
+    line_names: &[Vec<String>],
+    area_map: &HashMap<String, (usize, usize, usize, usize)>,
+    is_col: bool,
 ) -> (Option<usize>, usize) {
     let line_to_idx = |l: i32| -> usize {
         if l > 0 {
@@ -462,24 +529,41 @@ fn resolve_placement(
             0
         }
     };
+    let resolve_start = |p: &GridPlacement| -> Option<usize> {
+        match p {
+            GridPlacement::Line(s) => Some(line_to_idx(*s)),
+            GridPlacement::Named(n) => find_named_line(line_names, area_map, n, true, is_col),
+            _ => None,
+        }
+    };
+    let resolve_end = |p: &GridPlacement| -> Option<usize> {
+        match p {
+            GridPlacement::Line(e) => Some(line_to_idx(*e)),
+            GridPlacement::Named(n) => find_named_line(line_names, area_map, n, false, is_col),
+            _ => None,
+        }
+    };
     match (start, end) {
-        (GridPlacement::Line(s), GridPlacement::Line(e)) => {
-            let si = line_to_idx(s);
-            let ei = line_to_idx(e);
-            (Some(si), ei.saturating_sub(si).max(1))
+        (GridPlacement::Span(sp), GridPlacement::Line(_) | GridPlacement::Named(_)) => {
+            let span = (*sp as usize).max(1);
+            if let Some(ei) = resolve_end(end) {
+                (Some(ei.saturating_sub(span)), span)
+            } else {
+                (None, span)
+            }
         }
-        (GridPlacement::Line(s), GridPlacement::Span(sp)) => {
-            (Some(line_to_idx(s)), (sp as usize).max(1))
+        (GridPlacement::Line(_) | GridPlacement::Named(_), GridPlacement::Span(sp)) => {
+            (resolve_start(start), (*sp as usize).max(1))
         }
-        (GridPlacement::Line(s), GridPlacement::Auto) => (Some(line_to_idx(s)), 1),
         (GridPlacement::Span(sp), _) | (GridPlacement::Auto, GridPlacement::Span(sp)) => {
-            (None, (sp as usize).max(1))
+            (None, (*sp as usize).max(1))
         }
-        (GridPlacement::Auto, GridPlacement::Line(e)) => {
-            let ei = line_to_idx(e);
-            (Some(ei.saturating_sub(1)), 1)
-        }
-        (GridPlacement::Auto, GridPlacement::Auto) => (None, 1),
+        _ => match (resolve_start(start), resolve_end(end)) {
+            (Some(si), Some(ei)) => (Some(si), ei.saturating_sub(si).max(1)),
+            (Some(si), None) => (Some(si), 1),
+            (None, Some(ei)) => (Some(ei.saturating_sub(1)), 1),
+            (None, None) => (None, 1),
+        },
     }
 }
 

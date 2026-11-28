@@ -7,7 +7,7 @@ pub mod values;
 
 pub use cascade::{
     compute_styles, compute_styles_for_root, compute_styles_with_ua, compute_styles_with_ua_root,
-    StyleMap,
+    restyle_subtrees, style_affects_layout, StyleMap,
 };
 pub use parser::{
     is_supported_declaration, parse_inline_declarations, parse_media_query_list,
@@ -27,7 +27,7 @@ pub use selector::{
 pub use style::{
     get_computed_property, is_inherited_property, ua_stylesheet, AlignContent, AlignItems,
     AlignSelf, BackgroundClip, BackgroundRepeat, BackgroundSize, BorderCollapse, BorderStyle,
-    BoxSizing, Clear, ComputedStyle, Cursor, Display, FlexDirection, FlexWrap, Float, FontStyle,
+    BoxSizing, Clear, ColorScheme, ComputedStyle, Cursor, Display, FlexDirection, FlexWrap, Float, FontStyle,
     GridAutoFlow, JustifyContent, LineHeight, ListStylePosition, ListStyleType, ObjectFit,
     Overflow, OverflowWrap, PointerEvents, Position, TableLayout, TextAlign, TextDecorationLine,
     TextDecorationStyle, TextOverflow, TextTransform, UserSelect, VerticalAlign, Visibility,
@@ -37,7 +37,7 @@ pub use tokenizer::{serialize_tokens, tokenize, HashKind, NumericKind, Token, To
 pub use values::{
     parse_angle_deg, parse_background_image, parse_box_shadows, parse_calc_expr,
     parse_calc_function, parse_color, parse_color_from_tokens, parse_color_value, parse_filters,
-    parse_grid_placement, parse_grid_tracks, parse_length_percentage_auto, parse_length_unit,
+    parse_grid_placement, parse_grid_tracks, parse_grid_tracks_with_names, parse_length_percentage_auto, parse_length_unit,
     parse_text_shadows, parse_transforms, BackgroundImage, BoxShadow, CalcContext, CalcExpr, Color,
     ColorValue, FilterOp, GradientStop, GridPlacement, GridRepeatCount, GridTrackSize, Length,
     LengthPercentageAuto, LengthUnit, TextShadow, TransformOp,

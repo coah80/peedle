@@ -178,6 +178,7 @@ pub fn layout_document(
             let bb = engine.tree.get(root_box).dims.margin_box();
             engine.tree.content_width = bb.right().max(viewport_w);
             engine.tree.content_height = bb.bottom().max(viewport_h);
+            engine.tree.compute_subtree_cull_info();
         }
     }
 
@@ -453,6 +454,10 @@ impl LayoutEngine {
                 Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineGrid | Display::InlineTable
             ),
             BoxKind::Replaced(ReplacedKind::Hr) => true,
+            BoxKind::Replaced(_) => matches!(
+                b.style.display,
+                Display::Block | Display::FlowRoot | Display::ListItem
+            ),
             _ => false,
         }
     }
@@ -986,6 +991,59 @@ impl LayoutEngine {
                     engine.translate_subtree(bid, shift, 0.0);
                 }
             }
+            if text_refs.len() > 1 {
+                let mut max_baseline = line_top_y;
+                for &(tid, fidx) in text_refs.iter() {
+                    let b = engine.tree.get(tid);
+                    if matches!(
+                        b.style.vertical_align,
+                        peedle_css::VerticalAlign::Baseline
+                            | peedle_css::VerticalAlign::Super
+                            | peedle_css::VerticalAlign::Sub
+                    ) {
+                        if let Some(frag) = b.text_fragments.get(fidx) {
+                            max_baseline = max_baseline.max(frag.baseline);
+                        }
+                    }
+                }
+                if max_baseline > line_top_y {
+                    for &(tid, fidx) in text_refs.iter() {
+                        let (va, fs) = {
+                            let b = engine.tree.get(tid);
+                            (b.style.vertical_align, b.style.font_size)
+                        };
+                        let dy = if let Some(frag) = engine.tree.get(tid).text_fragments.get(fidx) {
+                            match va {
+                                peedle_css::VerticalAlign::Baseline => max_baseline - frag.baseline,
+                                peedle_css::VerticalAlign::Super => {
+                                    (max_baseline - fs * 0.4) - frag.baseline
+                                }
+                                peedle_css::VerticalAlign::Sub => {
+                                    (max_baseline + fs * 0.2) - frag.baseline
+                                }
+                                peedle_css::VerticalAlign::Middle => {
+                                    (line_top_y + (*cur_line_h - frag.height) * 0.5) - frag.y
+                                }
+                                peedle_css::VerticalAlign::Bottom => {
+                                    (line_top_y + *cur_line_h - frag.height) - frag.y
+                                }
+                                peedle_css::VerticalAlign::Length(off) => {
+                                    (max_baseline - off) - frag.baseline
+                                }
+                                _ => 0.0,
+                            }
+                        } else {
+                            0.0
+                        };
+                        if dy.abs() > 0.01 {
+                            if let Some(frag) = engine.tree.get_mut(tid).text_fragments.get_mut(fidx) {
+                                frag.y += dy;
+                                frag.baseline += dy;
+                            }
+                        }
+                    }
+                }
+            }
             let has_valign_offset = box_refs.iter().any(|&bid| {
                 matches!(
                     engine.tree.get(bid).style.vertical_align,
@@ -1218,11 +1276,13 @@ impl LayoutEngine {
                         if !preserve_spaces && tok == " " && !line_has_content {
                             continue;
                         }
-                        let w = self.measurer.measure_str(
+                        let is_italic = item_style.font_style == peedle_css::FontStyle::Italic;
+                        let w = self.measurer.measure_str_styled(
                             &tok,
                             &item_style.font_family,
                             item_style.font_size,
                             item_style.font_weight,
+                            is_italic,
                         );
                         if use_ellipsis && cur_x + w > line_right + 0.5 {
                             let avail = (line_right - ellipsis_w - cur_x).max(0.0);
@@ -1264,7 +1324,16 @@ impl LayoutEngine {
                             line_has_content = true;
                             break;
                         }
-                        if !no_wrap && line_has_content && cur_x + w > line_right + 0.5 && tok != " " {
+                        let is_closing_punct = matches!(
+                            tok.as_str(),
+                            "." | "," | ";" | ":" | "!" | "?" | ")" | "]" | "}"
+                        );
+                        if !no_wrap
+                            && line_has_content
+                            && cur_x + w > line_right + 0.5
+                            && tok != " "
+                            && !is_closing_punct
+                        {
                             finish_line(
                                 self,
                                 &mut line_items,
@@ -1386,7 +1455,7 @@ impl LayoutEngine {
             cur_y += line_h;
         }
 
-        self.update_inline_wrapper_bounds(children);
+        self.update_inline_wrapper_bounds(children, content_w, cb_height);
         let total_h = (cur_y - content_y).max(0.0);
         self.tree.get_mut(container_id).dims.content.height = explicit_h.unwrap_or(total_h);
         for cid in abs_children {
@@ -1425,11 +1494,11 @@ impl LayoutEngine {
         }
     }
 
-    fn update_inline_wrapper_bounds(&mut self, children: &[LayoutBoxId]) {
+    fn update_inline_wrapper_bounds(&mut self, children: &[LayoutBoxId], cb_w: f32, cb_h: f32) {
         for &cid in children {
             if self.tree.get(cid).kind == BoxKind::Inline {
                 let sub = self.tree.get(cid).children.clone();
-                self.update_inline_wrapper_bounds(&sub);
+                self.update_inline_wrapper_bounds(&sub, cb_w, cb_h);
                 let mut min_x = f32::INFINITY;
                 let mut min_y = f32::INFINITY;
                 let mut max_x = f32::NEG_INFINITY;
@@ -1464,6 +1533,7 @@ impl LayoutEngine {
                         left: s.border_left_width,
                     };
                     b.dims.content = Rect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+                    self.apply_relative_offset(cid, cb_w, cb_h);
                 }
             }
         }
@@ -1750,10 +1820,33 @@ impl LayoutEngine {
                         0.0
                     };
                     let kids = self.tree.get(id).children.clone();
+                    let trim_edges = kind != BoxKind::Inline;
+                    let mut start_idx = 0usize;
+                    let mut end_idx = kids.len();
+                    if trim_edges {
+                        while start_idx < end_idx {
+                            if let BoxKind::Text(ref t) = self.tree.get(kids[start_idx]).kind {
+                                if t.trim().is_empty() {
+                                    start_idx += 1;
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                        while end_idx > start_idx {
+                            if let BoxKind::Text(ref t) = self.tree.get(kids[end_idx - 1]).kind {
+                                if t.trim().is_empty() {
+                                    end_idx -= 1;
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                    }
                     let mut sum_inline = 0.0f32;
                     let mut flex_items = 0usize;
                     let mut max_block = 0.0f32;
-                    for cid in kids {
+                    for &cid in &kids[start_idx..end_idx] {
                         let cs = self.tree.get(cid).style.clone();
                         if matches!(cs.position, Position::Absolute | Position::Fixed) {
                             continue;
@@ -1906,7 +1999,7 @@ impl LayoutEngine {
                     (est_w, line_h)
                 }
                 "range" => (140.0, 20.0),
-                _ => (180.0, line_h),
+                _ => (150.0, line_h),
             },
             ReplacedKind::Textarea { rows, cols, .. } => {
                 ((*cols as f32 * 8.0).max(160.0), (*rows as f32 * 20.0).max(52.0))
@@ -1943,36 +2036,78 @@ impl LayoutEngine {
                 };
                 (w.max(0.0), h)
             }
-            (None, None) => {
-                let mut w = iw;
-                let mut h = ih;
-                if let Some(max_w) = style.max_width.resolve(&ctx_w) {
-                    let max_cw = if is_border_box { (max_w - pb_h).max(0.0) } else { max_w.max(0.0) };
-                    if w > max_cw && w > 0.0 {
-                        if has_aspect {
-                            h *= max_cw / w;
-                        }
-                        w = max_cw;
-                    }
-                }
-                (w, h)
-            }
+            (None, None) => (iw, ih),
         };
-        if let Some(min_w) = style.min_width.resolve(&ctx_w) {
-            let min_cw = if is_border_box { (min_w - pb_h).max(0.0) } else { min_w.max(0.0) };
-            w = w.max(min_cw);
-        }
-        if let Some(max_w) = style.max_width.resolve(&ctx_w) {
-            let max_cw = if is_border_box { (max_w - pb_h).max(0.0) } else { max_w.max(0.0) };
-            w = w.min(max_cw);
-        }
-        if let Some(min_h) = style.min_height.resolve(&ctx_h) {
-            let min_ch = if is_border_box { (min_h - pb_v).max(0.0) } else { min_h.max(0.0) };
-            h = h.max(min_ch);
-        }
-        if let Some(max_h) = style.max_height.resolve(&ctx_h) {
-            let max_ch = if is_border_box { (max_h - pb_v).max(0.0) } else { max_h.max(0.0) };
-            h = h.min(max_ch);
+        let min_w = style.min_width.resolve(&ctx_w).map(|v| {
+            if is_border_box { (v - pb_h).max(0.0) } else { v.max(0.0) }
+        });
+        let max_w = style.max_width.resolve(&ctx_w).map(|v| {
+            if is_border_box { (v - pb_h).max(0.0) } else { v.max(0.0) }
+        });
+        let min_h = if cb_height < 0.0 && matches!(style.min_height, LengthPercentageAuto::Percent(_)) {
+            None
+        } else {
+            style.min_height.resolve(&ctx_h).map(|v| {
+                if is_border_box { (v - pb_v).max(0.0) } else { v.max(0.0) }
+            })
+        };
+        let max_h = if cb_height < 0.0 && matches!(style.max_height, LengthPercentageAuto::Percent(_)) {
+            None
+        } else {
+            style.max_height.resolve(&ctx_h).map(|v| {
+                if is_border_box { (v - pb_v).max(0.0) } else { v.max(0.0) }
+            })
+        };
+
+        if has_aspect && ew.is_none() && eh.is_none() && iw > 0.0 && ih > 0.0 {
+            let ratio = iw / ih;
+            let eff_max_w = max_w.unwrap_or(f32::INFINITY);
+            let eff_max_h = max_h.unwrap_or(f32::INFINITY);
+            let eff_min_w = min_w.unwrap_or(0.0);
+            let eff_min_h = min_h.unwrap_or(0.0);
+            if w > eff_max_w && h > eff_max_h {
+                if eff_max_w / w <= eff_max_h / h {
+                    w = eff_max_w;
+                    h = (w / ratio).max(eff_min_h);
+                } else {
+                    h = eff_max_h;
+                    w = (h * ratio).max(eff_min_w);
+                }
+            } else if w > eff_max_w {
+                w = eff_max_w;
+                h = (w / ratio).clamp(eff_min_h, eff_max_h);
+            } else if h > eff_max_h {
+                h = eff_max_h;
+                w = (h * ratio).clamp(eff_min_w, eff_max_w);
+            }
+            if w < eff_min_w && h < eff_min_h {
+                if eff_min_w / w.max(0.001) >= eff_min_h / h.max(0.001) {
+                    w = eff_min_w;
+                    h = (w / ratio).min(eff_max_h);
+                } else {
+                    h = eff_min_h;
+                    w = (h * ratio).min(eff_max_w);
+                }
+            } else if w < eff_min_w {
+                w = eff_min_w;
+                h = (w / ratio).clamp(eff_min_h, eff_max_h);
+            } else if h < eff_min_h {
+                h = eff_min_h;
+                w = (h * ratio).clamp(eff_min_w, eff_max_w);
+            }
+        } else {
+            if let Some(mn) = min_w {
+                w = w.max(mn);
+            }
+            if let Some(mx) = max_w {
+                w = w.min(mx);
+            }
+            if let Some(mn) = min_h {
+                h = h.max(mn);
+            }
+            if let Some(mx) = max_h {
+                h = h.min(mx);
+            }
         }
         (w, h)
     }
@@ -2051,14 +2186,17 @@ fn detect_replaced(
     match el.tag_name.as_str() {
         "img" => {
             let url = el.get_attr("src").unwrap_or("").to_string();
-            let attr_w = el.get_attr("width").and_then(|s| s.parse::<f32>().ok());
-            let attr_h = el.get_attr("height").and_then(|s| s.parse::<f32>().ok());
             let (nat_w, nat_h) = image_sizes
                 .get(&url)
                 .map(|&(w, h)| (w as f32, h as f32))
                 .unwrap_or((0.0, 0.0));
-            let w = attr_w.unwrap_or(if nat_w > 0.0 { nat_w } else { 24.0 });
-            let h = attr_h.unwrap_or(if nat_h > 0.0 { nat_h } else { 24.0 });
+            let (w, h) = if nat_w > 0.0 && nat_h > 0.0 {
+                (nat_w, nat_h)
+            } else {
+                let attr_w = el.get_attr("width").and_then(|s| s.parse::<f32>().ok());
+                let attr_h = el.get_attr("height").and_then(|s| s.parse::<f32>().ok());
+                (attr_w.unwrap_or(24.0), attr_h.unwrap_or(24.0))
+            };
             Some(ReplacedKind::Image {
                 url,
                 intrinsic_w: w,
@@ -2171,7 +2309,13 @@ fn detect_replaced(
                 .get_attr("cols")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(24);
-            Some(ReplacedKind::Textarea { value: val, rows, cols })
+            let placeholder = el.get_attr("placeholder").unwrap_or("").to_string();
+            Some(ReplacedKind::Textarea {
+                value: val,
+                placeholder,
+                rows,
+                cols,
+            })
         }
         "select" => {
             let mut label = String::new();

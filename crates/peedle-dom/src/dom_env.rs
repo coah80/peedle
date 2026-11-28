@@ -480,8 +480,36 @@ impl BrowserJsEnv {
     }
 
     pub fn advance_time_ms(&mut self, delta_ms: u64) {
-        self.dom.borrow_mut().now_ms += delta_ms;
+        let _ = self.advance_time_ms_checked(delta_ms);
+    }
+
+    pub fn advance_time_ms_checked(&mut self, delta_ms: u64) -> bool {
+        let has_due = {
+            let mut st = self.dom.borrow_mut();
+            st.now_ms += delta_ms;
+            let now = st.now_ms;
+            !st.message_queue.is_empty()
+                || st.timers.iter().any(|t| !t.cancelled && t.due_ms <= now)
+                || !self.rt.microtasks.is_empty()
+        };
+        if !has_due {
+            return false;
+        }
         self.tick_event_loop(64);
+        true
+    }
+
+    pub fn next_timer_delay_ms(&self) -> Option<u64> {
+        let st = self.dom.borrow();
+        if !st.message_queue.is_empty() {
+            return Some(0);
+        }
+        let now = st.now_ms;
+        st.timers
+            .iter()
+            .filter(|t| !t.cancelled)
+            .map(|t| t.due_ms.saturating_sub(now))
+            .min()
     }
 
     pub fn has_pending_timers(&self) -> bool {

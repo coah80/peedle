@@ -79,6 +79,7 @@ pub struct BrowserApp {
     last_tick: Instant,
     phys_w: u32,
     phys_h: u32,
+    surface_size: (u32, u32),
     scale_factor: f32,
     settings_notice: Option<String>,
     window_fullscreen: bool,
@@ -134,6 +135,7 @@ impl BrowserApp {
             last_tick: Instant::now(),
             phys_w: 1280,
             phys_h: 820,
+            surface_size: (0, 0),
             scale_factor: 1.0,
             settings_notice: None,
             window_fullscreen: false,
@@ -1273,7 +1275,10 @@ impl BrowserApp {
             self.page_dirty = false;
             if let Some(ref mut surface) = self.surface {
                 if let (Some(w), Some(h)) = (NonZeroU32::new(self.phys_w), NonZeroU32::new(self.phys_h)) {
-                    let _ = surface.resize(w, h);
+                    if self.surface_size != (self.phys_w, self.phys_h) {
+                        let _ = surface.resize(w, h);
+                        self.surface_size = (self.phys_w, self.phys_h);
+                    }
                     if let Ok(mut buffer) = surface.buffer_mut() {
                         self.full_fb.to_xrgb_slice(&mut buffer);
                         let _ = buffer.present();
@@ -1353,12 +1358,19 @@ impl BrowserApp {
             }
         }
 
-        self.full_fb
-            .resize_or_clear(self.phys_w, self.phys_h, RgbaColor::new(17, 20, 27, 255));
+        let bg_chrome = RgbaColor::new(17, 20, 27, 255);
         let top_phys = top_h * s;
         let vh_phys = vh * s;
         let lx_phys = left_x * s;
         let lw_phys = left_w * s;
+        if self.full_fb.width != self.phys_w || self.full_fb.height != self.phys_h {
+            self.full_fb.resize_or_clear(self.phys_w, self.phys_h, bg_chrome);
+        } else {
+            self.full_fb.fill_rect(0.0, 0.0, self.phys_w as f32, top_phys, bg_chrome);
+            if lx_phys > 0.5 {
+                self.full_fb.fill_rect(0.0, top_phys, lx_phys, vh_phys, bg_chrome);
+            }
+        }
         self.full_fb.push_clip(ClipRect {
             x: lx_phys.floor() as i32,
             y: top_phys.floor() as i32,
@@ -1428,7 +1440,10 @@ impl BrowserApp {
 
         if let Some(ref mut surface) = self.surface {
             if let (Some(w), Some(h)) = (NonZeroU32::new(self.phys_w), NonZeroU32::new(self.phys_h)) {
-                let _ = surface.resize(w, h);
+                if self.surface_size != (self.phys_w, self.phys_h) {
+                    let _ = surface.resize(w, h);
+                    self.surface_size = (self.phys_w, self.phys_h);
+                }
                 if let Ok(mut buffer) = surface.buffer_mut() {
                     self.full_fb.to_xrgb_slice(&mut buffer);
                     let _ = buffer.present();
@@ -1554,15 +1569,19 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
         let now = Instant::now();
         let dt_ms = now.duration_since(self.last_tick).as_millis() as u64;
         if self.needs_animation_tick() {
+            let any_loading = self.tabs.iter().any(|t| t.loading);
+            let smooth_scroll = self.scroll_vel_y.abs() > 0.4;
+            let active_media = !self.tabs.is_empty() && self.active_page().has_active_media();
+            let active_timers = !self.tabs.is_empty() && self.active_page().has_pending_timers();
             if dt_ms >= 15 {
                 self.last_tick = now;
                 let mut need_draw = false;
-                if self.tabs.iter().any(|t| t.loading) {
+                if any_loading {
                     self.chrome.anim_phase =
                         (self.chrome.anim_phase + dt_ms as f32 * 0.008) % (std::f32::consts::TAU);
                     need_draw = true;
                 }
-                if self.scroll_vel_y.abs() > 0.4 {
+                if smooth_scroll {
                     let step = self.scroll_vel_y * 0.36;
                     self.scroll_vel_y *= 0.64;
                     if self.scroll_vel_y.abs() <= 0.4 {
@@ -1570,25 +1589,32 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                     }
                     self.active_page_mut().scroll_by(0.0, step);
                     self.page_dirty = true;
-                    self.split_dirty = true;
-                    need_draw = true;
-                }
-                if !self.tabs.is_empty() && self.active_page().has_pending_timers() {
-                    self.active_page_mut().advance_time_ms(dt_ms.min(50));
-                    let new_tabs = self.active_page_mut().drain_pending_new_tabs();
-                    for nu in new_tabs {
-                        self.open_new_tab(&nu);
+                    if self.chrome.split_active {
+                        self.split_dirty = true;
                     }
-                    self.page_dirty = true;
-                    self.split_dirty = true;
                     need_draw = true;
                 }
-                if !self.tabs.is_empty() && self.active_page().has_active_media() {
+                if active_timers {
+                    if self.active_page_mut().advance_time_ms(dt_ms.min(50)) {
+                        let new_tabs = self.active_page_mut().drain_pending_new_tabs();
+                        for nu in new_tabs {
+                            self.open_new_tab(&nu);
+                        }
+                        self.page_dirty = true;
+                        if self.chrome.split_active {
+                            self.split_dirty = true;
+                        }
+                        need_draw = true;
+                    }
+                }
+                if active_media {
                     let seq = self.active_page().media_frame_seq();
-                    if seq != self.tabs[self.active_tab].last_media_seq || dt_ms >= 32 {
+                    if seq != self.tabs[self.active_tab].last_media_seq || dt_ms >= 250 {
                         self.tabs[self.active_tab].last_media_seq = seq;
                         self.page_dirty = true;
-                        self.split_dirty = true;
+                        if self.chrome.split_active {
+                            self.split_dirty = true;
+                        }
                         need_draw = true;
                     }
                 }
@@ -1596,7 +1622,17 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                     self.request_redraw();
                 }
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(16)));
+            let wait_ms = if any_loading || smooth_scroll || active_media {
+                16
+            } else if active_timers {
+                self.active_page()
+                    .next_timer_delay_ms()
+                    .unwrap_or(50)
+                    .clamp(16, 250)
+            } else {
+                16
+            };
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(wait_ms)));
         } else {
             self.last_tick = now;
             event_loop.set_control_flow(ControlFlow::Wait);
@@ -1676,7 +1712,9 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                     let vh = content_viewport_height(self.logical_h(), &self.chrome) / z;
                     if vy >= 0.0 && vy < vh && self.active_page_mut().on_mouse_move(cx, vy) {
                         self.page_dirty = true;
-                        self.split_dirty = true;
+                        if self.chrome.split_active {
+                            self.split_dirty = true;
+                        }
                         self.request_redraw();
                     }
                 }

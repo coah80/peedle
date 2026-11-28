@@ -13,7 +13,7 @@ use crate::canvas2d::Canvas2D;
 use crate::fonts::{FontFaceKey, FontSystem};
 use crate::framebuffer::{ClipRect, Framebuffer, RgbaColor};
 use crate::images::ImageCache;
-use crate::svg::render_svg_node_with_color;
+use crate::svg::render_svg_node_with_style;
 
 #[derive(Clone, Debug, Default)]
 pub struct VideoOverlayState {
@@ -257,6 +257,15 @@ fn paint_box_with_opts(
     let is_fixed = b.style.position == Position::Fixed;
     let mut dx = if is_fixed { 0.0 } else { ox };
     let mut dy = if is_fixed { 0.0 } else { oy };
+
+    if !is_fixed
+        && !b.has_fixed_descendant
+        && b.subtree_min_y.is_finite()
+        && b.subtree_max_y.is_finite()
+        && (b.subtree_max_y + dy < -96.0 || b.subtree_min_y + dy > vp_h + 96.0)
+    {
+        return;
+    }
 
     let bb = b.dims.border_box();
     if b.style.position == Position::Sticky {
@@ -856,8 +865,13 @@ fn paint_box_with_opts(
         }
     }
 
-    let mut ordered_children = b.children.clone();
-    ordered_children.sort_by_key(|&cid| {
+    let (scroll_dx, scroll_dy) = b
+        .node
+        .and_then(|nid| doc.element(nid))
+        .map(|el| (el.scroll_left, el.scroll_top))
+        .unwrap_or((0.0, 0.0));
+
+    let paint_order_key = |cid: LayoutBoxId| -> (i32, i32) {
         let cb = tree.get(cid);
         let z = cb.style.z_index.unwrap_or(0);
         let positioned = cb.style.position != peedle_css::Position::Static;
@@ -876,28 +890,47 @@ fn paint_box_with_opts(
         } else {
             (1i32, 0)
         }
-    });
+    };
 
-    let (scroll_dx, scroll_dy) = b
-        .node
-        .and_then(|nid| doc.element(nid))
-        .map(|el| (el.scroll_left, el.scroll_top))
-        .unwrap_or((0.0, 0.0));
+    let already_sorted = b.children.len() <= 1
+        || b.children
+            .windows(2)
+            .all(|w| paint_order_key(w[0]) <= paint_order_key(w[1]));
 
-    for cid in ordered_children {
-        paint_box(
-            doc,
-            tree,
-            cid,
-            fb,
-            fonts,
-            images,
-            canvases,
-            media,
-            dx - scroll_dx,
-            dy - scroll_dy,
-            s,
-        );
+    if already_sorted {
+        for &cid in &b.children {
+            paint_box(
+                doc,
+                tree,
+                cid,
+                fb,
+                fonts,
+                images,
+                canvases,
+                media,
+                dx - scroll_dx,
+                dy - scroll_dy,
+                s,
+            );
+        }
+    } else {
+        let mut ordered_children = b.children.clone();
+        ordered_children.sort_by_key(|&cid| paint_order_key(cid));
+        for cid in ordered_children {
+            paint_box(
+                doc,
+                tree,
+                cid,
+                fb,
+                fonts,
+                images,
+                canvases,
+                media,
+                dx - scroll_dx,
+                dy - scroll_dy,
+                s,
+            );
+        }
     }
 
     if rounded_clipped {
@@ -1000,7 +1033,7 @@ fn paint_replaced(
         }
         ReplacedKind::Svg { .. } => {
             if let Some(nid) = node {
-                render_svg_node_with_color(
+                render_svg_node_with_style(
                     doc,
                     nid,
                     fb,
@@ -1010,6 +1043,8 @@ fn paint_replaced(
                     w * s,
                     h * s,
                     to_rgba(style.color).with_alpha(alpha),
+                    style.font_size,
+                    style.custom_properties.as_ref(),
                 );
             }
         }
@@ -1192,20 +1227,36 @@ fn paint_replaced(
                 }
             }
         },
-        ReplacedKind::Textarea { value, .. } => {
-            let fs = style.font_size.clamp(10.0, 22.0);
-            for (idx, line) in value.lines().enumerate() {
-                let ly = y + fs + 2.0 + idx as f32 * (fs * 1.3);
-                if ly < y + h {
-                    fonts.draw_text(
-                        fb,
-                        line,
-                        x * s,
-                        ly * s,
-                        FontFaceKey::SansRegular,
-                        fs * s,
-                        to_rgba(style.color).with_alpha(alpha),
-                    );
+        ReplacedKind::Textarea { value, placeholder, .. } => {
+            let fs = style.font_size.clamp(10.0, 24.0);
+            let key = fonts.select_face(
+                &style.font_family,
+                style.font_weight,
+                style.font_style == FontStyle::Italic,
+            );
+            let (text_to_draw, tc) = if !value.is_empty() {
+                (value.as_str(), to_rgba(style.color).with_alpha(alpha))
+            } else {
+                (
+                    placeholder.as_str(),
+                    RgbaColor::new(148, 163, 184, 255).with_alpha(alpha),
+                )
+            };
+            let line_step = style.line_height.resolve(fs).max(fs * 1.2);
+            let single_line = !text_to_draw.contains('\n');
+            if single_line && !text_to_draw.is_empty() {
+                let ly = if h <= line_step * 1.6 {
+                    y + (h + fs * 0.72) * 0.5
+                } else {
+                    y + fs + 2.0
+                };
+                fonts.draw_text(fb, text_to_draw, x * s, ly * s, key, fs * s, tc);
+            } else {
+                for (idx, line) in text_to_draw.lines().enumerate() {
+                    let ly = y + fs + 2.0 + idx as f32 * line_step;
+                    if ly < y + h + fs {
+                        fonts.draw_text(fb, line, x * s, ly * s, key, fs * s, tc);
+                    }
                 }
             }
         }

@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 pub type SharedOriginStorage = Arc<Mutex<HashMap<String, HashMap<String, String>>>>;
 
 use peedle_css::{
-    compute_styles, parse_stylesheet, CalcContext, StyleMap, Stylesheet, Viewport,
+    compute_styles, parse_stylesheet, restyle_subtrees, style_affects_layout, CalcContext,
+    StyleMap, Stylesheet, Viewport,
 };
 use peedle_html::{Document, NodeId};
 use peedle_js::{JsValue, ObjectId};
@@ -120,6 +121,7 @@ pub struct DomState {
     pub dark_mode: bool,
     pub dirty_style: bool,
     pub dirty_layout: bool,
+    pub stylesheets_dirty: bool,
     pub ready_state: String,
     pub node_wrappers: HashMap<NodeId, ObjectId>,
     pub document_obj: Option<ObjectId>,
@@ -177,6 +179,7 @@ impl DomState {
             dark_mode: false,
             dirty_style: true,
             dirty_layout: true,
+            stylesheets_dirty: true,
             ready_state: "loading".to_string(),
             node_wrappers: HashMap::new(),
             document_obj: None,
@@ -292,6 +295,7 @@ impl DomState {
     pub fn mark_dirty(&mut self) {
         self.dirty_style = true;
         self.dirty_layout = true;
+        self.stylesheets_dirty = true;
     }
 
     pub fn mark_dirty_for(&mut self, nid: NodeId) {
@@ -302,12 +306,29 @@ impl DomState {
         if cur == self.doc.root {
             self.dirty_style = true;
             self.dirty_layout = true;
+            self.stylesheets_dirty = true;
         }
+    }
+
+    pub fn has_event_listener(&self, event_type: &str) -> bool {
+        if self
+            .window_listeners
+            .iter()
+            .any(|e| e.event_type == event_type)
+        {
+            return true;
+        }
+        self.listeners
+            .values()
+            .any(|list| list.iter().any(|e| e.event_type == event_type))
     }
 
     pub fn ensure_styles(&mut self) {
         if self.dirty_style {
-            self.collect_inline_stylesheets();
+            if self.stylesheets_dirty || self.stylesheets.is_empty() {
+                self.collect_inline_stylesheets();
+                self.stylesheets_dirty = false;
+            }
             self.styles = compute_styles(
                 &self.doc,
                 &self.stylesheets,
@@ -330,6 +351,7 @@ impl DomState {
             }
             cur = self.doc.node(id).parent;
         }
+        self.stylesheets_dirty = true;
     }
 
     pub fn stylesheet_for_node(&self, nid: NodeId) -> Option<Stylesheet> {
@@ -358,13 +380,107 @@ impl DomState {
         out
     }
 
+    pub fn update_hover_styles(&mut self, changed_roots: &[NodeId]) -> bool {
+        if changed_roots.is_empty() {
+            return false;
+        }
+        if self.dirty_style || self.dirty_layout || self.stylesheets_dirty || self.stylesheets.is_empty() {
+            self.dirty_style = true;
+            return true;
+        }
+        let mut total_nodes = 0usize;
+        for &r in changed_roots {
+            total_nodes += 1 + self.doc.descendants(r).len();
+            if total_nodes > 512 {
+                self.dirty_style = true;
+                return true;
+            }
+        }
+        let mut old_styles: HashMap<NodeId, peedle_css::ComputedStyle> = HashMap::new();
+        let mut old_before: HashMap<NodeId, Option<peedle_css::ComputedStyle>> = HashMap::new();
+        let mut old_after: HashMap<NodeId, Option<peedle_css::ComputedStyle>> = HashMap::new();
+        for &r in changed_roots {
+            for nid in std::iter::once(r).chain(self.doc.descendants(r)) {
+                if let Some(s) = self.styles.styles.get(&nid) {
+                    old_styles.insert(nid, s.clone());
+                }
+                old_before.insert(nid, self.styles.before_styles.get(&nid).cloned());
+                old_after.insert(nid, self.styles.after_styles.get(&nid).cloned());
+            }
+        }
+        let vp = Viewport {
+            width: self.viewport_w,
+            height: self.viewport_h,
+            dark_mode: self.dark_mode,
+        };
+        let updated = restyle_subtrees(
+            &self.doc,
+            changed_roots,
+            &self.stylesheets,
+            vp,
+            &mut self.styles,
+        );
+        let mut any_visual_change = false;
+        for nid in &updated {
+            let new_b = self.styles.before_styles.get(nid);
+            let old_b = old_before.get(nid).and_then(|o| o.as_ref());
+            let new_a = self.styles.after_styles.get(nid);
+            let old_a = old_after.get(nid).and_then(|o| o.as_ref());
+            if new_b != old_b || new_a != old_a {
+                self.dirty_layout = true;
+                return true;
+            }
+            if let Some(new_s) = self.styles.styles.get(nid) {
+                if let Some(old_s) = old_styles.get(nid) {
+                    if old_s != new_s {
+                        any_visual_change = true;
+                        if style_affects_layout(old_s, new_s) {
+                            self.dirty_layout = true;
+                            return true;
+                        }
+                    }
+                } else {
+                    self.dirty_layout = true;
+                    return true;
+                }
+            }
+        }
+        if !any_visual_change {
+            return false;
+        }
+        for nid in updated {
+            if let (Some(new_s), Some(&bid)) =
+                (self.styles.styles.get(&nid), self.layout.node_to_box.get(&nid))
+            {
+                let kids = self.layout.boxes[bid.0].children.clone();
+                self.layout.boxes[bid.0].style = new_s.clone();
+                for cid in kids {
+                    if matches!(self.layout.boxes[cid.0].kind, peedle_layout::BoxKind::Text(_)) {
+                        let ts = &mut self.layout.boxes[cid.0].style;
+                        ts.color = new_s.color;
+                        ts.text_decoration_line = new_s.text_decoration_line;
+                        ts.text_decoration_color = new_s.text_decoration_color;
+                        ts.text_decoration_style = new_s.text_decoration_style;
+                        ts.text_shadow = new_s.text_shadow.clone();
+                        ts.visibility = new_s.visibility;
+                        ts.cursor = new_s.cursor;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     pub fn collect_inline_stylesheets(&mut self) {
         self.stylesheets = self.collect_stylesheets_for_root(self.doc.root);
     }
 
     pub fn ensure_layout(&mut self) {
         if self.dirty_style {
-            self.collect_inline_stylesheets();
+            if self.stylesheets_dirty || self.stylesheets.is_empty() {
+                self.collect_inline_stylesheets();
+                self.stylesheets_dirty = false;
+            }
             self.styles = compute_styles(
                 &self.doc,
                 &self.stylesheets,

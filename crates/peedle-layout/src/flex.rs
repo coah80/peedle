@@ -12,6 +12,8 @@ struct FlexItem {
     orig_index: usize,
     base_size: f32,
     hypothetical_main: f32,
+    min_main: f32,
+    max_main: f32,
     main_size: f32,
     cross_size: f32,
     flex_grow: f32,
@@ -200,6 +202,8 @@ pub fn layout_flex_container(
             orig_index,
             base_size: hypothetical,
             hypothetical_main: hypothetical,
+            min_main,
+            max_main,
             main_size: hypothetical,
             cross_size: 0.0,
             flex_grow: cs.flex_grow.max(0.0),
@@ -261,25 +265,54 @@ pub fn layout_flex_container(
         } else {
             explicit_h.unwrap_or(used_hyp)
         };
-        let free = target_main - used_hyp;
-
-        if free > 0.0 {
-            let total_grow: f32 = line.iter().map(|&i| items[i].flex_grow).sum();
-            if total_grow > 0.0 {
-                for &i in line {
-                    items[i].main_size = items[i].base_size + free * (items[i].flex_grow / total_grow);
+        let growing = target_main >= used_hyp;
+        let mut frozen = vec![false; line.len()];
+        for (li, &i) in line.iter().enumerate() {
+            items[i].main_size = items[i].hypothetical_main;
+            let flex_factor = if growing { items[i].flex_grow } else { items[i].flex_shrink };
+            if flex_factor <= 0.0 {
+                frozen[li] = true;
+            }
+        }
+        for _ in 0..line.len().max(1) {
+            let mut rem_free = target_main - gaps;
+            let mut sum_weight = 0.0f32;
+            for (li, &i) in line.iter().enumerate() {
+                rem_free -= items[i].margin_main_start + items[i].margin_main_end;
+                if frozen[li] {
+                    rem_free -= items[i].main_size;
+                } else {
+                    rem_free -= items[i].base_size;
+                    sum_weight += if growing {
+                        items[i].flex_grow
+                    } else {
+                        items[i].flex_shrink * items[i].base_size.max(1.0)
+                    };
                 }
             }
-        } else if free < 0.0 {
-            let total_scaled: f32 = line
-                .iter()
-                .map(|&i| items[i].flex_shrink * items[i].base_size.max(1.0))
-                .sum();
-            if total_scaled > 0.0 {
-                for &i in line {
-                    let ratio = (items[i].flex_shrink * items[i].base_size.max(1.0)) / total_scaled;
-                    items[i].main_size = (items[i].base_size + free * ratio).max(0.0);
+            if sum_weight <= 0.0 {
+                break;
+            }
+            let mut any_clamped = false;
+            for (li, &i) in line.iter().enumerate() {
+                if frozen[li] {
+                    continue;
                 }
+                let share = if growing {
+                    rem_free.max(0.0) * (items[i].flex_grow / sum_weight)
+                } else {
+                    rem_free.min(0.0) * ((items[i].flex_shrink * items[i].base_size.max(1.0)) / sum_weight)
+                };
+                let raw = (items[i].base_size + share).max(0.0);
+                let clamped = raw.clamp(items[i].min_main, items[i].max_main);
+                items[i].main_size = clamped;
+                if (clamped - raw).abs() > 0.01 {
+                    frozen[li] = true;
+                    any_clamped = true;
+                }
+            }
+            if !any_clamped {
+                break;
             }
         }
 
@@ -300,13 +333,22 @@ pub fn layout_flex_container(
                 max_cross = max_cross.max(h + items[i].margin_cross_start + items[i].margin_cross_end);
             } else {
                 let cs = engine.tree.get(cid).style.clone();
+                let is_replaced = matches!(engine.tree.get(cid).kind, crate::box_tree::BoxKind::Replaced(_));
                 let cctx = engine.calc_ctx(&cs, content_w);
-                let constraint = if cs.width != LengthPercentageAuto::Auto {
-                    SizeConstraint::Available(content_w)
-                } else if items[i].align_self == AlignItems::Stretch {
-                    SizeConstraint::DefiniteBorderBox(
+                let constraint = if cs.width != LengthPercentageAuto::Auto || is_replaced {
+                    SizeConstraint::Available(
                         (content_w - items[i].margin_cross_start - items[i].margin_cross_end).max(0.0),
                     )
+                } else if items[i].align_self == AlignItems::Stretch {
+                    let mut stretch_w =
+                        (content_w - items[i].margin_cross_start - items[i].margin_cross_end).max(0.0);
+                    if let Some(mx) = cs.max_width.resolve(&cctx) {
+                        stretch_w = stretch_w.min(mx);
+                    }
+                    if let Some(mn) = cs.min_width.resolve(&cctx) {
+                        stretch_w = stretch_w.max(mn);
+                    }
+                    SizeConstraint::DefiniteBorderBox(stretch_w)
                 } else {
                     let iw = engine.measure_intrinsic_width(cid, content_w);
                     let ph = cs.padding_left.resolve_or(&cctx, 0.0)
@@ -334,9 +376,38 @@ pub fn layout_flex_container(
         line_cross_sizes.push(max_cross);
     }
 
+    let pb_v = engine.tree.get(id).dims.padding.vertical() + engine.tree.get(id).dims.border.vertical();
+    let own_ctx_h = CalcContext {
+        percentage_base: cb_height.max(0.0),
+        font_size: style.font_size,
+        root_font_size: engine.root_font_size,
+        viewport_width: engine.viewport_w,
+        viewport_height: engine.viewport_h,
+    };
+    let min_h_content = resolve_dim(&style.min_height, &own_ctx_h, cb_height).map(|mh| {
+        if style.box_sizing == peedle_css::BoxSizing::BorderBox {
+            (mh - pb_v).max(0.0)
+        } else {
+            mh.max(0.0)
+        }
+    });
+    let max_h_content = resolve_dim(&style.max_height, &own_ctx_h, cb_height).map(|xh| {
+        if style.box_sizing == peedle_css::BoxSizing::BorderBox {
+            (xh - pb_v).max(0.0)
+        } else {
+            xh.max(0.0)
+        }
+    });
+
     if is_row && lines.len() == 1 {
         if let Some(eh) = explicit_h {
             line_cross_sizes[0] = line_cross_sizes[0].max(eh);
+        }
+        if let Some(mh) = min_h_content {
+            line_cross_sizes[0] = line_cross_sizes[0].max(mh);
+        }
+        if let Some(xh) = max_h_content {
+            line_cross_sizes[0] = line_cross_sizes[0].min(xh);
         }
     } else if !is_row && lines.len() == 1 {
         line_cross_sizes[0] = line_cross_sizes[0].max(content_w);
@@ -457,7 +528,7 @@ pub fn layout_flex_container(
                 0.0
             } else {
                 match items[i].align_self {
-                    AlignItems::FlexEnd => cross_free,
+                    AlignItems::FlexEnd | AlignItems::End => cross_free,
                     AlignItems::Center => cross_free * 0.5,
                     _ => 0.0,
                 }

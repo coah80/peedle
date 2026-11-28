@@ -3,26 +3,34 @@ use crate::parser::{
     Stylesheet, Viewport,
 };
 use crate::selector::{
-    matches_complex_selector, ComplexSelector, PseudoElement, SimpleSelector, Specificity,
+    matches_complex_selector, ComplexSelector, PseudoClass, PseudoElement, SimpleSelector,
+    Specificity,
 };
 use crate::style::{
     is_inherited_property, ua_stylesheet, AlignContent, AlignItems, AlignSelf, BackgroundClip,
-    BackgroundRepeat, BackgroundSize, BorderCollapse, BorderStyle, BoxSizing, Clear, ComputedStyle,
-    Cursor, Display, FlexDirection, FlexWrap, Float, FontStyle, GridAutoFlow, JustifyContent,
-    LineHeight, ListStylePosition, ListStyleType, ObjectFit, Overflow, OverflowWrap, PointerEvents,
-    Position, TableLayout, TextAlign, TextDecorationLine, TextDecorationStyle, TextOverflow,
-    TextTransform, UserSelect, VerticalAlign, Visibility, WhiteSpace, WordBreak,
+    BackgroundRepeat, BackgroundSize, BorderCollapse, BorderStyle, BoxSizing, Clear, ColorScheme,
+    ComputedStyle, Cursor, Display, FlexDirection, FlexWrap, Float, FontStyle, GridAutoFlow,
+    JustifyContent, LineHeight, ListStylePosition, ListStyleType, ObjectFit, Overflow,
+    OverflowWrap, PointerEvents, Position, TableLayout, TextAlign, TextDecorationLine,
+    TextDecorationStyle, TextOverflow, TextTransform, UserSelect, VerticalAlign, Visibility,
+    WhiteSpace, WordBreak,
 };
 use crate::tokenizer::{serialize_tokens, tokenize, Token};
 use crate::values::{
     parse_background_image, parse_box_shadows, parse_color_from_tokens, parse_filters,
-    parse_grid_placement, parse_grid_tracks, parse_length_percentage_auto, parse_text_shadows,
-    parse_transforms, split_commas, split_whitespace_groups, trim_ws, CalcContext, Color, Length,
-    LengthPercentageAuto, LengthUnit,
+    parse_grid_placement, parse_grid_tracks, parse_grid_tracks_with_names,
+    parse_length_percentage_auto, parse_text_shadows, parse_transforms, split_commas,
+    split_whitespace_groups, trim_ws, CalcContext, Color, Length, LengthPercentageAuto, LengthUnit,
 };
 use peedle_html::{Document, ElementData, NodeId};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::OnceLock;
+
+fn cached_ua_stylesheet() -> &'static Stylesheet {
+    static UA: OnceLock<Stylesheet> = OnceLock::new();
+    UA.get_or_init(ua_stylesheet)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct StyleMap {
@@ -32,6 +40,7 @@ pub struct StyleMap {
     pub keyframes: HashMap<String, KeyframesRule>,
     pub font_faces: Vec<FontFaceRule>,
     pub viewport: Viewport,
+    pub hover_selectors: Vec<ComplexSelector>,
 }
 
 impl StyleMap {
@@ -46,6 +55,46 @@ impl StyleMap {
     pub fn after(&self, id: NodeId) -> Option<&ComputedStyle> {
         self.after_styles.get(&id)
     }
+
+    pub fn node_matches_any_hover(&self, doc: &Document, node: NodeId) -> bool {
+        if self.hover_selectors.is_empty() {
+            return false;
+        }
+        if doc.element(node).is_some() {
+            for sel in &self.hover_selectors {
+                if matches_complex_selector(doc, node, sel, None) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn hover_match_hash(&self, doc: &Document, node: NodeId) -> u64 {
+        if self.hover_selectors.is_empty() || doc.element(node).is_none() {
+            return 0;
+        }
+        let mut h = 0xcbf29ce484222325u64;
+        for (idx, sel) in self.hover_selectors.iter().enumerate() {
+            if matches_complex_selector(doc, node, sel, None) {
+                h ^= (idx as u64).wrapping_add(1);
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        }
+        h
+    }
+}
+
+fn selector_has_hover(sel: &ComplexSelector) -> bool {
+    sel.compounds.iter().any(|c| {
+        c.simple.iter().any(|s| match s {
+            SimpleSelector::PseudoClass(PseudoClass::Hover) => true,
+            SimpleSelector::PseudoClass(
+                PseudoClass::Is(list) | PseudoClass::Where(list) | PseudoClass::Not(list),
+            ) => list.selectors.iter().any(selector_has_hover),
+            _ => false,
+        })
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -238,8 +287,7 @@ pub fn compute_styles(
     author_sheets: &[Stylesheet],
     viewport: Viewport,
 ) -> StyleMap {
-    let ua = ua_stylesheet();
-    compute_styles_with_ua_root(doc, doc.root, &ua, author_sheets, viewport)
+    compute_styles_with_ua_root(doc, doc.root, cached_ua_stylesheet(), author_sheets, viewport)
 }
 
 pub fn compute_styles_for_root(
@@ -248,8 +296,198 @@ pub fn compute_styles_for_root(
     author_sheets: &[Stylesheet],
     viewport: Viewport,
 ) -> StyleMap {
-    let ua = ua_stylesheet();
-    compute_styles_with_ua_root(doc, root, &ua, author_sheets, viewport)
+    compute_styles_with_ua_root(doc, root, cached_ua_stylesheet(), author_sheets, viewport)
+}
+
+pub fn restyle_subtrees(
+    doc: &Document,
+    roots: &[NodeId],
+    author_sheets: &[Stylesheet],
+    viewport: Viewport,
+    map: &mut StyleMap,
+) -> Vec<NodeId> {
+    let mut target_nodes: Vec<NodeId> = Vec::new();
+    let mut tags: HashSet<String> = HashSet::new();
+    let mut ids: HashSet<String> = HashSet::new();
+    let mut classes: HashSet<String> = HashSet::new();
+
+    for &r in roots {
+        if doc.element(r).is_some() {
+            target_nodes.push(r);
+        }
+        for d in doc.descendants(r) {
+            if doc.element(d).is_some() {
+                target_nodes.push(d);
+            }
+        }
+    }
+    if target_nodes.is_empty() {
+        return Vec::new();
+    }
+    for &nid in &target_nodes {
+        if let Some(el) = doc.element(nid) {
+            tags.insert(el.tag_name.to_ascii_lowercase());
+            if let Some(id) = el.id() {
+                ids.insert(id.to_string());
+            }
+            if let Some(cls) = el.get_attr("class") {
+                for c in cls.split_ascii_whitespace() {
+                    classes.insert(c.to_string());
+                }
+            }
+        }
+    }
+
+    let ua_sheet = cached_ua_stylesheet();
+    let mut flat_rules: Vec<FlatRule<'_>> = Vec::new();
+    let mut order_counter = 0usize;
+    let mut dummy_kf = HashMap::new();
+    let mut dummy_ff = Vec::new();
+    let mut ua_layers = LayerRegistry::new();
+    collect_rules(
+        &ua_sheet.rules,
+        Origin::Ua,
+        None,
+        &mut ua_layers,
+        &viewport,
+        &mut flat_rules,
+        &mut order_counter,
+        &mut dummy_kf,
+        &mut dummy_ff,
+    );
+    let mut author_layers = LayerRegistry::new();
+    for sheet in author_sheets {
+        collect_rules(
+            &sheet.rules,
+            Origin::Author,
+            None,
+            &mut author_layers,
+            &viewport,
+            &mut flat_rules,
+            &mut order_counter,
+            &mut dummy_kf,
+            &mut dummy_ff,
+        );
+    }
+
+    flat_rules.retain(|rule| {
+        if let Some(last) = rule.selector.compounds.last() {
+            let mut key_id = None;
+            let mut key_class = None;
+            let mut key_tag = None;
+            for s in &last.simple {
+                match s {
+                    SimpleSelector::Id(id) if key_id.is_none() => key_id = Some(id.as_str()),
+                    SimpleSelector::Class(c) if key_class.is_none() => key_class = Some(c.as_str()),
+                    SimpleSelector::Type(t) if key_tag.is_none() => key_tag = Some(t.as_str()),
+                    _ => {}
+                }
+            }
+            if let Some(id) = key_id {
+                return ids.contains(id);
+            }
+            if let Some(c) = key_class {
+                return classes.contains(c);
+            }
+            if let Some(t) = key_tag {
+                return tags.contains(&t.to_ascii_lowercase());
+            }
+        }
+        true
+    });
+
+    let rule_index = RuleIndex::build(flat_rules);
+    let prev_dark = crate::values::set_active_dark_mode(viewport.dark_mode);
+    let root_default = ComputedStyle::default();
+    let mut root_font_size = doc
+        .document_element_of(doc.root)
+        .and_then(|de| map.styles.get(&de))
+        .map(|s| s.font_size)
+        .unwrap_or(16.0);
+
+    for &r in roots {
+        let is_root = doc.document_element_of(doc.root) == Some(r);
+        let parent_style = doc
+            .node(r)
+            .parent
+            .and_then(|p| map.styles.get(&p))
+            .cloned()
+            .unwrap_or_else(|| root_default.clone());
+        resolve_subtree(
+            doc,
+            r,
+            &parent_style,
+            &mut root_font_size,
+            is_root,
+            &rule_index,
+            &viewport,
+            map,
+        );
+    }
+    crate::values::set_active_dark_mode(prev_dark);
+    target_nodes
+}
+
+pub fn style_affects_layout(a: &ComputedStyle, b: &ComputedStyle) -> bool {
+    a.display != b.display
+        || a.position != b.position
+        || a.top != b.top
+        || a.right != b.right
+        || a.bottom != b.bottom
+        || a.left != b.left
+        || a.width != b.width
+        || a.height != b.height
+        || a.min_width != b.min_width
+        || a.max_width != b.max_width
+        || a.min_height != b.min_height
+        || a.max_height != b.max_height
+        || a.margin_top != b.margin_top
+        || a.margin_right != b.margin_right
+        || a.margin_bottom != b.margin_bottom
+        || a.margin_left != b.margin_left
+        || a.padding_top != b.padding_top
+        || a.padding_right != b.padding_right
+        || a.padding_bottom != b.padding_bottom
+        || a.padding_left != b.padding_left
+        || (a.border_top_width - b.border_top_width).abs() > 1e-4
+        || (a.border_right_width - b.border_right_width).abs() > 1e-4
+        || (a.border_bottom_width - b.border_bottom_width).abs() > 1e-4
+        || (a.border_left_width - b.border_left_width).abs() > 1e-4
+        || a.box_sizing != b.box_sizing
+        || a.float != b.float
+        || a.clear != b.clear
+        || a.flex_direction != b.flex_direction
+        || a.flex_wrap != b.flex_wrap
+        || (a.flex_grow - b.flex_grow).abs() > 1e-4
+        || (a.flex_shrink - b.flex_shrink).abs() > 1e-4
+        || a.flex_basis != b.flex_basis
+        || a.justify_content != b.justify_content
+        || a.align_items != b.align_items
+        || a.align_self != b.align_self
+        || a.align_content != b.align_content
+        || a.order != b.order
+        || a.row_gap != b.row_gap
+        || a.column_gap != b.column_gap
+        || a.grid_template_columns != b.grid_template_columns
+        || a.grid_template_rows != b.grid_template_rows
+        || a.grid_column_start != b.grid_column_start
+        || a.grid_column_end != b.grid_column_end
+        || a.grid_row_start != b.grid_row_start
+        || a.grid_row_end != b.grid_row_end
+        || (a.font_size - b.font_size).abs() > 1e-4
+        || a.font_weight != b.font_weight
+        || a.font_style != b.font_style
+        || a.font_family != b.font_family
+        || a.line_height != b.line_height
+        || (a.letter_spacing - b.letter_spacing).abs() > 1e-4
+        || (a.word_spacing - b.word_spacing).abs() > 1e-4
+        || a.white_space != b.white_space
+        || a.text_transform != b.text_transform
+        || a.text_align != b.text_align
+        || a.overflow_x != b.overflow_x
+        || a.overflow_y != b.overflow_y
+        || a.vertical_align != b.vertical_align
+        || a.content != b.content
 }
 
 pub fn compute_styles_with_ua(
@@ -301,6 +539,12 @@ pub fn compute_styles_with_ua_root(
             &mut map.keyframes,
             &mut map.font_faces,
         );
+    }
+
+    for r in &flat_rules {
+        if selector_has_hover(r.selector) {
+            map.hover_selectors.push(r.selector.clone());
+        }
     }
 
     let rule_index = RuleIndex::build(flat_rules);
@@ -673,6 +917,22 @@ fn compute_element_style(
         percentage_base: 0.0,
     };
 
+    if let Some(mut entries) = expanded_lists.remove("color-scheme") {
+        entries.sort_by_key(|(k, _)| *k);
+        for (_, val) in entries {
+            if let Some(tokens) = resolve_revert("color-scheme", val, &ua_winners) {
+                apply_color_scheme(&mut style, parent, &tokens);
+            }
+        }
+    }
+
+    let effective_dark = match style.color_scheme {
+        ColorScheme::Dark => true,
+        ColorScheme::Light => false,
+        ColorScheme::Normal | ColorScheme::LightDark => viewport.dark_mode,
+    };
+    let prev_dark_mode = crate::values::set_active_dark_mode(effective_dark);
+
     if let Some(mut entries) = expanded_lists.remove("color") {
         entries.sort_by_key(|(k, _)| *k);
         for (_, val) in entries {
@@ -691,6 +951,7 @@ fn compute_element_style(
             apply_longhand(&mut style, parent, &prop, &tokens, &ctx);
         }
     }
+    crate::values::set_active_dark_mode(prev_dark_mode);
 
     if matches!(style.border_top_style, BorderStyle::None | BorderStyle::Hidden) {
         style.border_top_width = 0.0;
@@ -1516,9 +1777,19 @@ fn expand_grid_span_pair(
             (end_prop.into(), trim_ws(&tokens[slash + 1..]).to_vec()),
         ]
     } else {
+        let trimmed = trim_ws(tokens);
+        let is_named = matches!(
+            trimmed,
+            [Token::Ident(s)] if !s.eq_ignore_ascii_case("auto") && !s.eq_ignore_ascii_case("span")
+        );
+        let end_val = if is_named {
+            trimmed.to_vec()
+        } else {
+            tokenize("auto")
+        };
         vec![
-            (start_prop.into(), tokens.to_vec()),
-            (end_prop.into(), tokenize("auto")),
+            (start_prop.into(), trimmed.to_vec()),
+            (end_prop.into(), end_val),
         ]
     }
 }
@@ -1644,6 +1915,40 @@ fn apply_font_size(
                 style.font_size = px;
             }
         }
+    }
+}
+
+fn apply_color_scheme(style: &mut ComputedStyle, parent: &ComputedStyle, tokens: &[Token]) {
+    let trimmed = trim_ws(tokens);
+    if is_css_wide(trimmed, "inherit") || is_css_wide(trimmed, "unset") {
+        style.color_scheme = parent.color_scheme;
+        return;
+    }
+    if is_css_wide(trimmed, "initial") {
+        style.color_scheme = ColorScheme::Normal;
+        return;
+    }
+    let mut has_light = false;
+    let mut has_dark = false;
+    let mut has_normal = false;
+    for t in trimmed {
+        if let Token::Ident(s) = t {
+            match s.to_ascii_lowercase().as_str() {
+                "light" => has_light = true,
+                "dark" => has_dark = true,
+                "normal" => has_normal = true,
+                _ => {}
+            }
+        }
+    }
+    if has_light && has_dark {
+        style.color_scheme = ColorScheme::LightDark;
+    } else if has_dark {
+        style.color_scheme = ColorScheme::Dark;
+    } else if has_light {
+        style.color_scheme = ColorScheme::Light;
+    } else if has_normal {
+        style.color_scheme = ColorScheme::Normal;
     }
 }
 
@@ -2677,10 +2982,14 @@ fn apply_longhand(
             }
         }
         "grid-template-columns" => {
-            style.grid_template_columns = parse_grid_tracks(trimmed, ctx);
+            let (tracks, names) = parse_grid_tracks_with_names(trimmed, ctx);
+            style.grid_template_columns = tracks;
+            style.grid_column_line_names = names;
         }
         "grid-template-rows" => {
-            style.grid_template_rows = parse_grid_tracks(trimmed, ctx);
+            let (tracks, names) = parse_grid_tracks_with_names(trimmed, ctx);
+            style.grid_template_rows = tracks;
+            style.grid_row_line_names = names;
         }
         "grid-template-areas" => {
             if ident.as_deref() == Some("none") {
@@ -2964,6 +3273,7 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, prop: &str) {
         "outline-color" => dst.outline_color = src.outline_color,
         "outline-offset" => dst.outline_offset = src.outline_offset,
         "color" => dst.color = src.color,
+        "color-scheme" => dst.color_scheme = src.color_scheme,
         "font-family" => dst.font_family = src.font_family.clone(),
         "font-size" => dst.font_size = src.font_size,
         "font-weight" => dst.font_weight = src.font_weight,
@@ -3021,17 +3331,23 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, prop: &str) {
         "order" => dst.order = src.order,
         "row-gap" => dst.row_gap = src.row_gap.clone(),
         "column-gap" => dst.column_gap = src.column_gap.clone(),
-        "grid-template-columns" => dst.grid_template_columns = src.grid_template_columns.clone(),
-        "grid-template-rows" => dst.grid_template_rows = src.grid_template_rows.clone(),
+        "grid-template-columns" => {
+            dst.grid_template_columns = src.grid_template_columns.clone();
+            dst.grid_column_line_names = src.grid_column_line_names.clone();
+        }
+        "grid-template-rows" => {
+            dst.grid_template_rows = src.grid_template_rows.clone();
+            dst.grid_row_line_names = src.grid_row_line_names.clone();
+        }
         "grid-template-areas" => dst.grid_template_areas = src.grid_template_areas.clone(),
         "grid-auto-columns" => dst.grid_auto_columns = src.grid_auto_columns.clone(),
         "grid-auto-rows" => dst.grid_auto_rows = src.grid_auto_rows.clone(),
         "grid-auto-flow" => dst.grid_auto_flow = src.grid_auto_flow,
         "grid-area" => dst.grid_area = src.grid_area.clone(),
-        "grid-column-start" => dst.grid_column_start = src.grid_column_start,
-        "grid-column-end" => dst.grid_column_end = src.grid_column_end,
-        "grid-row-start" => dst.grid_row_start = src.grid_row_start,
-        "grid-row-end" => dst.grid_row_end = src.grid_row_end,
+        "grid-column-start" => dst.grid_column_start = src.grid_column_start.clone(),
+        "grid-column-end" => dst.grid_column_end = src.grid_column_end.clone(),
+        "grid-row-start" => dst.grid_row_start = src.grid_row_start.clone(),
+        "grid-row-end" => dst.grid_row_end = src.grid_row_end.clone(),
         "list-style-type" => dst.list_style_type = src.list_style_type,
         "list-style-position" => dst.list_style_position = src.list_style_position,
         "content" => dst.content = src.content.clone(),

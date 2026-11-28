@@ -56,18 +56,31 @@ impl DecodedImage {
                     None
                 }
             });
-        let w = el
+        let raw_w = el
             .get_attr("width")
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
-            .or_else(|| vb_dims.map(|d| d.0))
-            .unwrap_or(64.0)
-            .clamp(1.0, 1024.0) as u32;
-        let h = el
+            .filter(|&v| v > 0.0);
+        let raw_h = el
             .get_attr("height")
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
-            .or_else(|| vb_dims.map(|d| d.1))
-            .unwrap_or(64.0)
-            .clamp(1.0, 1024.0) as u32;
+            .filter(|&v| v > 0.0);
+        let (mut wf, mut hf) = match (raw_w, raw_h, vb_dims) {
+            (Some(w), Some(h), _) => (w, h),
+            (Some(w), None, Some((vw, vh))) => (w, w * (vh / vw)),
+            (None, Some(h), Some((vw, vh))) => (h * (vw / vh), h),
+            (None, None, Some((vw, vh))) => (vw, vh),
+            (Some(w), None, None) => (w, 64.0),
+            (None, Some(h), None) => (64.0, h),
+            (None, None, None) => (64.0, 64.0),
+        };
+        let max_dim = wf.max(hf);
+        if max_dim > 1024.0 {
+            let sc = 1024.0 / max_dim;
+            wf *= sc;
+            hf *= sc;
+        }
+        let w = wf.round().max(1.0) as u32;
+        let h = hf.round().max(1.0) as u32;
         let mut fb = Framebuffer::new(w, h);
         render_svg_node(&doc, svg_id, &mut fb, shared_svg_fonts(), 0.0, 0.0, w as f32, h as f32);
         Ok(Self {

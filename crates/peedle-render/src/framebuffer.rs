@@ -152,11 +152,19 @@ impl Framebuffer {
     }
 
     pub fn clear(&mut self, color: RgbaColor) {
-        for px in self.data.chunks_exact_mut(4) {
-            px[0] = color.r;
-            px[1] = color.g;
-            px[2] = color.b;
-            px[3] = color.a;
+        let len = self.data.len();
+        if len < 4 {
+            return;
+        }
+        self.data[0] = color.r;
+        self.data[1] = color.g;
+        self.data[2] = color.b;
+        self.data[3] = color.a;
+        let mut filled = 4usize;
+        while filled < len {
+            let copy_len = filled.min(len - filled);
+            self.data.copy_within(0..copy_len, filled);
+            filled += copy_len;
         }
     }
 
@@ -330,6 +338,29 @@ impl Framebuffer {
         self.rounded_clips.pop();
     }
 
+    fn rounded_clips_safe_inner(&self, x0: i32, y0: i32, x1: i32, y1: i32) -> (i32, i32, i32, i32) {
+        let mut sx0 = x0;
+        let mut sy0 = y0;
+        let mut sx1 = x1;
+        let mut sy1 = y1;
+        for &(rx, ry, rw, rh, radii) in &self.rounded_clips {
+            let max_r = radii[0].max(radii[1]).max(radii[2]).max(radii[3]);
+            sx0 = sx0.max((rx + max_r + 1.0).ceil() as i32);
+            sy0 = sy0.max((ry + max_r + 1.0).ceil() as i32);
+            sx1 = sx1.min((rx + rw - max_r - 1.0).floor() as i32);
+            sy1 = sy1.min((ry + rh - max_r - 1.0).floor() as i32);
+        }
+        if sx0 > sx1 {
+            sx0 = x1;
+            sx1 = x1;
+        }
+        if sy0 > sy1 {
+            sy0 = y1;
+            sy1 = y1;
+        }
+        (sx0, sy0, sx1, sy1)
+    }
+
     #[inline]
     pub fn blend_pixel(&mut self, x: i32, y: i32, mut color: RgbaColor) {
         if color.a == 0 {
@@ -344,6 +375,14 @@ impl Framebuffer {
             let cy = y as f32 + 0.5;
             let mut cov = 1.0f32;
             for &(rx, ry, rw, rh, radii) in &self.rounded_clips {
+                let max_r = radii[0].max(radii[1]).max(radii[2]).max(radii[3]);
+                if cx >= rx + max_r + 0.5
+                    && cx <= rx + rw - max_r - 0.5
+                    && cy >= ry + max_r + 0.5
+                    && cy <= ry + rh - max_r - 0.5
+                {
+                    continue;
+                }
                 let d = rounded_rect_sdf(cx, cy, rx, ry, rw, rh, radii);
                 let c = (0.5 - d).clamp(0.0, 1.0);
                 if c <= 0.0 {
@@ -362,7 +401,7 @@ impl Framebuffer {
         if idx + 3 >= self.data.len() {
             return;
         }
-        if color.a == 255 && self.rounded_clips.is_empty() {
+        if color.a == 255 {
             self.data[idx] = color.r;
             self.data[idx + 1] = color.g;
             self.data[idx + 2] = color.b;
@@ -394,15 +433,19 @@ impl Framebuffer {
             return;
         }
         if color.a == 255 && self.rounded_clips.is_empty() {
-            for py in y0..y1 {
-                let row = (py as u32 * self.width) as usize;
-                for px in x0..x1 {
-                    let idx = (row + px as usize) * 4;
-                    self.data[idx] = color.r;
-                    self.data[idx + 1] = color.g;
-                    self.data[idx + 2] = color.b;
-                    self.data[idx + 3] = 255;
-                }
+            let row_w = (x1 - x0) as usize;
+            let row_bytes = row_w * 4;
+            let px_val = [color.r, color.g, color.b, 255];
+            let first_off = (y0 as usize * self.width as usize + x0 as usize) * 4;
+            let first_row = &mut self.data[first_off..first_off + row_bytes];
+            for chunk in first_row.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&px_val);
+            }
+            let stride = self.width as usize * 4;
+            for py in (y0 + 1)..y1 {
+                let dst_off = (py as usize * self.width as usize + x0 as usize) * 4;
+                self.data.copy_within(first_off..first_off + row_bytes, dst_off);
+                let _ = stride;
             }
         } else {
             for py in y0..y1 {
@@ -444,6 +487,62 @@ impl Framebuffer {
             radii[2].clamp(0.0, max_r),
             radii[3].clamp(0.0, max_r),
         ];
+        if self.rounded_clips.is_empty() && color.a == 255 {
+            let top_r = r[0].max(r[1]);
+            let bot_r = r[2].max(r[3]);
+            let mid_y0 = ((y + top_r).ceil() as i32).clamp(y0, y1);
+            let mid_y1 = ((y + h - bot_r).floor() as i32).clamp(mid_y0, y1);
+            if mid_y0 < mid_y1 {
+                let row_px = (x1 - x0) as usize;
+                let mut row_buf = vec![0u8; row_px * 4];
+                for chunk in row_buf.chunks_exact_mut(4) {
+                    chunk[0] = color.r;
+                    chunk[1] = color.g;
+                    chunk[2] = color.b;
+                    chunk[3] = 255;
+                }
+                let stride = self.width as usize * 4;
+                for py in mid_y0..mid_y1 {
+                    let dst_off = py as usize * stride + x0 as usize * 4;
+                    if dst_off + row_buf.len() <= self.data.len() {
+                        self.data[dst_off..dst_off + row_buf.len()].copy_from_slice(&row_buf);
+                    }
+                }
+            }
+            for py in (y0..mid_y0).chain(mid_y1..y1) {
+                let cy = py as f32 + 0.5;
+                let is_top = py < mid_y0;
+                let left_r = if is_top { r[0] } else { r[3] };
+                let right_r = if is_top { r[1] } else { r[2] };
+                let inner_x0 = ((x + left_r).ceil() as i32).clamp(x0, x1);
+                let inner_x1 = ((x + w - right_r).floor() as i32).clamp(inner_x0, x1);
+                for px in x0..inner_x0 {
+                    let cx = px as f32 + 0.5;
+                    let cov = (0.5 - rounded_rect_sdf(cx, cy, x, y, w, h, r)).clamp(0.0, 1.0);
+                    if cov > 0.0 {
+                        self.blend_pixel(px, py, color.with_alpha(cov));
+                    }
+                }
+                if inner_x0 < inner_x1 {
+                    let row = (py as u32 * self.width) as usize;
+                    for px in inner_x0..inner_x1 {
+                        let idx = (row + px as usize) * 4;
+                        self.data[idx] = color.r;
+                        self.data[idx + 1] = color.g;
+                        self.data[idx + 2] = color.b;
+                        self.data[idx + 3] = 255;
+                    }
+                }
+                for px in inner_x1..x1 {
+                    let cx = px as f32 + 0.5;
+                    let cov = (0.5 - rounded_rect_sdf(cx, cy, x, y, w, h, r)).clamp(0.0, 1.0);
+                    if cov > 0.0 {
+                        self.blend_pixel(px, py, color.with_alpha(cov));
+                    }
+                }
+            }
+            return;
+        }
         for py in y0..y1 {
             let cy = py as f32 + 0.5;
             for px in x0..x1 {
@@ -564,6 +663,9 @@ impl Framebuffer {
             let y0 = (y.floor() as i32).max(clip.y);
             let x1 = ((x + w).ceil() as i32).min(clip.x + clip.w);
             let y1 = ((y + h).ceil() as i32).min(clip.y + clip.h);
+            if x0 >= x1 || y0 >= y1 {
+                return;
+            }
             let max_r = (w * 0.5).min(h * 0.5);
             let ro = [
                 radii[0].clamp(0.0, max_r),
@@ -579,24 +681,38 @@ impl Framebuffer {
             ];
             let iw = (w - bw * 2.0).max(0.0);
             let ih = (h - bw * 2.0).max(0.0);
+            let max_ro = ro[0].max(ro[1]).max(ro[2]).max(ro[3]);
+            let pad_skip = bw + max_ro + 2.0;
+            let skip_x0 = ((x + pad_skip).ceil() as i32).clamp(x0, x1);
+            let skip_x1 = ((x + w - pad_skip).floor() as i32).clamp(skip_x0, x1);
+            let skip_y0 = ((y + pad_skip).ceil() as i32).clamp(y0, y1);
+            let skip_y1 = ((y + h - pad_skip).floor() as i32).clamp(skip_y0, y1);
             for py in y0..y1 {
                 let cy = py as f32 + 0.5;
-                for px in x0..x1 {
-                    let cx = px as f32 + 0.5;
-                    let d_out = rounded_rect_sdf(cx, cy, x, y, w, h, ro);
-                    if d_out > 0.5 {
-                        continue;
-                    }
-                    let d_in = if iw > 0.0 && ih > 0.0 {
-                        rounded_rect_sdf(cx, cy, x + bw, y + bw, iw, ih, ri)
-                    } else {
-                        1.0
-                    };
-                    let cov_out = (0.5 - d_out).clamp(0.0, 1.0);
-                    let cov_in = (0.5 - d_in).clamp(0.0, 1.0);
-                    let cov = (cov_out - cov_in).clamp(0.0, 1.0);
-                    if cov > 0.0 {
-                        self.blend_pixel(px, py, colors[0].with_alpha(cov));
+                let skip_mid = py >= skip_y0 && py < skip_y1 && skip_x0 < skip_x1;
+                let ranges: [(i32, i32); 2] = if skip_mid {
+                    [(x0, skip_x0), (skip_x1, x1)]
+                } else {
+                    [(x0, x1), (0, 0)]
+                };
+                for &(rx0, rx1) in &ranges {
+                    for px in rx0..rx1 {
+                        let cx = px as f32 + 0.5;
+                        let d_out = rounded_rect_sdf(cx, cy, x, y, w, h, ro);
+                        if d_out > 0.5 {
+                            continue;
+                        }
+                        let d_in = if iw > 0.0 && ih > 0.0 {
+                            rounded_rect_sdf(cx, cy, x + bw, y + bw, iw, ih, ri)
+                        } else {
+                            1.0
+                        };
+                        let cov_out = (0.5 - d_out).clamp(0.0, 1.0);
+                        let cov_in = (0.5 - d_in).clamp(0.0, 1.0);
+                        let cov = (cov_out - cov_in).clamp(0.0, 1.0);
+                        if cov > 0.0 {
+                            self.blend_pixel(px, py, colors[0].with_alpha(cov));
+                        }
                     }
                 }
             }
@@ -610,6 +726,78 @@ impl Framebuffer {
         let x1 = ((x + w).ceil() as i32).min(clip.x + clip.w);
         let y1 = ((y + h).ceil() as i32).min(clip.y + clip.h);
         if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        if radii.iter().any(|&r| r > 0.01) {
+            let max_r = (w * 0.5).min(h * 0.5);
+            let ro = [
+                radii[0].clamp(0.0, max_r),
+                radii[1].clamp(0.0, max_r),
+                radii[2].clamp(0.0, max_r),
+                radii[3].clamp(0.0, max_r),
+            ];
+            let iw = (w - bl - br).max(0.0);
+            let ih = (h - bt - bb).max(0.0);
+            let max_ri = (iw * 0.5).min(ih * 0.5);
+            let ri = [
+                (ro[0] - bt.max(bl)).clamp(0.0, max_ri),
+                (ro[1] - bt.max(br)).clamp(0.0, max_ri),
+                (ro[2] - bb.max(br)).clamp(0.0, max_ri),
+                (ro[3] - bb.max(bl)).clamp(0.0, max_ri),
+            ];
+            let max_bw = bt.max(br).max(bb).max(bl);
+            let max_ro = ro[0].max(ro[1]).max(ro[2]).max(ro[3]);
+            let pad_skip = max_bw + max_ro + 2.0;
+            let skip_x0 = ((x + pad_skip).ceil() as i32).clamp(x0, x1);
+            let skip_x1 = ((x + w - pad_skip).floor() as i32).clamp(skip_x0, x1);
+            let skip_y0 = ((y + pad_skip).ceil() as i32).clamp(y0, y1);
+            let skip_y1 = ((y + h - pad_skip).floor() as i32).clamp(skip_y0, y1);
+            let mid_x = x + w * 0.5;
+            let mid_y = y + h * 0.5;
+            let inv_w = 1.0 / w.max(1.0);
+            let inv_h = 1.0 / h.max(1.0);
+            for py in y0..y1 {
+                let cy = py as f32 + 0.5;
+                let skip_mid = py >= skip_y0 && py < skip_y1 && skip_x0 < skip_x1;
+                let ranges: [(i32, i32); 2] = if skip_mid {
+                    [(x0, skip_x0), (skip_x1, x1)]
+                } else {
+                    [(x0, x1), (0, 0)]
+                };
+                for &(rx0, rx1) in &ranges {
+                    for px in rx0..rx1 {
+                        let cx = px as f32 + 0.5;
+                        let d_out = rounded_rect_sdf(cx, cy, x, y, w, h, ro);
+                        if d_out > 0.5 {
+                            continue;
+                        }
+                        let d_in = if iw > 0.0 && ih > 0.0 {
+                            rounded_rect_sdf(cx, cy, x + bl, y + bt, iw, ih, ri)
+                        } else {
+                            1.0
+                        };
+                        let cov_out = (0.5 - d_out).clamp(0.0, 1.0);
+                        let cov_in = (0.5 - d_in).clamp(0.0, 1.0);
+                        let cov = (cov_out - cov_in).clamp(0.0, 1.0);
+                        if cov <= 0.0 {
+                            continue;
+                        }
+                        let nx = (cx - mid_x) * inv_w;
+                        let ny = (cy - mid_y) * inv_h;
+                        let side = if ny.abs() >= nx.abs() {
+                            if ny < 0.0 { 0 } else { 2 }
+                        } else if nx > 0.0 {
+                            1
+                        } else {
+                            3
+                        };
+                        if widths[side] > 0.0 && colors[side].a > 0 {
+                            self.blend_pixel(px, py, colors[side].with_alpha(cov));
+                        }
+                    }
+                }
+            }
             return;
         }
 
@@ -851,6 +1039,9 @@ impl Framebuffer {
             let y0 = (y.floor() as i32).max(clip.y);
             let x1 = ((x + w).ceil() as i32).min(clip.x + clip.w);
             let y1 = ((y + h).ceil() as i32).min(clip.y + clip.h);
+            if x0 >= x1 || y0 >= y1 {
+                return;
+            }
             let ix = x + offset_x + spread;
             let iy = y + offset_y + spread;
             let iw = (w - spread * 2.0).max(0.0);
@@ -898,6 +1089,9 @@ impl Framebuffer {
         let y0 = ((sy - pad).floor() as i32).max(clip.y);
         let x1 = ((sx + sw + pad).ceil() as i32).min(clip.x + clip.w);
         let y1 = ((sy + sh + pad).ceil() as i32).min(clip.y + clip.h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
         let max_r = (sw * 0.5).min(sh * 0.5);
         let sr = [
             (radii[0] + spread).clamp(0.0, max_r),
@@ -905,25 +1099,38 @@ impl Framebuffer {
             (radii[2] + spread).clamp(0.0, max_r),
             (radii[3] + spread).clamp(0.0, max_r),
         ];
+        let box_max_r = radii[0].max(radii[1]).max(radii[2]).max(radii[3]);
+        let skip_x0 = ((x + box_max_r + 1.0).ceil() as i32).clamp(x0, x1);
+        let skip_x1 = ((x + w - box_max_r - 1.0).floor() as i32).clamp(skip_x0, x1);
+        let skip_y0 = ((y + box_max_r + 1.0).ceil() as i32).clamp(y0, y1);
+        let skip_y1 = ((y + h - box_max_r - 1.0).floor() as i32).clamp(skip_y0, y1);
         for py in y0..y1 {
             let cy = py as f32 + 0.5;
-            for px in x0..x1 {
-                let cx = px as f32 + 0.5;
-                let box_d = rounded_rect_sdf(cx, cy, x, y, w, h, radii);
-                let out_cov = (box_d + 0.5).clamp(0.0, 1.0);
-                if out_cov <= 0.0 {
-                    continue;
-                }
-                let dist = rounded_rect_sdf(cx, cy, sx, sy, sw, sh, sr);
-                let alpha = if blur <= 0.1 {
-                    (0.5 - dist).clamp(0.0, 1.0)
-                } else {
-                    let t = ((pad - dist) / (2.0 * sigma)).clamp(0.0, 1.0);
-                    t * t * (3.0 - 2.0 * t)
-                };
-                let a = alpha * out_cov;
-                if a > 0.0 {
-                    self.blend_pixel(px, py, color.with_alpha(a));
+            let skip_mid = py >= skip_y0 && py < skip_y1 && skip_x0 < skip_x1;
+            let ranges: [(i32, i32); 2] = if skip_mid {
+                [(x0, skip_x0), (skip_x1, x1)]
+            } else {
+                [(x0, x1), (0, 0)]
+            };
+            for &(rx0, rx1) in &ranges {
+                for px in rx0..rx1 {
+                    let cx = px as f32 + 0.5;
+                    let box_d = rounded_rect_sdf(cx, cy, x, y, w, h, radii);
+                    let out_cov = (box_d + 0.5).clamp(0.0, 1.0);
+                    if out_cov <= 0.0 {
+                        continue;
+                    }
+                    let dist = rounded_rect_sdf(cx, cy, sx, sy, sw, sh, sr);
+                    let alpha = if blur <= 0.1 {
+                        (0.5 - dist).clamp(0.0, 1.0)
+                    } else {
+                        let t = ((pad - dist) / (2.0 * sigma)).clamp(0.0, 1.0);
+                        t * t * (3.0 - 2.0 * t)
+                    };
+                    let a = alpha * out_cov;
+                    if a > 0.0 {
+                        self.blend_pixel(px, py, color.with_alpha(a));
+                    }
                 }
             }
         }
@@ -1058,17 +1265,126 @@ impl Framebuffer {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
-        for py in y0..y1 {
-            let v = ((py as f32 + 0.5 - dst_y) / dst_h).clamp(0.0, 0.9999);
-            let sy = ((v * src_h as f32) as u32).min(src_h - 1);
-            for px in x0..x1 {
-                let u = ((px as f32 + 0.5 - dst_x) / dst_w).clamp(0.0, 0.9999);
-                let sx = ((u * src_w as f32) as u32).min(src_w - 1);
-                let sidx = ((sy * src_w + sx) * 4) as usize;
-                if sidx + 3 < src.len() {
-                    let c = RgbaColor::new(src[sidx], src[sidx + 1], src[sidx + 2], src[sidx + 3])
-                        .with_alpha(opacity);
-                    self.blend_pixel(px, py, c);
+        let is_scaled = (dst_w - src_w as f32).abs() > 0.5 || (dst_h - src_h as f32).abs() > 0.5;
+        let max_sx = src_w.saturating_sub(1);
+        let max_sy = src_h.saturating_sub(1);
+        let src_stride = src_w as usize * 4;
+        let dst_stride = self.width as usize * 4;
+        let (rc_x0, rc_y0, rc_x1, rc_y1) = self.rounded_clips_safe_inner(x0, y0, x1, y1);
+        let no_rc = self.rounded_clips.is_empty();
+        let opaque_alpha = opacity >= 0.999;
+        if is_scaled && src_w > 1 && src_h > 1 {
+            let max_fx_fp = (max_sx as i64) << 16;
+            let fx_step = ((src_w as f64 / dst_w as f64) * 65536.0) as i64;
+            let fx_base = (((x0 as f64 + 0.5 - dst_x as f64) / dst_w as f64 * src_w as f64 - 0.5)
+                * 65536.0) as i64;
+            for py in y0..y1 {
+                let row_rc_safe = no_rc || (py >= rc_y0 && py < rc_y1);
+                let fy = (((py as f32 + 0.5 - dst_y) / dst_h) * src_h as f32 - 0.5)
+                    .clamp(0.0, max_sy as f32);
+                let sy0 = fy as u32;
+                let sy1 = (sy0 + 1).min(max_sy);
+                let wy = ((fy - sy0 as f32) * 256.0) as u32;
+                let iwy = 256 - wy;
+                let row0 = sy0 as usize * src_stride;
+                let row1 = sy1 as usize * src_stride;
+                let dst_row = py as usize * dst_stride;
+                let mut fx_cur = fx_base;
+                for px in x0..x1 {
+                    let fxc = fx_cur.clamp(0, max_fx_fp);
+                    fx_cur += fx_step;
+                    let sx0 = (fxc >> 16) as u32;
+                    let sx1 = (sx0 + 1).min(max_sx);
+                    let wx = ((fxc >> 8) & 0xff) as u32;
+                    let iwx = 256 - wx;
+                    let i00 = row0 + sx0 as usize * 4;
+                    let i10 = row0 + sx1 as usize * 4;
+                    let i01 = row1 + sx0 as usize * 4;
+                    let i11 = row1 + sx1 as usize * 4;
+                    if i11 + 3 >= src.len() {
+                        continue;
+                    }
+                    let a00 = src[i00 + 3];
+                    let a10 = src[i10 + 3];
+                    let a01 = src[i01 + 3];
+                    let a11 = src[i11 + 3];
+                    if (a00 | a10 | a01 | a11) == 0 {
+                        continue;
+                    }
+                    let w00 = iwx * iwy;
+                    let w10 = wx * iwy;
+                    let w01 = iwx * wy;
+                    let w11 = wx * wy;
+                    let r = (src[i00] as u32 * w00
+                        + src[i10] as u32 * w10
+                        + src[i01] as u32 * w01
+                        + src[i11] as u32 * w11
+                        + 32768)
+                        >> 16;
+                    let g = (src[i00 + 1] as u32 * w00
+                        + src[i10 + 1] as u32 * w10
+                        + src[i01 + 1] as u32 * w01
+                        + src[i11 + 1] as u32 * w11
+                        + 32768)
+                        >> 16;
+                    let b = (src[i00 + 2] as u32 * w00
+                        + src[i10 + 2] as u32 * w10
+                        + src[i01 + 2] as u32 * w01
+                        + src[i11 + 2] as u32 * w11
+                        + 32768)
+                        >> 16;
+                    let rc_safe = no_rc || (row_rc_safe && px >= rc_x0 && px < rc_x1);
+                    if opaque_alpha && rc_safe && (a00 & a10 & a01 & a11) == 255 {
+                        let didx = dst_row + px as usize * 4;
+                        self.data[didx] = r as u8;
+                        self.data[didx + 1] = g as u8;
+                        self.data[didx + 2] = b as u8;
+                        self.data[didx + 3] = 255;
+                    } else {
+                        let a = (a00 as u32 * w00
+                            + a10 as u32 * w10
+                            + a01 as u32 * w01
+                            + a11 as u32 * w11
+                            + 32768)
+                            >> 16;
+                        if a == 0 {
+                            continue;
+                        }
+                        let c = RgbaColor::new(r as u8, g as u8, b as u8, a as u8)
+                            .with_alpha(opacity);
+                        self.blend_pixel(px, py, c);
+                    }
+                }
+            }
+        } else {
+            for py in y0..y1 {
+                let row_rc_safe = no_rc || (py >= rc_y0 && py < rc_y1);
+                let v = ((py as f32 + 0.5 - dst_y) / dst_h).clamp(0.0, 0.9999);
+                let sy = ((v * src_h as f32) as u32).min(max_sy);
+                let row0 = sy as usize * src_stride;
+                let dst_row = py as usize * dst_stride;
+                for px in x0..x1 {
+                    let u = ((px as f32 + 0.5 - dst_x) / dst_w).clamp(0.0, 0.9999);
+                    let sx = ((u * src_w as f32) as u32).min(max_sx);
+                    let sidx = row0 + sx as usize * 4;
+                    if sidx + 3 < src.len() {
+                        let sa = src[sidx + 3];
+                        if sa == 0 {
+                            continue;
+                        }
+                        let rc_safe = no_rc || (row_rc_safe && px >= rc_x0 && px < rc_x1);
+                        if opaque_alpha && rc_safe && sa == 255 {
+                            let didx = dst_row + px as usize * 4;
+                            self.data[didx] = src[sidx];
+                            self.data[didx + 1] = src[sidx + 1];
+                            self.data[didx + 2] = src[sidx + 2];
+                            self.data[didx + 3] = 255;
+                        } else {
+                            let c = RgbaColor::new(src[sidx], src[sidx + 1], src[sidx + 2], sa)
+                                .with_alpha(opacity);
+                            self.blend_pixel(px, py, c);
+                        }
+                    }
                 }
             }
         }
@@ -1101,6 +1417,32 @@ impl Framebuffer {
             .min(clip.y + clip.h)
             .min(self.height as i32);
         if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let exact_1to1 = (dst_w - src_w as f32).abs() < 0.01
+            && (dst_h - src_h as f32).abs() < 0.01
+            && (dst_x - dst_x.round()).abs() < 0.01
+            && (dst_y - dst_y.round()).abs() < 0.01;
+        if exact_1to1 {
+            let dx0 = dst_x.round() as i32;
+            let dy0 = dst_y.round() as i32;
+            let src_stride = src_w as usize * 4;
+            let dst_stride = self.width as usize * 4;
+            let sx_start = (x0 - dx0).max(0) as usize;
+            let span_px = ((x1 - x0) as usize).min((src_w as usize).saturating_sub(sx_start));
+            let row_bytes = span_px * 4;
+            for py in y0..y1 {
+                let sy = py - dy0;
+                if sy < 0 || sy >= src_h as i32 {
+                    continue;
+                }
+                let s_off = sy as usize * src_stride + sx_start * 4;
+                let d_off = py as usize * dst_stride + x0 as usize * 4;
+                if s_off + row_bytes <= src.len() && d_off + row_bytes <= self.data.len() {
+                    self.data[d_off..d_off + row_bytes]
+                        .copy_from_slice(&src[s_off..s_off + row_bytes]);
+                }
+            }
             return;
         }
         let span_w = (x1 - x0) as usize;
@@ -1165,28 +1507,240 @@ impl Framebuffer {
             radii[3].clamp(0.0, max_r),
         ];
         let has_radius = r.iter().any(|&v| v > 0.01);
+        let max_corner = r[0].max(r[1]).max(r[2]).max(r[3]);
+        let inner_x0 = ((clip_x + max_corner + 1.0).ceil() as i32).clamp(x0, x1);
+        let inner_x1 = ((clip_x + clip_w - max_corner - 1.0).floor() as i32).clamp(inner_x0, x1);
+        let inner_y0 = ((clip_y + max_corner + 1.0).ceil() as i32).clamp(y0, y1);
+        let inner_y1 = ((clip_y + clip_h - max_corner - 1.0).floor() as i32).clamp(inner_y0, y1);
+        let is_scaled = (dst_w - src_w as f32).abs() > 0.5 || (dst_h - src_h as f32).abs() > 0.5;
+        let max_sx = src_w.saturating_sub(1);
+        let max_sy = src_h.saturating_sub(1);
+        let src_stride = src_w as usize * 4;
+        let dst_stride = self.width as usize * 4;
+        let (rc_x0, rc_y0, rc_x1, rc_y1) = self.rounded_clips_safe_inner(x0, y0, x1, y1);
+        let no_rc = self.rounded_clips.is_empty();
+        let opaque_alpha = opacity >= 0.999;
+        let max_fx_fp = (max_sx as i64) << 16;
+        let fx_step = ((src_w as f64 / dst_w as f64) * 65536.0) as i64;
+        let fx_base = (((x0 as f64 + 0.5 - dst_x as f64) / dst_w as f64 * src_w as f64 - 0.5)
+            * 65536.0) as i64;
+        let use_bilinear = is_scaled && src_w > 1 && src_h > 1;
+        let fast_x0 = if has_radius {
+            if no_rc { inner_x0 } else { inner_x0.max(rc_x0) }
+        } else if no_rc {
+            x0
+        } else {
+            rc_x0
+        }
+        .clamp(x0, x1);
+        let fast_x1 = if has_radius {
+            if no_rc { inner_x1 } else { inner_x1.min(rc_x1) }
+        } else if no_rc {
+            x1
+        } else {
+            rc_x1
+        }
+        .clamp(fast_x0, x1);
         for py in y0..y1 {
             let cy = py as f32 + 0.5;
-            let v = ((cy - dst_y) / dst_h).clamp(0.0, 0.9999);
-            let sy = ((v * src_h as f32) as u32).min(src_h - 1);
-            for px in x0..x1 {
-                let cx = px as f32 + 0.5;
-                let cov = if has_radius {
-                    (0.5 - rounded_rect_sdf(cx, cy, clip_x, clip_y, clip_w, clip_h, r)).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                if cov <= 0.0 {
+            let row_interior = !has_radius || (py >= inner_y0 && py < inner_y1);
+            let row_rc_safe = no_rc || (py >= rc_y0 && py < rc_y1);
+            let fy = if use_bilinear {
+                (((cy - dst_y) / dst_h) * src_h as f32 - 0.5).clamp(0.0, max_sy as f32)
+            } else {
+                0.0
+            };
+            let sy0 = if use_bilinear {
+                fy as u32
+            } else {
+                ((((cy - dst_y) / dst_h).clamp(0.0, 0.9999) * src_h as f32) as u32).min(max_sy)
+            };
+            let sy1 = (sy0 + 1).min(max_sy);
+            let wy = ((fy - sy0 as f32) * 256.0) as u32;
+            let iwy = 256 - wy;
+            let row0 = sy0 as usize * src_stride;
+            let row1 = sy1 as usize * src_stride;
+            let dst_row = py as usize * dst_stride;
+            let mut fx_cur = fx_base;
+            let row_fast_span = use_bilinear
+                && opaque_alpha
+                && row_interior
+                && row_rc_safe
+                && fast_x0 < fast_x1
+                && row1 + src_stride <= src.len();
+            let mut px = x0;
+            while px < x1 {
+                if row_fast_span && px == fast_x0 {
+                    let s0 = &src[row0..row0 + src_stride];
+                    let s1 = &src[row1..row1 + src_stride];
+                    let dst_slice =
+                        &mut self.data[dst_row + fast_x0 as usize * 4..dst_row + fast_x1 as usize * 4];
+                    for dst_px in dst_slice.chunks_exact_mut(4) {
+                        let fxc = fx_cur.clamp(0, max_fx_fp);
+                        fx_cur += fx_step;
+                        let sx0 = (fxc >> 16) as usize;
+                        let sx1 = (sx0 + 1).min(max_sx as usize);
+                        let wx = ((fxc >> 8) & 0xff) as u32;
+                        let iwx = 256 - wx;
+                        let o0 = sx0 * 4;
+                        let o1 = sx1 * 4;
+                        let a00 = s0[o0 + 3];
+                        let a10 = s0[o1 + 3];
+                        let a01 = s1[o0 + 3];
+                        let a11 = s1[o1 + 3];
+                        if (a00 | a10 | a01 | a11) == 0 {
+                            continue;
+                        }
+                        let w00 = iwx * iwy;
+                        let w10 = wx * iwy;
+                        let w01 = iwx * wy;
+                        let w11 = wx * wy;
+                        let r_c = (s0[o0] as u32 * w00
+                            + s0[o1] as u32 * w10
+                            + s1[o0] as u32 * w01
+                            + s1[o1] as u32 * w11
+                            + 32768)
+                            >> 16;
+                        let g_c = (s0[o0 + 1] as u32 * w00
+                            + s0[o1 + 1] as u32 * w10
+                            + s1[o0 + 1] as u32 * w01
+                            + s1[o1 + 1] as u32 * w11
+                            + 32768)
+                            >> 16;
+                        let b_c = (s0[o0 + 2] as u32 * w00
+                            + s0[o1 + 2] as u32 * w10
+                            + s1[o0 + 2] as u32 * w01
+                            + s1[o1 + 2] as u32 * w11
+                            + 32768)
+                            >> 16;
+                        if (a00 & a10 & a01 & a11) == 255 {
+                            dst_px[0] = r_c as u8;
+                            dst_px[1] = g_c as u8;
+                            dst_px[2] = b_c as u8;
+                            dst_px[3] = 255;
+                        } else {
+                            let sa = (a00 as u32 * w00
+                                + a10 as u32 * w10
+                                + a01 as u32 * w01
+                                + a11 as u32 * w11
+                                + 32768)
+                                >> 16;
+                            if sa > 0 {
+                                let inv = 255 - sa;
+                                dst_px[0] = ((r_c * sa + dst_px[0] as u32 * inv + 127) / 255) as u8;
+                                dst_px[1] = ((g_c * sa + dst_px[1] as u32 * inv + 127) / 255) as u8;
+                                dst_px[2] = ((b_c * sa + dst_px[2] as u32 * inv + 127) / 255) as u8;
+                                dst_px[3] = (sa + (dst_px[3] as u32 * inv + 127) / 255).min(255) as u8;
+                            }
+                        }
+                    }
+                    px = fast_x1;
                     continue;
                 }
-                let u = ((cx - dst_x) / dst_w).clamp(0.0, 0.9999);
-                let sx = ((u * src_w as f32) as u32).min(src_w - 1);
-                let sidx = ((sy * src_w + sx) * 4) as usize;
-                if sidx + 3 < src.len() {
-                    let c = RgbaColor::new(src[sidx], src[sidx + 1], src[sidx + 2], src[sidx + 3])
-                        .with_alpha(opacity * cov);
-                    self.blend_pixel(px, py, c);
+                let fxc = fx_cur.clamp(0, max_fx_fp);
+                fx_cur += fx_step;
+                let is_inside = !has_radius || (row_interior && px >= inner_x0 && px < inner_x1);
+                let cov = if is_inside {
+                    1.0
+                } else {
+                    let cx = px as f32 + 0.5;
+                    (0.5 - rounded_rect_sdf(cx, cy, clip_x, clip_y, clip_w, clip_h, r))
+                        .clamp(0.0, 1.0)
+                };
+                if cov <= 0.0 {
+                    px += 1;
+                    continue;
                 }
+                let rc_safe = no_rc || (row_rc_safe && px >= rc_x0 && px < rc_x1);
+                if use_bilinear {
+                    let sx0 = (fxc >> 16) as u32;
+                    let sx1 = (sx0 + 1).min(max_sx);
+                    let wx = ((fxc >> 8) & 0xff) as u32;
+                    let iwx = 256 - wx;
+                    let i00 = row0 + sx0 as usize * 4;
+                    let i10 = row0 + sx1 as usize * 4;
+                    let i01 = row1 + sx0 as usize * 4;
+                    let i11 = row1 + sx1 as usize * 4;
+                    if i11 + 3 >= src.len() {
+                        px += 1;
+                        continue;
+                    }
+                    let a00 = src[i00 + 3];
+                    let a10 = src[i10 + 3];
+                    let a01 = src[i01 + 3];
+                    let a11 = src[i11 + 3];
+                    if (a00 | a10 | a01 | a11) == 0 {
+                        px += 1;
+                        continue;
+                    }
+                    let w00 = iwx * iwy;
+                    let w10 = wx * iwy;
+                    let w01 = iwx * wy;
+                    let w11 = wx * wy;
+                    let r_c = (src[i00] as u32 * w00
+                        + src[i10] as u32 * w10
+                        + src[i01] as u32 * w01
+                        + src[i11] as u32 * w11
+                        + 32768)
+                        >> 16;
+                    let g_c = (src[i00 + 1] as u32 * w00
+                        + src[i10 + 1] as u32 * w10
+                        + src[i01 + 1] as u32 * w01
+                        + src[i11 + 1] as u32 * w11
+                        + 32768)
+                        >> 16;
+                    let b_c = (src[i00 + 2] as u32 * w00
+                        + src[i10 + 2] as u32 * w10
+                        + src[i01 + 2] as u32 * w01
+                        + src[i11 + 2] as u32 * w11
+                        + 32768)
+                        >> 16;
+                    if is_inside && opaque_alpha && rc_safe && (a00 & a10 & a01 & a11) == 255 {
+                        let didx = dst_row + px as usize * 4;
+                        self.data[didx] = r_c as u8;
+                        self.data[didx + 1] = g_c as u8;
+                        self.data[didx + 2] = b_c as u8;
+                        self.data[didx + 3] = 255;
+                    } else {
+                        let a = (a00 as u32 * w00
+                            + a10 as u32 * w10
+                            + a01 as u32 * w01
+                            + a11 as u32 * w11
+                            + 32768)
+                            >> 16;
+                        if a == 0 {
+                            px += 1;
+                            continue;
+                        }
+                        let c = RgbaColor::new(r_c as u8, g_c as u8, b_c as u8, a as u8)
+                            .with_alpha(opacity * cov);
+                        self.blend_pixel(px, py, c);
+                    }
+                } else {
+                    let cx = px as f32 + 0.5;
+                    let u = ((cx - dst_x) / dst_w).clamp(0.0, 0.9999);
+                    let sx = ((u * src_w as f32) as u32).min(max_sx);
+                    let sidx = row0 + sx as usize * 4;
+                    if sidx + 3 < src.len() {
+                        let sa = src[sidx + 3];
+                        if sa == 0 {
+                            px += 1;
+                            continue;
+                        }
+                        if is_inside && opaque_alpha && rc_safe && sa == 255 {
+                            let didx = dst_row + px as usize * 4;
+                            self.data[didx] = src[sidx];
+                            self.data[didx + 1] = src[sidx + 1];
+                            self.data[didx + 2] = src[sidx + 2];
+                            self.data[didx + 3] = 255;
+                        } else {
+                            let c = RgbaColor::new(src[sidx], src[sidx + 1], src[sidx + 2], sa)
+                                .with_alpha(opacity * cov);
+                            self.blend_pixel(px, py, c);
+                        }
+                    }
+                }
+                px += 1;
             }
         }
     }
@@ -1244,27 +1798,73 @@ impl Framebuffer {
         if color.a == 0 || mask_w == 0 || mask_h == 0 {
             return;
         }
-        for my in 0..mask_h {
-            let py = dst_y + my as i32;
-            for mx in 0..mask_w {
+        let clip = self.current_clip();
+        let x0 = dst_x.max(clip.x);
+        let y0 = dst_y.max(clip.y);
+        let x1 = (dst_x + mask_w as i32).min(clip.x + clip.w).min(self.width as i32);
+        let y1 = (dst_y + mask_h as i32).min(clip.y + clip.h).min(self.height as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        if self.rounded_clips.is_empty() {
+            let ca = color.a as u32;
+            let cr = color.r as u32;
+            let cg = color.g as u32;
+            let cb = color.b as u32;
+            let stride = self.width as usize * 4;
+            for py in y0..y1 {
+                let my = (py - dst_y) as usize;
+                let mask_row = my * mask_w;
+                let dst_row = py as usize * stride;
+                for px in x0..x1 {
+                    let mx = (px - dst_x) as usize;
+                    let cov = mask[mask_row + mx] as u32;
+                    if cov == 0 {
+                        continue;
+                    }
+                    let sa = (ca * cov + 127) / 255;
+                    if sa == 0 {
+                        continue;
+                    }
+                    let idx = dst_row + px as usize * 4;
+                    if sa == 255 {
+                        self.data[idx] = color.r;
+                        self.data[idx + 1] = color.g;
+                        self.data[idx + 2] = color.b;
+                        self.data[idx + 3] = 255;
+                    } else {
+                        let inv = 255 - sa;
+                        let dr = self.data[idx] as u32;
+                        let dg = self.data[idx + 1] as u32;
+                        let db = self.data[idx + 2] as u32;
+                        let da = self.data[idx + 3] as u32;
+                        self.data[idx] = ((cr * sa + dr * inv + 127) / 255) as u8;
+                        self.data[idx + 1] = ((cg * sa + dg * inv + 127) / 255) as u8;
+                        self.data[idx + 2] = ((cb * sa + db * inv + 127) / 255) as u8;
+                        self.data[idx + 3] = (sa + (da * inv + 127) / 255).min(255) as u8;
+                    }
+                }
+            }
+            return;
+        }
+        for py in y0..y1 {
+            let my = (py - dst_y) as usize;
+            for px in x0..x1 {
+                let mx = (px - dst_x) as usize;
                 let cov = mask[my * mask_w + mx];
                 if cov == 0 {
                     continue;
                 }
                 let a = ((color.a as u32 * cov as u32 + 127) / 255) as u8;
-                self.blend_pixel(dst_x + mx as i32, py, RgbaColor::new(color.r, color.g, color.b, a));
+                self.blend_pixel(px, py, RgbaColor::new(color.r, color.g, color.b, a));
             }
         }
     }
 
     pub fn to_xrgb_slice(&self, out: &mut [u32]) {
         let count = (self.width as usize * self.height as usize).min(out.len());
-        for i in 0..count {
-            let idx = i * 4;
-            let r = self.data[idx] as u32;
-            let g = self.data[idx + 1] as u32;
-            let b = self.data[idx + 2] as u32;
-            out[i] = (r << 16) | (g << 8) | b;
+        for (dst, px) in out[..count].iter_mut().zip(self.data.chunks_exact(4)) {
+            *dst = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
         }
     }
 

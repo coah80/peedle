@@ -313,6 +313,10 @@ impl Canvas2D {
         all
     }
 
+    pub fn path_contours(&self) -> Vec<Vec<(f32, f32)>> {
+        self.all_contours()
+    }
+
     pub fn fill(&mut self, even_odd: bool) {
         let contours = self.all_contours();
         let color = self.state.fill_style.with_alpha(self.state.global_alpha);

@@ -489,6 +489,7 @@ pub struct Page {
     pub media_captions: HashMap<NodeId, (bool, Vec<CaptionCue>)>,
     pub fullscreen_video: Option<NodeId>,
     pub tab_muted: bool,
+    pub dom_scan_dirty: bool,
 }
 
 impl Page {
@@ -550,6 +551,7 @@ impl Page {
             media_captions: HashMap::new(),
             fullscreen_video: None,
             tab_muted: false,
+            dom_scan_dirty: true,
         };
         let _ = page.navigate("peedle://newtab");
         page
@@ -902,6 +904,7 @@ impl Page {
     }
 
     pub fn load_html_string(&mut self, html: &str, url: &str) {
+        self.dom_scan_dirty = true;
         self.media_players.clear();
         self.media_qualities.clear();
         self.media_captions.clear();
@@ -949,11 +952,13 @@ impl Page {
             self.check_pending_navigation();
         }
         self.sync_media_elements();
+        self.dom_scan_dirty = false;
     }
 
     pub fn eval_js(&mut self, code: &str) -> Result<String, String> {
         let res = self.js_env.eval(code);
         self.sync_console_from_js();
+        self.dom_scan_dirty = true;
         self.fetch_missing_images();
         self.recompute_if_needed();
         self.check_pending_navigation();
@@ -975,12 +980,26 @@ impl Page {
         }
     }
 
-    pub fn advance_time_ms(&mut self, delta_ms: u64) {
-        self.js_env.advance_time_ms(delta_ms);
+    pub fn advance_time_ms(&mut self, delta_ms: u64) -> bool {
+        if !self.js_env.advance_time_ms_checked(delta_ms) {
+            return false;
+        }
         self.sync_console_from_js();
-        self.fetch_missing_images();
-        self.recompute_if_needed();
+        let dirty = {
+            let st = self.js_env.dom.borrow();
+            st.dirty_style || st.dirty_layout || !st.doc.mutations.is_empty()
+        };
+        if dirty {
+            self.dom_scan_dirty = true;
+            self.fetch_missing_images();
+            self.recompute_if_needed();
+        }
         self.check_pending_navigation();
+        dirty || !self.js_env.dom.borrow().canvases.is_empty()
+    }
+
+    pub fn next_timer_delay_ms(&self) -> Option<u64> {
+        self.js_env.next_timer_delay_ms()
     }
 
     fn sync_console_from_js(&mut self) {
@@ -1436,9 +1455,20 @@ impl Page {
     }
 
     pub fn render_to_framebuffer_scaled(&mut self, fb: &mut Framebuffer, scale: f32) {
-        self.fetch_missing_images();
-        self.recompute_if_needed();
-        self.sync_media_elements();
+        if self.dom_scan_dirty {
+            self.fetch_missing_images();
+            self.recompute_if_needed();
+            self.sync_media_elements();
+            self.dom_scan_dirty = false;
+        } else {
+            let needs_recompute = {
+                let st = self.js_env.dom.borrow();
+                st.dirty_style || st.dirty_layout || st.dark_mode != self.dark_mode
+            };
+            if needs_recompute {
+                self.recompute_if_needed();
+            }
+        }
         let media_map = self.build_media_overlay_map();
         if let Some(fid) = self.fullscreen_video {
             if let Some(vst) = media_map.get(&fid) {
@@ -2114,27 +2144,59 @@ pre{{background:{surface};padding:14px 16px;border-radius:8px;overflow:auto;font
         if hit == self.hovered_node {
             return false;
         }
-        {
+        let (style_affected, has_mouseover) = {
             let mut st = self.js_env.dom.borrow_mut();
-            if let Some(prev) = self.hovered_node {
-                if let Some(el) = st.doc.element_mut(prev) {
+            let prev = self.hovered_node;
+            let prev_before = prev.map_or(0, |p| st.styles.hover_match_hash(&st.doc, p));
+            if let Some(p) = prev {
+                if let Some(el) = st.doc.element_mut(p) {
                     el.hovered = false;
                 }
             }
+            let prev_after = prev.map_or(0, |p| st.styles.hover_match_hash(&st.doc, p));
+            let prev_changed = prev_before != prev_after;
+
             self.hovered_node = hit;
             self.hovered_href = hit.and_then(|nid| find_ancestor_href(&st.doc, nid));
+            let cur_before = hit.map_or(0, |c| st.styles.hover_match_hash(&st.doc, c));
             if let Some(cur) = hit {
                 if let Some(el) = st.doc.element_mut(cur) {
                     el.hovered = true;
                 }
             }
-            st.dirty_style = true;
+            let cur_after = hit.map_or(0, |c| st.styles.hover_match_hash(&st.doc, c));
+            let cur_changed = cur_before != cur_after;
+            let affected = if prev_changed || cur_changed {
+                let mut roots = Vec::with_capacity(2);
+                if prev_changed {
+                    if let Some(p) = prev {
+                        roots.push(p);
+                    }
+                }
+                if cur_changed {
+                    if let Some(c) = hit {
+                        if !roots.contains(&c) {
+                            roots.push(c);
+                        }
+                    }
+                }
+                st.update_hover_styles(&roots)
+            } else {
+                false
+            };
+            let has_mo = st.has_event_listener("mouseover");
+            (affected, has_mo)
+        };
+        let mut js_dirty = false;
+        if has_mouseover {
+            if let Some(cur) = hit {
+                let _ = self.js_env.dispatch_dom_event(Some(cur), "mouseover", true, true);
+                self.sync_console_from_js();
+                let st = self.js_env.dom.borrow();
+                js_dirty = st.dirty_style || st.dirty_layout;
+            }
         }
-        if let Some(cur) = hit {
-            let _ = self.js_env.dispatch_dom_event(Some(cur), "mouseover", true, true);
-            self.sync_console_from_js();
-        }
-        true
+        style_affected || js_dirty
     }
 
     pub fn hovered_cursor(&self) -> peedle_css::Cursor {
@@ -2301,6 +2363,7 @@ pre{{background:{surface};padding:14px 16px;border-radius:8px;overflow:auto;font
             .dispatch_dom_event(Some(nid), "click", true, true)
             .unwrap_or(true);
         self.sync_console_from_js();
+        self.dom_scan_dirty = true;
         self.fetch_missing_images();
 
         let pending = self.js_env.dom.borrow_mut().pending_navigation.take();

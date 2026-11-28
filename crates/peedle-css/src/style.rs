@@ -858,6 +858,15 @@ impl ObjectFit {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ColorScheme {
+    #[default]
+    Normal,
+    Light,
+    Dark,
+    LightDark,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum LineHeight {
     #[default]
@@ -937,6 +946,7 @@ pub struct ComputedStyle {
     pub outline_offset: f32,
 
     pub color: Color,
+    pub color_scheme: ColorScheme,
     pub font_family: Vec<String>,
     pub font_size: f32,
     pub font_weight: u16,
@@ -999,6 +1009,8 @@ pub struct ComputedStyle {
 
     pub grid_template_columns: Vec<GridTrackSize>,
     pub grid_template_rows: Vec<GridTrackSize>,
+    pub grid_column_line_names: Vec<Vec<String>>,
+    pub grid_row_line_names: Vec<Vec<String>>,
     pub grid_template_areas: Vec<Vec<String>>,
     pub grid_auto_columns: Vec<GridTrackSize>,
     pub grid_auto_rows: Vec<GridTrackSize>,
@@ -1080,6 +1092,7 @@ impl Default for ComputedStyle {
             outline_offset: 0.0,
 
             color: Color::BLACK,
+            color_scheme: ColorScheme::Normal,
             font_family: vec!["sans-serif".to_string()],
             font_size: 16.0,
             font_weight: 400,
@@ -1142,6 +1155,8 @@ impl Default for ComputedStyle {
 
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
+            grid_column_line_names: Vec::new(),
+            grid_row_line_names: Vec::new(),
             grid_template_areas: Vec::new(),
             grid_auto_columns: Vec::new(),
             grid_auto_rows: Vec::new(),
@@ -1167,6 +1182,7 @@ impl ComputedStyle {
     pub fn inherit_from(parent: &ComputedStyle) -> Self {
         let mut s = Self::default();
         s.color = parent.color;
+        s.color_scheme = parent.color_scheme;
         s.border_top_color = parent.color;
         s.border_right_color = parent.color;
         s.border_bottom_color = parent.color;
@@ -1248,6 +1264,7 @@ pub fn is_inherited_property(prop: &str) -> bool {
     matches!(
         prop,
         "color"
+            | "color-scheme"
             | "font-family"
             | "font-size"
             | "font-weight"
@@ -1481,19 +1498,19 @@ button, input, select, textarea {
 }
 button, input[type=button], input[type=submit], input[type=reset] {
     padding: 4px 10px;
-    border: 1px solid #94a3b8;
+    border: 1px solid light-dark(#94a3b8, #475569);
     border-radius: 4px;
-    background-color: #f1f5f9;
-    color: #0f172a;
+    background-color: light-dark(#f1f5f9, #2b3240);
+    color: light-dark(#0f172a, #e2e8f0);
     cursor: pointer;
     text-align: center;
 }
 input, textarea, select {
     padding: 4px 8px;
-    border: 1px solid #b4bcc6;
+    border: 1px solid light-dark(#b4bcc6, #475569);
     border-radius: 4px;
-    background-color: #ffffff;
-    color: #0f172a;
+    background-color: light-dark(#ffffff, #161b22);
+    color: light-dark(#0f172a, #e2e8f0);
 }
 input[type=checkbox i], input[type=radio i] {
     padding: 0;

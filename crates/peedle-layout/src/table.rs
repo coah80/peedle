@@ -42,6 +42,7 @@ pub fn layout_table(
 
     let mut col_preferred = vec![0.0f32; num_cols];
     let mut col_min = vec![0.0f32; num_cols];
+    let mut col_fixed = vec![false; num_cols];
     for (_, cells) in &row_entries {
         let mut col = 0usize;
         for &(cid, colspan) in cells {
@@ -57,6 +58,9 @@ pub fn layout_table(
                     + cs.border_right_width;
                 let min_w = engine.measure_min_word_width(cid, table_w) + pb_h;
                 let pref = if let Some(w) = cs.width.resolve(&cctx) {
+                    if matches!(cs.width, LengthPercentageAuto::Length(_)) {
+                        col_fixed[col] = true;
+                    }
                     (w + pb_h).max(min_w)
                 } else {
                     (engine.measure_intrinsic_width(cid, table_w) + pb_h).max(min_w)
@@ -101,10 +105,34 @@ pub fn layout_table(
                 .collect()
         }
     } else if style.width != LengthPercentageAuto::Auto {
-        col_preferred
+        let extra = avail_w - pref_sum;
+        let flex_sum: f32 = col_preferred
             .iter()
-            .map(|&p| avail_w * (p / pref_sum))
-            .collect()
+            .enumerate()
+            .filter(|(i, _)| !col_fixed[*i])
+            .map(|(_, &p)| p)
+            .sum();
+        let flex_count = col_fixed.iter().filter(|&&f| !f).count();
+        if flex_count > 0 {
+            col_preferred
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| {
+                    if col_fixed[i] {
+                        p
+                    } else if flex_sum > 0.0 {
+                        p + extra * (p / flex_sum)
+                    } else {
+                        p + extra / flex_count as f32
+                    }
+                })
+                .collect()
+        } else {
+            col_preferred
+                .iter()
+                .map(|&p| avail_w * (p / pref_sum))
+                .collect()
+        }
     } else {
         col_preferred
     };
