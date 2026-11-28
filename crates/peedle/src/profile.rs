@@ -31,6 +31,10 @@ pub struct SavedDownload {
     pub timestamp: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BrowserSettings {
     pub dark_mode: bool,
@@ -38,6 +42,10 @@ pub struct BrowserSettings {
     pub restore_session: bool,
     pub bookmarks_visible: bool,
     pub default_zoom: f32,
+    #[serde(default = "default_true")]
+    pub adblock_enabled: bool,
+    #[serde(default)]
+    pub vertical_tabs: bool,
 }
 
 impl Default for BrowserSettings {
@@ -48,6 +56,8 @@ impl Default for BrowserSettings {
             restore_session: true,
             bookmarks_visible: true,
             default_zoom: 1.0,
+            adblock_enabled: true,
+            vertical_tabs: false,
         }
     }
 }

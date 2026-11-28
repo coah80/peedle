@@ -7,6 +7,7 @@ edition.workspace = true
 peedle-html.workspace = true
 peedle-css.workspace = true
 peedle-layout.workspace = true
+peedle-media.workspace = true
 fontdue.workspace = true
 image.workspace = true
 flate2.workspace = true

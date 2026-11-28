@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -180,6 +181,8 @@ pub struct HttpClient {
     pub cookies: Arc<Mutex<CookieJar>>,
     pub user_agent: String,
     pub timeout: Duration,
+    adblock_enabled: Arc<AtomicBool>,
+    blocked_count: Arc<AtomicUsize>,
 }
 
 impl Default for HttpClient {
@@ -221,7 +224,25 @@ impl HttpClient {
             cookies,
             user_agent: default_user_agent().to_string(),
             timeout: Duration::from_secs(18),
+            adblock_enabled: Arc::new(AtomicBool::new(true)),
+            blocked_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn adblock_enabled(&self) -> bool {
+        self.adblock_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_adblock_enabled(&self, enabled: bool) {
+        self.adblock_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn blocked_count(&self) -> usize {
+        self.blocked_count.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_blocked_count(&self) {
+        self.blocked_count.store(0, Ordering::Relaxed);
     }
 
     pub fn clear_cache(&self) {
@@ -306,7 +327,20 @@ impl HttpClient {
                         body: Vec::new(),
                     });
                 }
-                "http" | "https" => {}
+                "http" | "https" => {
+                    if self.adblock_enabled.load(Ordering::Relaxed)
+                        && crate::adblock::should_block_url(&req.url)
+                    {
+                        self.blocked_count.fetch_add(1, Ordering::Relaxed);
+                        return Ok(HttpResponse {
+                            url: req.url,
+                            status: 204,
+                            status_text: "Blocked".to_string(),
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                        });
+                    }
+                }
                 other => return Err(HttpError::UnsupportedScheme(other.to_string())),
             }
 
@@ -393,7 +427,7 @@ impl HttpClient {
         }
         let has_accept = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept"));
         if !has_accept {
-            wire.push_str("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n");
+            wire.push_str("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/png,image/jpeg,*/*;q=0.8\r\n");
         }
         if !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept-language")) {
             wire.push_str("Accept-Language: en-US,en;q=0.9\r\n");
@@ -539,34 +573,30 @@ impl HttpClient {
             Some("gzip") | Some("x-gzip") => {
                 let mut dec = GzDecoder::new(&raw_body[..]);
                 let mut out = Vec::new();
-                dec.read_to_end(&mut out).unwrap_or(0);
-                if out.is_empty() && !raw_body.is_empty() {
-                    raw_body
-                } else {
-                    out
+                match dec.read_to_end(&mut out) {
+                    Ok(_) => out,
+                    Err(_) => raw_body,
                 }
             }
             Some("deflate") => {
                 let mut out = Vec::new();
-                let ok = ZlibDecoder::new(&raw_body[..]).read_to_end(&mut out).is_ok();
-                if !ok {
-                    out.clear();
-                    let _ = DeflateDecoder::new(&raw_body[..]).read_to_end(&mut out);
-                }
-                if out.is_empty() && !raw_body.is_empty() {
-                    raw_body
-                } else {
+                if ZlibDecoder::new(&raw_body[..]).read_to_end(&mut out).is_ok() {
                     out
+                } else {
+                    out.clear();
+                    if DeflateDecoder::new(&raw_body[..]).read_to_end(&mut out).is_ok() {
+                        out
+                    } else {
+                        raw_body
+                    }
                 }
             }
             Some("br") => {
                 let mut dec = BrotliDecoder::new(&raw_body[..], 4096);
                 let mut out = Vec::new();
-                dec.read_to_end(&mut out).unwrap_or(0);
-                if out.is_empty() && !raw_body.is_empty() {
-                    raw_body
-                } else {
-                    out
+                match dec.read_to_end(&mut out) {
+                    Ok(_) => out,
+                    Err(_) => raw_body,
                 }
             }
             _ => raw_body,

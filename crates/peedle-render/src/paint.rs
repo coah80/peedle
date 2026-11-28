@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use peedle_css::{
     BackgroundImage, BorderStyle, CalcContext, Color, ComputedStyle, FontStyle, Overflow, Position,
@@ -6,12 +7,34 @@ use peedle_css::{
 };
 use peedle_html::{Document, NodeId};
 use peedle_layout::{BoxKind, LayoutBoxId, LayoutTree, ReplacedKind};
+use peedle_media::VideoFrame;
 
 use crate::canvas2d::Canvas2D;
 use crate::fonts::{FontFaceKey, FontSystem};
 use crate::framebuffer::{ClipRect, Framebuffer, RgbaColor};
 use crate::images::ImageCache;
 use crate::svg::render_svg_node_with_color;
+
+#[derive(Clone, Debug, Default)]
+pub struct VideoOverlayState {
+    pub frame: Option<Arc<VideoFrame>>,
+    pub poster_url: Option<String>,
+    pub playing: bool,
+    pub loading: bool,
+    pub ended: bool,
+    pub current_time: f64,
+    pub duration: f64,
+    pub buffered_sec: f64,
+    pub volume: f32,
+    pub muted: bool,
+    pub playback_rate: f32,
+    pub controls: bool,
+    pub caption: Option<String>,
+    pub captions_enabled: bool,
+    pub has_captions: bool,
+    pub quality_label: Option<String>,
+    pub fullscreen: bool,
+}
 
 pub fn paint_layout(
     doc: &Document,
@@ -37,6 +60,34 @@ pub fn paint_layout_scaled(
     scroll_y: f32,
     scale: f32,
 ) {
+    let empty_media = HashMap::new();
+    paint_layout_with_media(
+        doc,
+        tree,
+        fb,
+        fonts,
+        images,
+        canvases,
+        &empty_media,
+        scroll_x,
+        scroll_y,
+        scale,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paint_layout_with_media(
+    doc: &Document,
+    tree: &LayoutTree,
+    fb: &mut Framebuffer,
+    fonts: &FontSystem,
+    images: &ImageCache,
+    canvases: &HashMap<NodeId, Canvas2D>,
+    media: &HashMap<NodeId, VideoOverlayState>,
+    scroll_x: f32,
+    scroll_y: f32,
+    scale: f32,
+) {
     let s = scale.max(0.25);
     let bg = doc
         .document_element()
@@ -54,8 +105,34 @@ pub fn paint_layout_scaled(
     fb.clear(to_rgba(bg));
 
     if let Some(root) = tree.root {
-        paint_box(doc, tree, root, fb, fonts, images, canvases, -scroll_x, -scroll_y, s);
+        paint_box(
+            doc,
+            tree,
+            root,
+            fb,
+            fonts,
+            images,
+            canvases,
+            media,
+            -scroll_x,
+            -scroll_y,
+            s,
+        );
     }
+}
+
+pub fn paint_fullscreen_video(
+    fb: &mut Framebuffer,
+    fonts: &FontSystem,
+    images: &ImageCache,
+    state: &VideoOverlayState,
+    scale: f32,
+) {
+    let s = scale.max(0.25);
+    let w = fb.width as f32 / s;
+    let h = fb.height as f32 / s;
+    fb.clear(RgbaColor::BLACK);
+    paint_video_surface(fb, fonts, images, state, 0.0, 0.0, w, h, [0.0; 4], 1.0, s, true);
 }
 
 fn is_inline_only_container(tree: &LayoutTree, id: LayoutBoxId) -> bool {
@@ -103,6 +180,7 @@ fn resolve_radii(style: &ComputedStyle, w: f32, h: f32) -> [f32; 4] {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_box(
     doc: &Document,
     tree: &LayoutTree,
@@ -111,9 +189,62 @@ fn paint_box(
     fonts: &FontSystem,
     images: &ImageCache,
     canvases: &HashMap<NodeId, Canvas2D>,
+    media: &HashMap<NodeId, VideoOverlayState>,
     ox: f32,
     oy: f32,
     s: f32,
+) {
+    paint_box_with_opts(doc, tree, id, fb, fonts, images, canvases, media, ox, oy, s, false);
+}
+
+fn compose_affine(m1: [f32; 6], m2: [f32; 6]) -> [f32; 6] {
+    [
+        m1[0] * m2[0] + m1[2] * m2[1],
+        m1[1] * m2[0] + m1[3] * m2[1],
+        m1[0] * m2[2] + m1[2] * m2[3],
+        m1[1] * m2[2] + m1[3] * m2[3],
+        m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+        m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+    ]
+}
+
+fn collect_subtree_bounds(tree: &LayoutTree, id: LayoutBoxId, out: &mut (f32, f32, f32, f32)) {
+    let b = tree.get(id);
+    if b.style.visibility == Visibility::Hidden || b.style.opacity <= 0.001 || b.style.clip_hidden {
+        return;
+    }
+    let bb = b.dims.border_box();
+    if bb.width > 0.0 || bb.height > 0.0 {
+        out.0 = out.0.min(bb.x);
+        out.1 = out.1.min(bb.y);
+        out.2 = out.2.max(bb.x + bb.width);
+        out.3 = out.3.max(bb.y + bb.height);
+    }
+    for f in &b.text_fragments {
+        out.0 = out.0.min(f.x);
+        out.1 = out.1.min(f.y);
+        out.2 = out.2.max(f.x + f.width);
+        out.3 = out.3.max(f.y + f.height);
+    }
+    for &cid in &b.children {
+        collect_subtree_bounds(tree, cid, out);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_box_with_opts(
+    doc: &Document,
+    tree: &LayoutTree,
+    id: LayoutBoxId,
+    fb: &mut Framebuffer,
+    fonts: &FontSystem,
+    images: &ImageCache,
+    canvases: &HashMap<NodeId, Canvas2D>,
+    media: &HashMap<NodeId, VideoOverlayState>,
+    ox: f32,
+    oy: f32,
+    s: f32,
+    skip_root_transform: bool,
 ) {
     let b = tree.get(id);
     if b.style.visibility == Visibility::Hidden || b.style.opacity <= 0.001 || b.style.clip_hidden {
@@ -154,7 +285,7 @@ fn paint_box(
         }
     }
 
-    if !b.style.transform.is_empty() {
+    if !skip_root_transform && !b.style.transform.is_empty() {
         let ctx_w = CalcContext {
             font_size: b.style.font_size,
             root_font_size: 16.0,
@@ -166,24 +297,95 @@ fn paint_box(
             percentage_base: bb.height,
             ..ctx_w
         };
+        let mut mat = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
         for op in &b.style.transform {
-            match op {
-                TransformOp::Translate(tx, ty) => {
-                    dx += tx.resolve_or(&ctx_w, 0.0);
-                    dy += ty.resolve_or(&ctx_h, 0.0);
+            let m = match op {
+                TransformOp::Translate(tx, ty) => [
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    tx.resolve_or(&ctx_w, 0.0),
+                    ty.resolve_or(&ctx_h, 0.0),
+                ],
+                TransformOp::TranslateX(tx) => [1.0, 0.0, 0.0, 1.0, tx.resolve_or(&ctx_w, 0.0), 0.0],
+                TransformOp::TranslateY(ty) => [1.0, 0.0, 0.0, 1.0, 0.0, ty.resolve_or(&ctx_h, 0.0)],
+                TransformOp::Scale(sx, sy) => [*sx, 0.0, 0.0, *sy, 0.0, 0.0],
+                TransformOp::ScaleX(sx) => [*sx, 0.0, 0.0, 1.0, 0.0, 0.0],
+                TransformOp::ScaleY(sy) => [1.0, 0.0, 0.0, *sy, 0.0, 0.0],
+                TransformOp::Rotate(deg) => {
+                    let rad = deg.to_radians();
+                    let (sn, cs) = rad.sin_cos();
+                    [cs, sn, -sn, cs, 0.0, 0.0]
                 }
-                TransformOp::TranslateX(tx) => {
-                    dx += tx.resolve_or(&ctx_w, 0.0);
-                }
-                TransformOp::TranslateY(ty) => {
-                    dy += ty.resolve_or(&ctx_h, 0.0);
-                }
-                TransformOp::Matrix(_, _, _, _, e, f) => {
-                    dx += *e;
-                    dy += *f;
-                }
-                _ => {}
+                TransformOp::Skew(ax, ay) => [
+                    1.0,
+                    ay.to_radians().tan(),
+                    ax.to_radians().tan(),
+                    1.0,
+                    0.0,
+                    0.0,
+                ],
+                TransformOp::SkewX(ax) => [1.0, 0.0, ax.to_radians().tan(), 1.0, 0.0, 0.0],
+                TransformOp::SkewY(ay) => [1.0, ay.to_radians().tan(), 0.0, 1.0, 0.0, 0.0],
+                TransformOp::Matrix(a, bm, c, d, e, f) => [*a, *bm, *c, *d, *e, *f],
+            };
+            mat = compose_affine(mat, m);
+        }
+        let is_pure_translate = (mat[0] - 1.0).abs() < 1e-4
+            && mat[1].abs() < 1e-4
+            && mat[2].abs() < 1e-4
+            && (mat[3] - 1.0).abs() < 1e-4;
+        if is_pure_translate {
+            dx += mat[4];
+            dy += mat[5];
+        } else {
+            let mut bnds = (bb.x, bb.y, bb.x + bb.width, bb.y + bb.height);
+            collect_subtree_bounds(tree, id, &mut bnds);
+            let pad = 6.0f32;
+            let src_x = bnds.0 - pad;
+            let src_y = bnds.1 - pad;
+            let src_w = ((bnds.2 - bnds.0) + pad * 2.0).max(1.0);
+            let src_h = ((bnds.3 - bnds.1) + pad * 2.0).max(1.0);
+            let pw = (src_w * s).ceil() as u32;
+            let ph = (src_h * s).ceil() as u32;
+            if pw > 0 && ph > 0 && pw <= 1600 && ph <= 1600 {
+                let mut off = Framebuffer::new(pw, ph);
+                paint_box_with_opts(
+                    doc,
+                    tree,
+                    id,
+                    &mut off,
+                    fonts,
+                    images,
+                    canvases,
+                    media,
+                    -src_x,
+                    -src_y,
+                    s,
+                    true,
+                );
+                let orig_x = b.style.transform_origin_x.resolve_or(&ctx_w, bb.width * 0.5);
+                let orig_y = b.style.transform_origin_y.resolve_or(&ctx_h, bb.height * 0.5);
+                let pivot_src_x = (bb.x + orig_x - src_x) * s;
+                let pivot_src_y = (bb.y + orig_y - src_y) * s;
+                let pivot_dst_x = (bb.x + dx + orig_x + mat[4]) * s;
+                let pivot_dst_y = (bb.y + dy + orig_y + mat[5]) * s;
+                fb.blit_rgba_affine(
+                    off.width,
+                    off.height,
+                    &off.data,
+                    pivot_src_x,
+                    pivot_src_y,
+                    pivot_dst_x,
+                    pivot_dst_y,
+                    [mat[0], mat[1], mat[2], mat[3]],
+                    1.0,
+                );
+                return;
             }
+            dx += mat[4];
+            dy += mat[5];
         }
     }
 
@@ -614,6 +816,7 @@ fn paint_box(
                     fonts,
                     images,
                     canvases,
+                    media,
                     cx,
                     cy,
                     cw,
@@ -690,6 +893,7 @@ fn paint_box(
             fonts,
             images,
             canvases,
+            media,
             dx - scroll_dx,
             dy - scroll_dy,
             s,
@@ -704,6 +908,7 @@ fn paint_box(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_replaced(
     doc: &Document,
     node: Option<NodeId>,
@@ -713,6 +918,7 @@ fn paint_replaced(
     fonts: &FontSystem,
     images: &ImageCache,
     canvases: &HashMap<NodeId, Canvas2D>,
+    media: &HashMap<NodeId, VideoOverlayState>,
     x: f32,
     y: f32,
     w: f32,
@@ -745,8 +951,8 @@ fn paint_replaced(
                     peedle_css::ObjectFit::None => (iw, ih),
                     peedle_css::ObjectFit::Fill => (w, h),
                 };
-                let dx = x + (w - dw) * 0.5;
-                let dy = y + (h - dh) * 0.5;
+                let dx = x + (w - dw) * style.object_position_x;
+                let dy = y + (h - dh) * style.object_position_y;
                 if radii.iter().any(|&r| r > 0.01) || (dw - w).abs() > 0.5 || (dh - h).abs() > 0.5 {
                     fb.blit_rgba_rounded(
                         img.width,
@@ -805,6 +1011,53 @@ fn paint_replaced(
                     h * s,
                     to_rgba(style.color).with_alpha(alpha),
                 );
+            }
+        }
+        ReplacedKind::Video {
+            poster, controls, ..
+        } => {
+            let radii = resolve_radii(style, w, h);
+            let default_state = VideoOverlayState {
+                poster_url: if poster.is_empty() {
+                    None
+                } else {
+                    Some(poster.clone())
+                },
+                controls: *controls,
+                volume: 1.0,
+                playback_rate: 1.0,
+                ..Default::default()
+            };
+            let st = node
+                .and_then(|nid| media.get(&nid))
+                .unwrap_or(&default_state);
+            paint_video_surface(
+                fb,
+                fonts,
+                images,
+                st,
+                x,
+                y,
+                w,
+                h,
+                radii,
+                alpha,
+                s,
+                *controls || st.controls,
+            );
+        }
+        ReplacedKind::Audio { controls, .. } => {
+            if *controls {
+                let default_state = VideoOverlayState {
+                    controls: true,
+                    volume: 1.0,
+                    playback_rate: 1.0,
+                    ..Default::default()
+                };
+                let st = node
+                    .and_then(|nid| media.get(&nid))
+                    .unwrap_or(&default_state);
+                paint_audio_bar(fb, fonts, st, x, y, w, h, alpha, s);
             }
         }
         ReplacedKind::Input {
@@ -1012,4 +1265,480 @@ fn normalize_stops(stops: &[peedle_css::GradientStop], alpha: f32) -> Vec<(RgbaC
             (to_rgba(s.color).with_alpha(alpha), pos)
         })
         .collect()
+}
+
+fn format_media_time(secs: f64) -> String {
+    let total = secs.max(0.0).floor() as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{}:{:02}", m, s)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_video_surface(
+    fb: &mut Framebuffer,
+    fonts: &FontSystem,
+    images: &ImageCache,
+    st: &VideoOverlayState,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    radii: [f32; 4],
+    alpha: f32,
+    s: f32,
+    show_controls: bool,
+) {
+    let sradii = scale_arr4(radii, s);
+    let has_radius = sradii.iter().any(|&r| r > 0.5);
+    fb.fill_rounded_rect(
+        x * s,
+        y * s,
+        w * s,
+        h * s,
+        sradii,
+        RgbaColor::new(0, 0, 0, 255).with_alpha(alpha),
+    );
+    fb.push_clip(ClipRect {
+        x: (x * s).floor() as i32,
+        y: (y * s).floor() as i32,
+        w: (w * s).ceil() as i32,
+        h: (h * s).ceil() as i32,
+    });
+    if has_radius {
+        fb.push_rounded_clip(x * s, y * s, w * s, h * s, sradii);
+    }
+
+    if let Some(ref frame) = st.frame {
+        let iw = frame.width.max(1) as f32;
+        let ih = frame.height.max(1) as f32;
+        let sc = (w / iw).min(h / ih);
+        let dw = iw * sc;
+        let dh = ih * sc;
+        let dx = x + (w - dw) * 0.5;
+        let dy = y + (h - dh) * 0.5;
+        fb.blit_rgba(
+            frame.width,
+            frame.height,
+            &frame.rgba,
+            dx * s,
+            dy * s,
+            dw * s,
+            dh * s,
+            alpha,
+        );
+    } else if let Some(ref poster_u) = st.poster_url {
+        if let Some(img) = images.get(poster_u) {
+            let iw = img.width.max(1) as f32;
+            let ih = img.height.max(1) as f32;
+            let sc = (w / iw).min(h / ih);
+            let dw = iw * sc;
+            let dh = ih * sc;
+            let dx = x + (w - dw) * 0.5;
+            let dy = y + (h - dh) * 0.5;
+            fb.blit_rgba(
+                img.width,
+                img.height,
+                &img.rgba,
+                dx * s,
+                dy * s,
+                dw * s,
+                dh * s,
+                alpha,
+            );
+        }
+    }
+
+    if st.captions_enabled {
+        if let Some(ref cap) = st.caption {
+            let trimmed = cap.trim();
+            if !trimmed.is_empty() {
+                let cap_px = (15.0 * (w / 720.0).clamp(0.85, 1.35)) * s;
+                let tw = fonts.measure_text(trimmed, FontFaceKey::SansRegular, cap_px);
+                let pad_x = 12.0 * s;
+                let pad_y = 6.0 * s;
+                let box_w = (tw + pad_x * 2.0).min((w - 24.0) * s);
+                let box_h = cap_px + pad_y * 2.0;
+                let bx = (x + w * 0.5) * s - box_w * 0.5;
+                let by = (y + h - 62.0) * s - box_h;
+                fb.fill_rounded_rect(
+                    bx,
+                    by,
+                    box_w,
+                    box_h,
+                    [4.0 * s; 4],
+                    RgbaColor::new(8, 8, 8, 205),
+                );
+                let asc = fonts.line_ascent(FontFaceKey::SansRegular, cap_px);
+                fonts.draw_text(
+                    fb,
+                    trimmed,
+                    bx + pad_x,
+                    by + pad_y + asc,
+                    FontFaceKey::SansRegular,
+                    cap_px,
+                    RgbaColor::WHITE,
+                );
+            }
+        }
+    }
+
+    if !st.playing && !st.loading && w >= 120.0 && h >= 90.0 {
+        let cx = (x + w * 0.5) * s;
+        let cy = (y + h * 0.5) * s;
+        let pw = 68.0 * s;
+        let ph = 48.0 * s;
+        fb.fill_rounded_rect(
+            cx - pw * 0.5,
+            cy - ph * 0.5,
+            pw,
+            ph,
+            [12.0 * s; 4],
+            RgbaColor::new(15, 15, 15, 205),
+        );
+        let tri = vec![
+            (cx - 8.0 * s, cy - 11.0 * s),
+            (cx + 12.0 * s, cy),
+            (cx - 8.0 * s, cy + 11.0 * s),
+        ];
+        fb.fill_polygon(&[tri], RgbaColor::WHITE, false);
+    } else if st.loading && st.frame.is_none() && w >= 120.0 && h >= 90.0 {
+        let cx = (x + w * 0.5) * s;
+        let cy = (y + h * 0.5) * s;
+        fb.draw_circle_stroke(cx, cy, 18.0 * s, 3.0 * s, RgbaColor::new(255, 255, 255, 175));
+    }
+
+    if show_controls && h >= 80.0 && w >= 160.0 {
+        let scrim_h = 84.0f32.min(h * 0.45);
+        fb.fill_linear_gradient(
+            x * s,
+            (y + h - scrim_h) * s,
+            w * s,
+            scrim_h * s,
+            [0.0; 4],
+            180.0,
+            &[
+                (RgbaColor::new(0, 0, 0, 0), 0.0),
+                (RgbaColor::new(0, 0, 0, 210), 1.0),
+            ],
+            false,
+        );
+
+        let track_x = x + 12.0;
+        let track_w = (w - 24.0).max(20.0);
+        let track_y = y + h - 46.0;
+        let track_h = 4.0;
+        fb.fill_rounded_rect(
+            track_x * s,
+            track_y * s,
+            track_w * s,
+            track_h * s,
+            [2.0 * s; 4],
+            RgbaColor::new(255, 255, 255, 75),
+        );
+        let dur = st.duration.max(0.001);
+        let buf_frac = (st.buffered_sec / dur).clamp(0.0, 1.0) as f32;
+        if buf_frac > 0.0 {
+            fb.fill_rounded_rect(
+                track_x * s,
+                track_y * s,
+                (track_w * buf_frac) * s,
+                track_h * s,
+                [2.0 * s; 4],
+                RgbaColor::new(255, 255, 255, 120),
+            );
+        }
+        let play_frac = if st.duration > 0.0 {
+            (st.current_time / dur).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        let fill_w = track_w * play_frac;
+        if fill_w > 0.5 {
+            fb.fill_rounded_rect(
+                track_x * s,
+                track_y * s,
+                fill_w * s,
+                track_h * s,
+                [2.0 * s; 4],
+                RgbaColor::new(255, 0, 51, 255),
+            );
+        }
+        fb.draw_circle_fill(
+            (track_x + fill_w) * s,
+            (track_y + track_h * 0.5) * s,
+            6.0 * s,
+            RgbaColor::new(255, 0, 51, 255),
+        );
+
+        let cy = (y + h - 21.0) * s;
+        let px = (x + 24.0) * s;
+        if st.playing {
+            fb.fill_rounded_rect(
+                px - 6.0 * s,
+                cy - 7.0 * s,
+                4.0 * s,
+                14.0 * s,
+                [1.0 * s; 4],
+                RgbaColor::WHITE,
+            );
+            fb.fill_rounded_rect(
+                px + 2.0 * s,
+                cy - 7.0 * s,
+                4.0 * s,
+                14.0 * s,
+                [1.0 * s; 4],
+                RgbaColor::WHITE,
+            );
+        } else {
+            let tri = vec![
+                (px - 5.0 * s, cy - 7.5 * s),
+                (px + 8.0 * s, cy),
+                (px - 5.0 * s, cy + 7.5 * s),
+            ];
+            fb.fill_polygon(&[tri], RgbaColor::WHITE, false);
+        }
+
+        let vx = (x + 56.0) * s;
+        let spk = vec![
+            (vx - 6.0 * s, cy - 3.5 * s),
+            (vx - 2.0 * s, cy - 3.5 * s),
+            (vx + 3.0 * s, cy - 7.5 * s),
+            (vx + 3.0 * s, cy + 7.5 * s),
+            (vx - 2.0 * s, cy + 3.5 * s),
+            (vx - 6.0 * s, cy + 3.5 * s),
+        ];
+        fb.fill_polygon(&[spk], RgbaColor::WHITE, false);
+        if st.muted || st.volume <= 0.01 {
+            fb.draw_line_aa(
+                vx + 6.0 * s,
+                cy - 4.0 * s,
+                vx + 12.0 * s,
+                cy + 4.0 * s,
+                1.6 * s,
+                RgbaColor::new(255, 90, 90, 255),
+            );
+            fb.draw_line_aa(
+                vx + 12.0 * s,
+                cy - 4.0 * s,
+                vx + 6.0 * s,
+                cy + 4.0 * s,
+                1.6 * s,
+                RgbaColor::new(255, 90, 90, 255),
+            );
+        } else {
+            fb.draw_line_aa(
+                vx + 6.5 * s,
+                cy - 3.5 * s,
+                vx + 8.0 * s,
+                cy,
+                1.5 * s,
+                RgbaColor::WHITE,
+            );
+            fb.draw_line_aa(
+                vx + 8.0 * s,
+                cy,
+                vx + 6.5 * s,
+                cy + 3.5 * s,
+                1.5 * s,
+                RgbaColor::WHITE,
+            );
+        }
+
+        let mut time_x = x + 84.0;
+        if w >= 360.0 {
+            let vol_x = x + 78.0;
+            let vol_w = 56.0;
+            let vol_y = y + h - 22.5;
+            fb.fill_rounded_rect(
+                vol_x * s,
+                vol_y * s,
+                vol_w * s,
+                3.0 * s,
+                [1.5 * s; 4],
+                RgbaColor::new(255, 255, 255, 90),
+            );
+            let eff_v = if st.muted { 0.0 } else { st.volume.clamp(0.0, 1.0) };
+            fb.fill_rounded_rect(
+                vol_x * s,
+                vol_y * s,
+                (vol_w * eff_v) * s,
+                3.0 * s,
+                [1.5 * s; 4],
+                RgbaColor::WHITE,
+            );
+            fb.draw_circle_fill(
+                (vol_x + vol_w * eff_v) * s,
+                (vol_y + 1.5) * s,
+                4.5 * s,
+                RgbaColor::WHITE,
+            );
+            time_x = x + 146.0;
+        }
+
+        let label = format!(
+            "{} / {}",
+            format_media_time(st.current_time),
+            format_media_time(st.duration)
+        );
+        let t_px = 12.5 * s;
+        let asc = fonts.line_ascent(FontFaceKey::SansRegular, t_px);
+        fonts.draw_text(
+            fb,
+            &label,
+            time_x * s,
+            cy - t_px * 0.5 + asc,
+            FontFaceKey::SansRegular,
+            t_px,
+            RgbaColor::new(240, 240, 240, 255),
+        );
+
+        let fs_cx = (x + w - 26.0) * s;
+        let d = 6.0 * s;
+        let arm = 3.5 * s;
+        let stroke = 1.6 * s;
+        fb.draw_line_aa(fs_cx - d, cy - d, fs_cx - d + arm, cy - d, stroke, RgbaColor::WHITE);
+        fb.draw_line_aa(fs_cx - d, cy - d, fs_cx - d, cy - d + arm, stroke, RgbaColor::WHITE);
+        fb.draw_line_aa(fs_cx + d, cy - d, fs_cx + d - arm, cy - d, stroke, RgbaColor::WHITE);
+        fb.draw_line_aa(fs_cx + d, cy - d, fs_cx + d, cy - d + arm, stroke, RgbaColor::WHITE);
+        fb.draw_line_aa(fs_cx - d, cy + d, fs_cx - d + arm, cy + d, stroke, RgbaColor::WHITE);
+        fb.draw_line_aa(fs_cx - d, cy + d, fs_cx - d, cy + d - arm, stroke, RgbaColor::WHITE);
+        fb.draw_line_aa(fs_cx + d, cy + d, fs_cx + d - arm, cy + d, stroke, RgbaColor::WHITE);
+        fb.draw_line_aa(fs_cx + d, cy + d, fs_cx + d, cy + d - arm, stroke, RgbaColor::WHITE);
+
+        if let Some(ref ql) = st.quality_label {
+            let qx = (x + w - 92.0) * s;
+            let qy = cy - 10.0 * s;
+            fb.fill_rounded_rect(
+                qx,
+                qy,
+                44.0 * s,
+                20.0 * s,
+                [4.0 * s; 4],
+                RgbaColor::new(255, 255, 255, 36),
+            );
+            let q_px = 11.0 * s;
+            let qtw = fonts.measure_text(ql, FontFaceKey::SansBold, q_px);
+            let qasc = fonts.line_ascent(FontFaceKey::SansBold, q_px);
+            fonts.draw_text(
+                fb,
+                ql,
+                qx + (44.0 * s - qtw) * 0.5,
+                qy + (20.0 * s - q_px) * 0.5 + qasc,
+                FontFaceKey::SansBold,
+                q_px,
+                RgbaColor::WHITE,
+            );
+        }
+
+        if st.has_captions && w >= 300.0 {
+            let cc_x = (x + w - 130.0) * s;
+            let cc_y = cy - 10.0 * s;
+            let bg_c = if st.captions_enabled {
+                RgbaColor::new(255, 0, 51, 210)
+            } else {
+                RgbaColor::new(255, 255, 255, 36)
+            };
+            fb.fill_rounded_rect(cc_x, cc_y, 30.0 * s, 20.0 * s, [4.0 * s; 4], bg_c);
+            let cc_px = 11.0 * s;
+            let ctw = fonts.measure_text("CC", FontFaceKey::SansBold, cc_px);
+            let casc = fonts.line_ascent(FontFaceKey::SansBold, cc_px);
+            fonts.draw_text(
+                fb,
+                "CC",
+                cc_x + (30.0 * s - ctw) * 0.5,
+                cc_y + (20.0 * s - cc_px) * 0.5 + casc,
+                FontFaceKey::SansBold,
+                cc_px,
+                RgbaColor::WHITE,
+            );
+        }
+    }
+
+    if has_radius {
+        fb.pop_rounded_clip();
+    }
+    fb.pop_clip();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_audio_bar(
+    fb: &mut Framebuffer,
+    fonts: &FontSystem,
+    st: &VideoOverlayState,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    alpha: f32,
+    s: f32,
+) {
+    let r = (h * 0.5).min(22.0) * s;
+    fb.fill_rounded_rect(
+        x * s,
+        y * s,
+        w * s,
+        h * s,
+        [r; 4],
+        RgbaColor::new(28, 31, 38, 255).with_alpha(alpha),
+    );
+    let cy = (y + h * 0.5) * s;
+    let px = (x + 20.0) * s;
+    if st.playing {
+        fb.fill_rect(px - 4.0 * s, cy - 6.0 * s, 3.0 * s, 12.0 * s, RgbaColor::WHITE);
+        fb.fill_rect(px + 2.0 * s, cy - 6.0 * s, 3.0 * s, 12.0 * s, RgbaColor::WHITE);
+    } else {
+        let tri = vec![
+            (px - 4.0 * s, cy - 6.0 * s),
+            (px + 6.0 * s, cy),
+            (px - 4.0 * s, cy + 6.0 * s),
+        ];
+        fb.fill_polygon(&[tri], RgbaColor::WHITE, false);
+    }
+    let label = format!(
+        "{} / {}",
+        format_media_time(st.current_time),
+        format_media_time(st.duration)
+    );
+    let t_px = 11.5 * s;
+    let asc = fonts.line_ascent(FontFaceKey::SansRegular, t_px);
+    fonts.draw_text(
+        fb,
+        &label,
+        (x + 36.0) * s,
+        cy - t_px * 0.5 + asc,
+        FontFaceKey::SansRegular,
+        t_px,
+        RgbaColor::new(230, 235, 240, 255),
+    );
+    let bar_x = x + 112.0;
+    let bar_w = (w - 130.0).max(20.0);
+    if bar_w > 20.0 {
+        fb.fill_rounded_rect(
+            bar_x * s,
+            (y + h * 0.5 - 2.0) * s,
+            bar_w * s,
+            4.0 * s,
+            [2.0 * s; 4],
+            RgbaColor::new(255, 255, 255, 65),
+        );
+        let frac = if st.duration > 0.0 {
+            (st.current_time / st.duration).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        fb.fill_rounded_rect(
+            bar_x * s,
+            (y + h * 0.5 - 2.0) * s,
+            (bar_w * frac) * s,
+            4.0 * s,
+            [2.0 * s; 4],
+            RgbaColor::new(96, 165, 250, 255),
+        );
+    }
 }

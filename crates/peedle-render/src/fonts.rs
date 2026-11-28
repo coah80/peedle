@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use fontdue::{Font, FontSettings, Metrics};
+use peedle_layout::{extract_gsub_ligatures, FontLigatures, ShapedGlyph};
 
 use crate::framebuffer::{Framebuffer, RgbaColor};
 
@@ -25,6 +26,7 @@ pub enum FontFaceKey {
 pub struct FontSystem {
     faces: HashMap<FontFaceKey, Arc<Font>>,
     custom_names: Vec<(String, u16, bool, FontFaceKey)>,
+    ligatures: HashMap<FontFaceKey, Arc<FontLigatures>>,
     fallback_keys: Vec<FontFaceKey>,
     glyph_cache: Arc<Mutex<HashMap<(FontFaceKey, char, u32), (Metrics, Vec<u8>)>>>,
 }
@@ -41,6 +43,7 @@ impl FontSystem {
         Self {
             faces: base.faces.clone(),
             custom_names: Vec::new(),
+            ligatures: HashMap::new(),
             fallback_keys: base.fallback_keys.clone(),
             glyph_cache: Arc::clone(&base.glyph_cache),
         }
@@ -176,6 +179,7 @@ impl FontSystem {
         Self {
             faces,
             custom_names: Vec::new(),
+            ligatures: HashMap::new(),
             fallback_keys,
             glyph_cache: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -201,6 +205,17 @@ impl FontSystem {
         italic: bool,
         bytes: &[u8],
     ) -> Option<Arc<Font>> {
+        self.register_web_font_styled_ex(family, weight, italic, bytes)
+            .map(|(f, _)| f)
+    }
+
+    pub fn register_web_font_styled_ex(
+        &mut self,
+        family: &str,
+        weight: u16,
+        italic: bool,
+        bytes: &[u8],
+    ) -> Option<(Arc<Font>, Option<Arc<FontLigatures>>)> {
         let norm = family.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
         if norm.is_empty() {
             return None;
@@ -208,11 +223,15 @@ impl FontSystem {
         let decoded = decode_web_font(bytes);
         let font_bytes = decoded.as_deref().unwrap_or(bytes);
         if let Ok(font) = Font::from_bytes(font_bytes, FontSettings::default()) {
+            let ligs = extract_gsub_ligatures(font_bytes);
             let arc = Arc::new(font);
             let key = FontFaceKey::Custom(self.custom_names.len());
             self.faces.insert(key, Arc::clone(&arc));
+            if let Some(ref l) = ligs {
+                self.ligatures.insert(key, Arc::clone(l));
+            }
             self.custom_names.push((norm, weight, italic, key));
-            return Some(arc);
+            return Some((arc, ligs));
         }
         None
     }
@@ -340,8 +359,24 @@ impl FontSystem {
     }
 
     pub fn measure_text(&self, text: &str, key: FontFaceKey, px: f32) -> f32 {
-        if self.font(key).is_none() {
+        let Some(primary) = self.font(key) else {
             return text.chars().count() as f32 * px * 0.55;
+        };
+        if let Some(ligs) = self.ligatures.get(&key) {
+            let mut width = 0.0f32;
+            for sg in ligs.apply(primary, text) {
+                match sg {
+                    ShapedGlyph::GlyphId(gid) => {
+                        width += primary.metrics_indexed(gid, px).advance_width;
+                    }
+                    ShapedGlyph::Char(c) => {
+                        if let Some((_, f)) = self.resolve_glyph_font(key, c) {
+                            width += f.metrics(c, px).advance_width;
+                        }
+                    }
+                }
+            }
+            return width;
         }
         let mut width = 0.0f32;
         for c in text.chars() {
@@ -371,12 +406,50 @@ impl FontSystem {
         px: f32,
         color: RgbaColor,
     ) -> f32 {
-        if self.font(key).is_none() {
+        let Some(primary) = self.font(key) else {
             return x;
-        }
+        };
         let px_key = (px.max(4.0) * 4.0).round() as u32;
         let actual_px = px_key as f32 / 4.0;
         let mut pen_x = x;
+
+        if let Some(ligs) = self.ligatures.get(&key) {
+            for sg in ligs.apply(primary, text) {
+                match sg {
+                    ShapedGlyph::GlyphId(gid) => {
+                        let (metrics, bitmap) = primary.rasterize_indexed(gid, actual_px);
+                        if metrics.width > 0 && metrics.height > 0 {
+                            let gx = (pen_x + metrics.xmin as f32).round() as i32;
+                            let gy = (baseline_y - metrics.ymin as f32 - metrics.height as f32).round() as i32;
+                            fb.blit_alpha_mask(gx, gy, metrics.width, metrics.height, &bitmap, color);
+                        }
+                        pen_x += metrics.advance_width;
+                    }
+                    ShapedGlyph::Char(c) => {
+                        let Some((use_key, use_font)) = self.resolve_glyph_font(key, c) else {
+                            continue;
+                        };
+                        let (metrics, bitmap) = {
+                            let mut cache = self.glyph_cache.lock().unwrap();
+                            if let Some(hit) = cache.get(&(use_key, c, px_key)) {
+                                hit.clone()
+                            } else {
+                                let entry = use_font.rasterize(c, actual_px);
+                                cache.insert((use_key, c, px_key), entry.clone());
+                                entry
+                            }
+                        };
+                        if metrics.width > 0 && metrics.height > 0 {
+                            let gx = (pen_x + metrics.xmin as f32).round() as i32;
+                            let gy = (baseline_y - metrics.ymin as f32 - metrics.height as f32).round() as i32;
+                            fb.blit_alpha_mask(gx, gy, metrics.width, metrics.height, &bitmap, color);
+                        }
+                        pen_x += metrics.advance_width;
+                    }
+                }
+            }
+            return pen_x;
+        }
 
         for c in text.chars() {
             let Some((use_key, use_font)) = self.resolve_glyph_font(key, c) else {

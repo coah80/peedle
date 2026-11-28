@@ -979,6 +979,8 @@ pub struct ComputedStyle {
     pub filter: Vec<FilterOp>,
     pub backdrop_filter: Vec<FilterOp>,
     pub object_fit: ObjectFit,
+    pub object_position_x: f32,
+    pub object_position_y: f32,
 
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
@@ -1120,6 +1122,8 @@ impl Default for ComputedStyle {
             filter: Vec::new(),
             backdrop_filter: Vec::new(),
             object_fit: ObjectFit::Fill,
+            object_position_x: 0.5,
+            object_position_y: 0.5,
 
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::Nowrap,

@@ -5,14 +5,19 @@ use std::time::Instant;
 use peedle_css::{parse_stylesheet, LayerBlockRule, Rule, Stylesheet, Viewport};
 use peedle_dom::{BrowserJsEnv, SharedOriginStorage};
 use peedle_html::{parse_html, Document, NodeId};
+use peedle_media::MediaPlayer;
 use peedle_net::HttpClient;
 use peedle_render::{
-    paint_layout, paint_layout_scaled, DecodedImage, FontSystem, Framebuffer, ImageCache, RgbaColor,
+    paint_fullscreen_video, paint_layout_with_media, DecodedImage, FontSystem, Framebuffer,
+    ImageCache, RgbaColor, VideoOverlayState,
 };
 use peedle_url::Url;
 
 use crate::internal_pages::{
     render_history_html_themed, render_internal_page_themed, render_view_source_html,
+};
+use crate::youtube::{
+    build_youtube_html, parse_timedtext_xml, CaptionCue, MediaQualityOption,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +177,87 @@ pub fn fetch_navigation_background(
     }
 
     let start = Instant::now();
+    if let Ok(parsed_target) = Url::parse(&target) {
+        if let Some(yt_html) = build_youtube_html(client, &parsed_target, dark_mode) {
+            let final_url = parsed_target.href();
+            let base_url = Some(parsed_target.clone());
+            let doc = parse_html(&yt_html);
+            let mut img_urls: Vec<(String, String)> = Vec::new();
+            let mut seen_imgs: HashSet<String> = HashSet::new();
+            for nid in doc.descendants(doc.root) {
+                let Some(el) = doc.element(nid) else {
+                    continue;
+                };
+                if !el.is_html() {
+                    continue;
+                }
+                if el.tag_is("img") {
+                    if let Some(raw_src) = extract_img_source(&doc, nid, el) {
+                        if seen_imgs.insert(raw_src.clone()) {
+                            if let Some(resolved) = resolve_url_against(&base_url, &raw_src) {
+                                img_urls.push((raw_src, resolved));
+                            }
+                        }
+                    }
+                } else if el.tag_is("video") {
+                    if let Some(poster) = el.get_attr("poster").filter(|s| !s.trim().is_empty()) {
+                        if seen_imgs.insert(poster.to_string()) {
+                            if let Some(resolved) = resolve_url_against(&base_url, poster) {
+                                img_urls.push((poster.to_string(), resolved));
+                            }
+                        }
+                    }
+                }
+            }
+            let img_queue = Mutex::new(VecDeque::from(img_urls.into_iter().take(48).collect::<Vec<_>>()));
+            let decoded_out = Mutex::new(Vec::new());
+            let fav_out: Mutex<Option<DecodedImage>> = Mutex::new(None);
+            std::thread::scope(|s| {
+                for _ in 0..6 {
+                    s.spawn(|| loop {
+                        let item = img_queue.lock().unwrap().pop_front();
+                        let Some((raw_src, resolved)) = item else {
+                            break;
+                        };
+                        if let Ok(r) = client.get_cached(&resolved) {
+                            if r.status < 400 {
+                                if let Ok(dec) = DecodedImage::decode(&r.body) {
+                                    decoded_out.lock().unwrap().push((raw_src, dec));
+                                }
+                            }
+                        }
+                    });
+                }
+                s.spawn(|| {
+                    if let Ok(r) = client.get_cached("https://www.youtube.com/favicon.ico") {
+                        if r.status < 400 {
+                            if let Ok(dec) = DecodedImage::decode(&r.body) {
+                                *fav_out.lock().unwrap() = Some(dec);
+                            }
+                        }
+                    }
+                });
+            });
+            let elapsed = start.elapsed().as_millis() as u64;
+            return PreparedNavigation::Html {
+                final_url: final_url.clone(),
+                base_url,
+                html: yt_html.clone(),
+                raw_source: yt_html,
+                fragment: parsed_target.fragment.clone().filter(|f| !f.is_empty()),
+                network_log: vec![NetworkEntry {
+                    method: "GET".to_string(),
+                    url: final_url,
+                    status: 200,
+                    content_type: "text/html; charset=utf-8".to_string(),
+                    bytes: 0,
+                    duration_ms: elapsed,
+                }],
+                predecoded_images: decoded_out.into_inner().unwrap(),
+                favicon: fav_out.into_inner().unwrap(),
+            };
+        }
+    }
     let resp = match client.get(&target) {
         Ok(r) => r,
         Err(e) => {
@@ -224,6 +310,20 @@ pub fn fetch_navigation_background(
         let h = format!(
             "<!DOCTYPE html><html><body style=\"margin:0;background:#111;display:flex;justify-content:center;align-items:center;min-height:100vh;\"><img src=\"{}\"></body></html>",
             escape_text(&final_url)
+        );
+        (h.clone(), h)
+    } else if ct.starts_with("video/") {
+        let h = format!(
+            "<!DOCTYPE html><html><head><title>{t}</title></head><body style=\"margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh;\"><video controls autoplay style=\"max-width:100%;max-height:100%;width:960px;height:540px;\" src=\"{u}\"></video></body></html>",
+            t = escape_text(&final_url),
+            u = escape_text(&final_url),
+        );
+        (h.clone(), h)
+    } else if ct.starts_with("audio/") {
+        let h = format!(
+            "<!DOCTYPE html><html><head><title>{t}</title></head><body style=\"margin:0;background:#0f1117;display:flex;justify-content:center;align-items:center;height:100vh;\"><audio controls autoplay style=\"width:420px;\" src=\"{u}\"></audio></body></html>",
+            t = escape_text(&final_url),
+            u = escape_text(&final_url),
         );
         (h.clone(), h)
     } else if ct.contains("text/plain") || ct.contains("application/json") {
@@ -384,6 +484,11 @@ pub struct Page {
     pub scripts_enabled: bool,
     pub selection_start: Option<(f32, f32)>,
     pub selection_end: Option<(f32, f32)>,
+    pub media_players: HashMap<NodeId, MediaPlayer>,
+    pub media_qualities: HashMap<NodeId, (usize, Vec<MediaQualityOption>)>,
+    pub media_captions: HashMap<NodeId, (bool, Vec<CaptionCue>)>,
+    pub fullscreen_video: Option<NodeId>,
+    pub tab_muted: bool,
 }
 
 impl Page {
@@ -440,6 +545,11 @@ impl Page {
             scripts_enabled: true,
             selection_start: None,
             selection_end: None,
+            media_players: HashMap::new(),
+            media_qualities: HashMap::new(),
+            media_captions: HashMap::new(),
+            fullscreen_video: None,
+            tab_muted: false,
         };
         let _ = page.navigate("peedle://newtab");
         page
@@ -670,6 +780,28 @@ impl Page {
         }
 
         let start = Instant::now();
+        if let Ok(parsed_target) = Url::parse(target) {
+            if let Some(yt_html) = build_youtube_html(&self.client, &parsed_target, self.dark_mode) {
+                let elapsed = start.elapsed().as_millis() as u64;
+                let final_url = parsed_target.href();
+                self.network_log.push(NetworkEntry {
+                    method: "GET".to_string(),
+                    url: final_url.clone(),
+                    status: 200,
+                    content_type: "text/html; charset=utf-8".to_string(),
+                    bytes: yt_html.len(),
+                    duration_ms: elapsed,
+                });
+                self.url = final_url.clone();
+                self.base_url = Some(parsed_target);
+                self.source_html = yt_html.clone();
+                self.load_html_string(&yt_html, &final_url);
+                if push_history {
+                    self.push_history_entry();
+                }
+                return Ok(());
+            }
+        }
         let resp = match self.client.get(target) {
             Ok(r) => r,
             Err(e) => {
@@ -709,6 +841,22 @@ impl Page {
                 "<!DOCTYPE html><html><body style=\"margin:0;background:#111;display:flex;justify-content:center;align-items:center;min-height:100vh;\"><img src=\"{}\"></body></html>",
                 escape_text(&final_url)
             )
+        } else if ct.starts_with("video/") {
+            let h = format!(
+                "<!DOCTYPE html><html><head><title>{t}</title></head><body style=\"margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh;\"><video controls autoplay style=\"max-width:100%;max-height:100%;width:960px;height:540px;\" src=\"{u}\"></video></body></html>",
+                t = escape_text(&final_url),
+                u = escape_text(&final_url),
+            );
+            self.source_html = h.clone();
+            h
+        } else if ct.starts_with("audio/") {
+            let h = format!(
+                "<!DOCTYPE html><html><head><title>{t}</title></head><body style=\"margin:0;background:#0f1117;display:flex;justify-content:center;align-items:center;height:100vh;\"><audio controls autoplay style=\"width:420px;\" src=\"{u}\"></audio></body></html>",
+                t = escape_text(&final_url),
+                u = escape_text(&final_url),
+            );
+            self.source_html = h.clone();
+            h
         } else if ct.contains("text/plain") || ct.contains("application/json") {
             let raw = resp.text();
             self.source_html = raw.clone();
@@ -754,6 +902,10 @@ impl Page {
     }
 
     pub fn load_html_string(&mut self, html: &str, url: &str) {
+        self.media_players.clear();
+        self.media_qualities.clear();
+        self.media_captions.clear();
+        self.fullscreen_video = None;
         self.url = url.to_string();
         if self.base_url.is_none() {
             self.base_url = Url::parse(url).ok();
@@ -796,6 +948,7 @@ impl Page {
             self.recompute_if_needed();
             self.check_pending_navigation();
         }
+        self.sync_media_elements();
     }
 
     pub fn eval_js(&mut self, code: &str) -> Result<String, String> {
@@ -1011,6 +1164,14 @@ impl Page {
                                 push_src(src.clone(), self.resolve_subresource_url(&src));
                             } else if !st.image_sizes.contains_key(&src) {
                                 push_src(src, None);
+                            }
+                        }
+                    } else if el.is_html() && el.tag_is("video") {
+                        if let Some(poster) = el.get_attr("poster").filter(|s| !s.trim().is_empty()) {
+                            if !self.images.contains(poster) {
+                                push_src(poster.to_string(), self.resolve_subresource_url(poster));
+                            } else if !st.image_sizes.contains_key(poster) {
+                                push_src(poster.to_string(), None);
                             }
                         }
                     } else if el.is_html() && el.tag_is("object") {
@@ -1249,12 +1410,14 @@ impl Page {
                 }
             });
             for (fam, weight, italic, body) in fetched.into_inner().unwrap() {
-                if let Some(arc) = self
+                if let Some((arc, ligs)) = self
                     .fonts
-                    .register_web_font_styled(&fam, weight, italic, &body)
+                    .register_web_font_styled_ex(&fam, weight, italic, &body)
                 {
                     if !italic {
-                        peedle_layout::register_web_font_arc_weighted(&fam, weight, arc);
+                        peedle_layout::register_web_font_arc_weighted_with_ligatures(
+                            &fam, weight, arc, ligs,
+                        );
                     }
                     registered_any = true;
                 }
@@ -1269,33 +1432,32 @@ impl Page {
     }
 
     pub fn render_to_framebuffer(&mut self, fb: &mut Framebuffer) {
-        self.fetch_missing_images();
-        self.recompute_if_needed();
-        let st = self.js_env.dom.borrow();
-        paint_layout(
-            &st.doc,
-            &st.layout,
-            fb,
-            &self.fonts,
-            &self.images,
-            &st.canvases,
-            self.scroll_x,
-            self.scroll_y,
-        );
+        self.render_to_framebuffer_scaled(fb, 1.0);
     }
 
     pub fn render_to_framebuffer_scaled(&mut self, fb: &mut Framebuffer, scale: f32) {
         self.fetch_missing_images();
         self.recompute_if_needed();
+        self.sync_media_elements();
+        let media_map = self.build_media_overlay_map();
+        if let Some(fid) = self.fullscreen_video {
+            if let Some(vst) = media_map.get(&fid) {
+                paint_fullscreen_video(fb, &self.fonts, &self.images, vst, scale);
+                return;
+            } else {
+                self.fullscreen_video = None;
+            }
+        }
         let sel_rects = self.selection_rects();
         let st = self.js_env.dom.borrow();
-        paint_layout_scaled(
+        paint_layout_with_media(
             &st.doc,
             &st.layout,
             fb,
             &self.fonts,
             &self.images,
             &st.canvases,
+            &media_map,
             self.scroll_x,
             self.scroll_y,
             scale,
@@ -1309,6 +1471,458 @@ impl Page {
                 rh * s,
                 RgbaColor::new(56, 189, 248, 85),
             );
+        }
+    }
+
+    pub fn sync_media_elements(&mut self) {
+        struct MediaSpec {
+            nid: NodeId,
+            src: String,
+            audio_src: Option<String>,
+            autoplay: bool,
+            muted: bool,
+            qualities: Vec<MediaQualityOption>,
+            captions_url: Option<String>,
+        }
+        let specs: Vec<MediaSpec> = {
+            let st = self.js_env.dom.borrow();
+            let mut out = Vec::new();
+            for nid in st.doc.descendants(st.doc.root) {
+                let Some(el) = st.doc.element(nid) else {
+                    continue;
+                };
+                if !el.is_html() || (!el.tag_is("video") && !el.tag_is("audio")) {
+                    continue;
+                }
+                if self.media_players.contains_key(&nid) {
+                    continue;
+                }
+                let mut raw_src = el.get_attr("src").unwrap_or("").trim().to_string();
+                if raw_src.is_empty() {
+                    for c in st.doc.children(nid) {
+                        if let Some(ce) = st.doc.element(c) {
+                            if ce.is_html() && ce.tag_is("source") {
+                                if let Some(s) = ce.get_attr("src").filter(|x| !x.trim().is_empty()) {
+                                    raw_src = s.trim().to_string();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if raw_src.is_empty() {
+                    continue;
+                }
+                let Some(resolved) = self.resolve_subresource_url(&raw_src) else {
+                    continue;
+                };
+                let audio_src = el
+                    .get_attr("data-peedle-audio-src")
+                    .and_then(|s| self.resolve_subresource_url(s));
+                let autoplay = el.has_attr("autoplay");
+                let muted = el.has_attr("muted") || self.tab_muted;
+                let mut qualities = Vec::new();
+                if let Some(qjson) = el.get_attr("data-peedle-qualities") {
+                    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(qjson) {
+                        for item in arr {
+                            if let (Some(label), Some(v)) =
+                                (item["label"].as_str(), item["video"].as_str())
+                            {
+                                qualities.push(MediaQualityOption {
+                                    label: label.to_string(),
+                                    video_url: v.to_string(),
+                                    audio_url: item["audio"].as_str().map(|s| s.to_string()),
+                                });
+                            }
+                        }
+                    }
+                }
+                let captions_url = el
+                    .get_attr("data-peedle-captions")
+                    .and_then(|s| self.resolve_subresource_url(s));
+                out.push(MediaSpec {
+                    nid,
+                    src: resolved,
+                    audio_src,
+                    autoplay,
+                    muted,
+                    qualities,
+                    captions_url,
+                });
+            }
+            out
+        };
+
+        for spec in specs {
+            let player = MediaPlayer::open(
+                self.client.clone(),
+                spec.src,
+                spec.audio_src,
+                spec.autoplay,
+            );
+            if spec.muted {
+                player.set_muted(true);
+            }
+            self.media_players.insert(spec.nid, player);
+            if !spec.qualities.is_empty() {
+                self.media_qualities.insert(spec.nid, (0, spec.qualities));
+            }
+            if let Some(cap_url) = spec.captions_url {
+                if let Ok(resp) = self.client.get_cached(&cap_url) {
+                    if resp.status < 400 {
+                        let cues = parse_timedtext_xml(&resp.text());
+                        if !cues.is_empty() {
+                            self.media_captions.insert(spec.nid, (false, cues));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn build_media_overlay_map(&self) -> HashMap<NodeId, VideoOverlayState> {
+        let mut map = HashMap::new();
+        let st = self.js_env.dom.borrow();
+        for (&nid, player) in &self.media_players {
+            let snap = player.snapshot();
+            let frame = player.current_frame();
+            let (poster_url, controls) = st
+                .doc
+                .element(nid)
+                .map(|el| {
+                    let p = el
+                        .get_attr("poster")
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.to_string());
+                    let c = el.has_attr("controls") || el.has_attr("data-peedle-controls");
+                    (p, c)
+                })
+                .unwrap_or((None, true));
+            let quality_label = self
+                .media_qualities
+                .get(&nid)
+                .and_then(|(idx, list)| list.get(*idx).map(|q| q.label.clone()));
+            let (captions_enabled, has_captions, caption) = self
+                .media_captions
+                .get(&nid)
+                .map(|(enabled, cues)| {
+                    let cur = if *enabled {
+                        cues.iter()
+                            .find(|c| snap.current_time >= c.start_sec && snap.current_time <= c.end_sec)
+                            .map(|c| c.text.clone())
+                    } else {
+                        None
+                    };
+                    (*enabled, !cues.is_empty(), cur)
+                })
+                .unwrap_or((false, false, None));
+            map.insert(
+                nid,
+                VideoOverlayState {
+                    frame,
+                    poster_url,
+                    playing: snap.playing,
+                    loading: snap.loading,
+                    ended: snap.ended,
+                    current_time: snap.current_time,
+                    duration: snap.duration,
+                    buffered_sec: snap.buffered_sec,
+                    volume: snap.volume,
+                    muted: snap.muted || self.tab_muted,
+                    playback_rate: snap.playback_rate,
+                    controls,
+                    caption,
+                    captions_enabled,
+                    has_captions,
+                    quality_label,
+                    fullscreen: self.fullscreen_video == Some(nid),
+                },
+            );
+        }
+        map
+    }
+
+    pub fn has_active_media(&self) -> bool {
+        self.media_players.values().any(|p| {
+            let s = p.snapshot();
+            s.playing || s.loading
+        })
+    }
+
+    pub fn is_playing_audio(&self) -> bool {
+        self.media_players.values().any(|p| {
+            let s = p.snapshot();
+            s.playing && s.has_audio
+        })
+    }
+
+    pub fn media_frame_seq(&self) -> u64 {
+        self.media_players
+            .values()
+            .map(|p| p.snapshot().frame_seq)
+            .sum()
+    }
+
+    pub fn toggle_tab_mute(&mut self) {
+        self.tab_muted = !self.tab_muted;
+        for p in self.media_players.values() {
+            p.set_muted(self.tab_muted);
+        }
+    }
+
+    pub fn is_fullscreen_video(&self) -> bool {
+        self.fullscreen_video.is_some()
+    }
+
+    pub fn exit_fullscreen_video(&mut self) {
+        self.fullscreen_video = None;
+    }
+
+    pub fn build_reader_mode_html(&self) -> String {
+        let title = self.title();
+        let src_url = self.url.clone();
+        let dark = self.dark_mode;
+        let (bg, fg, muted, surface, border) = if dark {
+            ("#14171f", "#e6ebf3", "#94a3b8", "#1d2230", "#2d3548")
+        } else {
+            ("#fbfaf7", "#1e293b", "#64748b", "#f1efe9", "#e2dfd7")
+        };
+        let blocks = {
+            let st = self.js_env.dom.borrow();
+            let root = st
+                .doc
+                .descendants(st.doc.root)
+                .into_iter()
+                .find(|&nid| {
+                    st.doc
+                        .element(nid)
+                        .map_or(false, |e| e.tag_is("article") || e.tag_is("main"))
+                })
+                .or_else(|| st.doc.body())
+                .unwrap_or(st.doc.root);
+            let mut items: Vec<(String, String)> = Vec::new();
+            for nid in st.doc.descendants(root) {
+                let Some(el) = st.doc.element(nid) else {
+                    continue;
+                };
+                let tag = el.tag_name.as_str();
+                if matches!(tag, "h1" | "h2" | "h3" | "p" | "blockquote" | "pre" | "li") {
+                    let txt = st.doc.text_content(nid);
+                    let clean: String = txt.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if clean.len() >= 18 || (matches!(tag, "h1" | "h2" | "h3") && !clean.is_empty())
+                    {
+                        if items.last().map_or(true, |(_, prev)| prev != &clean) {
+                            items.push((tag.to_string(), clean));
+                        }
+                    }
+                }
+                if items.len() >= 160 {
+                    break;
+                }
+            }
+            items
+        };
+        let esc = |s: &str| {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        let mut body_html = String::new();
+        for (tag, text) in blocks {
+            body_html.push_str(&format!("<{t}>{v}</{t}>\n", t = tag, v = esc(&text)));
+        }
+        if body_html.is_empty() {
+            body_html.push_str("<p>No article body could be extracted from this page.</p>");
+        }
+        format!(
+            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Reader: {title}</title><style>
+*{{box-sizing:border-box;}}
+body{{margin:0;background:{bg};color:{fg};font-family:Georgia,'Times New Roman',serif;font-size:19px;line-height:1.72;}}
+article{{max-width:720px;margin:0 auto;padding:48px 28px 96px 28px;}}
+.rm-meta{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;color:{muted};margin-bottom:26px;padding-bottom:16px;border-bottom:1px solid {border};}}
+h1{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:34px;line-height:1.22;margin:0 0 12px 0;}}
+h2,h3{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:28px 0 10px 0;line-height:1.3;}}
+p{{margin:0 0 18px 0;}}
+blockquote{{margin:20px 0;padding:12px 20px;border-left:4px solid #38bdf8;background:{surface};border-radius:0 8px 8px 0;}}
+pre{{background:{surface};padding:14px 16px;border-radius:8px;overflow:auto;font-family:Consolas,monospace;font-size:14px;}}
+</style></head><body><article><h1>{title}</h1><div class="rm-meta">Reader View &middot; {url}</div>{body}</article></body></html>"#,
+            title = esc(&title),
+            url = esc(&src_url),
+            bg = bg,
+            fg = fg,
+            muted = muted,
+            surface = surface,
+            border = border,
+            body = body_html
+        )
+    }
+
+    pub fn wait_for_first_video_frame(&mut self, max_ms: u64) {
+        self.sync_media_elements();
+        if self.media_players.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + std::time::Duration::from_millis(max_ms);
+        while Instant::now() < deadline {
+            let ready = self.media_players.values().any(|p| {
+                let s = p.snapshot();
+                p.current_frame().is_some() || (!s.loading && s.error.is_some())
+            });
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    fn handle_media_click(&mut self, nid: NodeId, lx: f32, ly: f32, w: f32, h: f32) -> bool {
+        let Some(player) = self.media_players.get(&nid) else {
+            return false;
+        };
+        let is_audio = self
+            .js_env
+            .dom
+            .borrow()
+            .doc
+            .element(nid)
+            .map_or(false, |e| e.tag_is("audio"));
+        if is_audio {
+            if lx <= 36.0 {
+                player.toggle_play();
+            } else if lx >= 110.0 && w > 130.0 {
+                let frac = ((lx - 112.0) / (w - 130.0)).clamp(0.0, 1.0) as f64;
+                let dur = player.snapshot().duration;
+                if dur > 0.0 {
+                    player.seek(frac * dur);
+                }
+            } else {
+                player.toggle_play();
+            }
+            return true;
+        }
+
+        if h >= 80.0 && w >= 160.0 && ly >= h - 54.0 {
+            if ly <= h - 36.0 {
+                let track_w = (w - 24.0).max(20.0);
+                let frac = ((lx - 12.0) / track_w).clamp(0.0, 1.0) as f64;
+                let dur = player.snapshot().duration;
+                if dur > 0.0 {
+                    player.seek(frac * dur);
+                }
+                return true;
+            }
+            if lx <= 44.0 {
+                player.toggle_play();
+                return true;
+            }
+            if lx <= 76.0 {
+                player.toggle_mute();
+                return true;
+            }
+            if w >= 360.0 && lx >= 76.0 && lx <= 138.0 {
+                let vol = ((lx - 78.0) / 56.0).clamp(0.0, 1.0);
+                player.set_volume(vol);
+                return true;
+            }
+            if lx >= w - 44.0 {
+                if self.fullscreen_video == Some(nid) {
+                    self.fullscreen_video = None;
+                } else {
+                    self.fullscreen_video = Some(nid);
+                }
+                return true;
+            }
+            if lx >= w - 96.0 && lx <= w - 46.0 {
+                if let Some((idx, list)) = self.media_qualities.get_mut(&nid) {
+                    if list.len() > 1 {
+                        *idx = (*idx + 1) % list.len();
+                        let opt = list[*idx].clone();
+                        player.switch_sources(opt.video_url, opt.audio_url);
+                    }
+                }
+                return true;
+            }
+            if w >= 300.0 && lx >= w - 134.0 && lx <= w - 98.0 {
+                if let Some((enabled, cues)) = self.media_captions.get_mut(&nid) {
+                    if !cues.is_empty() {
+                        *enabled = !*enabled;
+                    }
+                }
+                return true;
+            }
+        }
+        player.toggle_play();
+        true
+    }
+
+    pub fn handle_media_key(&mut self, key: &str) -> bool {
+        if self.has_focused_input() {
+            return false;
+        }
+        let target_id = self
+            .fullscreen_video
+            .or_else(|| self.media_players.keys().next().copied());
+        let Some(nid) = target_id else {
+            return false;
+        };
+        let Some(player) = self.media_players.get(&nid) else {
+            return false;
+        };
+        match key {
+            " " | "k" | "K" => {
+                player.toggle_play();
+                true
+            }
+            "m" | "M" => {
+                player.toggle_mute();
+                true
+            }
+            "f" | "F" => {
+                if self.fullscreen_video == Some(nid) {
+                    self.fullscreen_video = None;
+                } else {
+                    self.fullscreen_video = Some(nid);
+                }
+                true
+            }
+            "Escape" => {
+                if self.fullscreen_video.is_some() {
+                    self.fullscreen_video = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            "j" | "J" => {
+                let cur = player.snapshot().current_time;
+                player.seek((cur - 10.0).max(0.0));
+                true
+            }
+            "l" | "L" => {
+                let cur = player.snapshot().current_time;
+                player.seek(cur + 10.0);
+                true
+            }
+            "ArrowLeft" => {
+                let cur = player.snapshot().current_time;
+                player.seek((cur - 5.0).max(0.0));
+                true
+            }
+            "ArrowRight" => {
+                let cur = player.snapshot().current_time;
+                player.seek(cur + 5.0);
+                true
+            }
+            "c" | "C" => {
+                if let Some((enabled, cues)) = self.media_captions.get_mut(&nid) {
+                    if !cues.is_empty() {
+                        *enabled = !*enabled;
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
         }
     }
 
@@ -1658,6 +2272,10 @@ impl Page {
     }
 
     pub fn on_click_ex(&mut self, vx: f32, vy: f32, execute_nav: bool) -> ClickAction {
+        if let Some(fid) = self.fullscreen_video {
+            self.handle_media_click(fid, vx, vy, self.viewport_w, self.viewport_h);
+            return ClickAction::None;
+        }
         let hit = {
             let st = self.js_env.dom.borrow();
             st.layout.hit_test(vx + self.scroll_x, vy + self.scroll_y)
@@ -1706,6 +2324,26 @@ impl Page {
         };
         if let Some(ctrl_id) = resolved_label_target {
             nid = ctrl_id;
+        }
+
+        let media_hit_rect = {
+            let st = self.js_env.dom.borrow();
+            let is_media = st
+                .doc
+                .element(nid)
+                .map_or(false, |e| e.is_html() && (e.tag_is("video") || e.tag_is("audio")));
+            if is_media {
+                st.layout.bounding_rect(nid)
+            } else {
+                None
+            }
+        };
+        if let Some(r) = media_hit_rect {
+            let lx = (vx + self.scroll_x) - r.x;
+            let ly = (vy + self.scroll_y) - r.y;
+            if self.handle_media_click(nid, lx, ly, r.width, r.height) {
+                return ClickAction::None;
+            }
         }
 
         let select_popup = {

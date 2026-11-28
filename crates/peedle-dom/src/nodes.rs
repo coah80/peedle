@@ -3087,6 +3087,70 @@ fn define_html_table_form_embed_apis(
         );
         define_getter_setter(rt, html_element_proto, dim_prop, Some(getter), Some(setter));
     }
+
+    let can_play_type = rt.create_native_function(
+        "canPlayType",
+        1,
+        Rc::new(|rt, _, args| {
+            let mime = args
+                .first()
+                .and_then(|v| rt.to_string(v).ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let res = if mime.contains("mp4")
+                || mime.contains("avc1")
+                || mime.contains("mp4a")
+                || mime.contains("aac")
+                || mime.contains("mpeg")
+                || mime.contains("ogg")
+                || mime.contains("opus")
+                || mime.contains("flac")
+                || mime.contains("wav")
+            {
+                if mime.contains("codecs=") {
+                    "probably"
+                } else {
+                    "maybe"
+                }
+            } else {
+                ""
+            };
+            Ok(JsValue::String(res.to_string()))
+        }),
+    );
+    let _ = rt.set_property(html_element_proto, "canPlayType", JsValue::Object(can_play_type));
+
+    let media_play = rt.create_native_function(
+        "play",
+        0,
+        Rc::new(|rt, _, _| {
+            let p = rt.create_object();
+            let then_fn = rt.create_native_function(
+                "then",
+                1,
+                Rc::new(|rt, _, args| {
+                    if let Some(cb) = args.first() {
+                        if cb.as_object().is_some() {
+                            let _ = rt.call_function(cb.clone(), JsValue::Undefined, &[]);
+                        }
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+            let catch_fn = rt.create_native_function(
+                "catch",
+                1,
+                Rc::new(|_, this, _| Ok(this)),
+            );
+            let _ = rt.set_property(p, "then", JsValue::Object(then_fn));
+            let _ = rt.set_property(p, "catch", JsValue::Object(catch_fn));
+            Ok(JsValue::Object(p))
+        }),
+    );
+    let media_noop = rt.create_native_function("pause", 0, Rc::new(|_, _, _| Ok(JsValue::Undefined)));
+    let _ = rt.set_property(html_element_proto, "play", JsValue::Object(media_play));
+    let _ = rt.set_property(html_element_proto, "pause", JsValue::Object(media_noop));
+    let _ = rt.set_property(html_element_proto, "load", JsValue::Object(media_noop));
 }
 
 fn find_owner_form(doc: &peedle_html::Document, nid: NodeId) -> Option<NodeId> {

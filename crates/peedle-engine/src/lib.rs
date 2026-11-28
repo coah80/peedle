@@ -1,5 +1,6 @@
 pub mod internal_pages;
 pub mod page;
+pub mod youtube;
 
 pub use internal_pages::{
     render_bookmarks_html, render_downloads_html, render_history_html, render_history_html_themed,
@@ -11,3 +12,4 @@ pub use page::{
     ClickAction, DownloadPayload, HistoryEntry, NetworkEntry, Page, PreparedNavigation,
     SearchEngine,
 };
+pub use youtube::{CaptionCue, MediaQualityOption};

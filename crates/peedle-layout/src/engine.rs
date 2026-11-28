@@ -618,8 +618,17 @@ impl LayoutEngine {
                         && self.is_block_level(cid)
                 });
                 let explicit_h = self.resolve_explicit_height(&style, cb_height);
+                let aspect_h = if explicit_h.is_none() {
+                    style
+                        .aspect_ratio
+                        .filter(|&ar| ar > 0.0 && content_w > 0.0)
+                        .map(|ar| content_w / ar)
+                } else {
+                    None
+                };
+                let definite_h = explicit_h.or(aspect_h);
                 let is_root = self.tree.root == Some(id);
-                let child_cb_h = explicit_h.unwrap_or(if is_root { cb_height } else { -1.0 });
+                let child_cb_h = definite_h.unwrap_or(if is_root { cb_height } else { -1.0 });
                 let establishes_bfc = style.overflow_x != peedle_css::Overflow::Visible
                     || style.overflow_y != peedle_css::Overflow::Visible
                     || style.display == Display::FlowRoot
@@ -1622,8 +1631,14 @@ impl LayoutEngine {
             match kind {
                 BoxKind::Text(ref t) => {
                     let s = apply_text_transform(t, style.text_transform);
+                    let trimmed = s.trim();
+                    let sample = if trimmed.is_empty() && !t.is_empty() {
+                        " "
+                    } else {
+                        trimmed
+                    };
                     self.measurer.measure_str(
-                        s.trim(),
+                        sample,
                         &style.font_family,
                         style.font_size,
                         style.font_weight,
@@ -1865,13 +1880,24 @@ impl LayoutEngine {
         let is_border_box = style.box_sizing == BoxSizing::BorderBox;
         let has_aspect = matches!(
             rep,
-            ReplacedKind::Image { .. } | ReplacedKind::Canvas { .. } | ReplacedKind::Svg { .. }
+            ReplacedKind::Image { .. }
+                | ReplacedKind::Canvas { .. }
+                | ReplacedKind::Svg { .. }
+                | ReplacedKind::Video { .. }
         );
         let line_h = (style.font_size * 1.4).max(18.0);
         let (iw, ih) = match rep {
             ReplacedKind::Image { intrinsic_w, intrinsic_h, .. } => (*intrinsic_w, *intrinsic_h),
             ReplacedKind::Canvas { width, height } => (*width, *height),
             ReplacedKind::Svg { width, height } => (*width, *height),
+            ReplacedKind::Video { intrinsic_w, intrinsic_h, .. } => (*intrinsic_w, *intrinsic_h),
+            ReplacedKind::Audio { controls, .. } => {
+                if *controls {
+                    (320.0, 44.0)
+                } else {
+                    (0.0, 0.0)
+                }
+            }
             ReplacedKind::Input { input_type, value, .. } => match input_type.as_str() {
                 "checkbox" | "radio" => (15.0, 15.0),
                 "hidden" => (0.0, 0.0),
@@ -1987,14 +2013,36 @@ fn detect_replaced(
     image_sizes: &HashMap<String, (u32, u32)>,
 ) -> Option<ReplacedKind> {
     if el.namespace == Namespace::Svg && el.tag_name.eq_ignore_ascii_case("svg") {
-        let w = el
+        let vb = el
+            .get_attr("viewBox")
+            .or_else(|| el.get_attr("viewbox"))
+            .and_then(|s| {
+                let nums: Vec<f32> = s
+                    .split(|c: char| c.is_ascii_whitespace() || c == ',')
+                    .filter(|t| !t.is_empty())
+                    .filter_map(|t| t.parse::<f32>().ok())
+                    .collect();
+                if nums.len() == 4 && nums[2] > 0.0 && nums[3] > 0.0 {
+                    Some((nums[2], nums[3]))
+                } else {
+                    None
+                }
+            });
+        let attr_w = el
             .get_attr("width")
-            .and_then(|s| s.trim_end_matches("px").parse::<f32>().ok())
-            .unwrap_or(150.0);
-        let h = el
+            .and_then(|s| s.trim_end_matches("px").parse::<f32>().ok());
+        let attr_h = el
             .get_attr("height")
-            .and_then(|s| s.trim_end_matches("px").parse::<f32>().ok())
-            .unwrap_or(150.0);
+            .and_then(|s| s.trim_end_matches("px").parse::<f32>().ok());
+        let (w, h) = match (attr_w, attr_h, vb) {
+            (Some(w), Some(h), _) => (w, h),
+            (Some(w), None, Some((vw, vh))) => (w, w * (vh / vw)),
+            (None, Some(h), Some((vw, vh))) => (h * (vw / vh), h),
+            (None, None, Some((vw, vh))) => (vw, vh),
+            (Some(w), None, None) => (w, 150.0),
+            (None, Some(h), None) => (150.0, h),
+            (None, None, None) => (150.0, 150.0),
+        };
         return Some(ReplacedKind::Svg { width: w, height: h });
     }
     if !el.is_html() {
@@ -2038,6 +2086,61 @@ fn detect_replaced(
                 .and_then(|s| s.parse::<f32>().ok())
                 .unwrap_or(150.0);
             Some(ReplacedKind::Canvas { width: w, height: h })
+        }
+        "video" => {
+            let mut src = el.get_attr("src").unwrap_or("").to_string();
+            if src.is_empty() {
+                for c in doc.children(node_id) {
+                    if let Some(ce) = doc.element(c) {
+                        if ce.tag_is("source") {
+                            if let Some(s) = ce.get_attr("src") {
+                                if !s.trim().is_empty() {
+                                    src = s.to_string();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let poster = el.get_attr("poster").unwrap_or("").to_string();
+            let controls = el.has_attr("controls") || el.has_attr("data-peedle-controls");
+            let attr_w = el.get_attr("width").and_then(|s| s.parse::<f32>().ok());
+            let attr_h = el.get_attr("height").and_then(|s| s.parse::<f32>().ok());
+            let vid_key = format!("__video__:{}", node_id.0);
+            let (nat_w, nat_h) = image_sizes
+                .get(&vid_key)
+                .or_else(|| image_sizes.get(&poster))
+                .map(|&(w, h)| (w as f32, h as f32))
+                .unwrap_or((640.0, 360.0));
+            let w = attr_w.unwrap_or(if nat_w > 0.0 { nat_w } else { 640.0 });
+            let h = attr_h.unwrap_or(if nat_h > 0.0 { nat_h } else { 360.0 });
+            Some(ReplacedKind::Video {
+                src,
+                poster,
+                intrinsic_w: w,
+                intrinsic_h: h,
+                controls,
+            })
+        }
+        "audio" => {
+            let mut src = el.get_attr("src").unwrap_or("").to_string();
+            if src.is_empty() {
+                for c in doc.children(node_id) {
+                    if let Some(ce) = doc.element(c) {
+                        if ce.tag_is("source") {
+                            if let Some(s) = ce.get_attr("src") {
+                                if !s.trim().is_empty() {
+                                    src = s.to_string();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let controls = el.has_attr("controls");
+            Some(ReplacedKind::Audio { src, controls })
         }
         "input" => {
             let input_type = el.get_attr("type").unwrap_or("text").to_ascii_lowercase();

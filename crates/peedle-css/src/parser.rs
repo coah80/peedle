@@ -418,6 +418,7 @@ pub fn is_supported_declaration(prop: &str, value: &[Token]) -> bool {
             | "user-select"
             | "table-layout"
             | "object-fit"
+            | "object-position"
     );
     if !known {
         return false;

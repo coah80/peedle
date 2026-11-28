@@ -1,0 +1,15 @@
+[package]
+name = "peedle-media"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+peedle-net.workspace = true
+peedle-url.workspace = true
+rusty_h264-decoder.workspace = true
+symphonia.workspace = true
+symphonia-opus.workspace = true
+
+[dev-dependencies]
+image.workspace = true
+serde_json.workspace = true

@@ -7,3 +7,4 @@ edition.workspace = true
 peedle-html.workspace = true
 peedle-css.workspace = true
 fontdue.workspace = true
+ttf-parser.workspace = true

@@ -143,6 +143,9 @@ fn run_headless(args: &[String]) {
                 Err(err) => eprintln!("JS error: {}", err),
             }
         }
+        if page.has_active_media() {
+            page.wait_for_first_video_frame(6000);
+        }
         if let Err(e) = page.save_screenshot(Path::new(&out)) {
             eprintln!("screenshot error: {}", e);
             std::process::exit(1);

@@ -23,6 +23,17 @@ pub enum ReplacedKind {
         width: f32,
         height: f32,
     },
+    Video {
+        src: String,
+        poster: String,
+        intrinsic_w: f32,
+        intrinsic_h: f32,
+        controls: bool,
+    },
+    Audio {
+        src: String,
+        controls: bool,
+    },
     Input {
         input_type: String,
         value: String,

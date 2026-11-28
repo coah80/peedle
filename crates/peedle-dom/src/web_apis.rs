@@ -78,6 +78,72 @@ pub fn define_web_apis(rt: &mut JsRuntime, dom: SharedDom) {
     define_fetch_and_xhr(rt, dom.clone(), global);
     define_observers_and_misc(rt, dom.clone(), global);
     define_crypto(rt, global);
+    define_media_and_security_apis(rt, global);
+}
+
+fn define_media_and_security_apis(rt: &mut JsRuntime, global: ObjectId) {
+    let ms_proto = rt.create_object();
+    let ms_ctor = rt.create_native_constructor(
+        "MediaSource",
+        0,
+        ms_proto,
+        Rc::new(move |rt, _, _| {
+            let inst = rt.create_object_with_proto(Some(ms_proto));
+            let _ = rt.set_property(inst, "readyState", JsValue::String("closed".into()));
+            Ok(JsValue::Object(inst))
+        }),
+    );
+    let is_supported = rt.create_native_function(
+        "isTypeSupported",
+        1,
+        Rc::new(|rt, _, args| {
+            let mime = args
+                .first()
+                .and_then(|v| rt.to_string(v).ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let ok = mime.contains("avc1")
+                || mime.contains("mp4a.40.2")
+                || mime.contains("mp4")
+                || mime.contains("opus");
+            Ok(JsValue::Boolean(ok))
+        }),
+    );
+    let _ = rt.set_property(ms_ctor, "isTypeSupported", JsValue::Object(is_supported));
+    let _ = rt.set_property(global, "MediaSource", JsValue::Object(ms_ctor));
+
+    let tt = rt.create_object();
+    let create_policy = rt.create_native_function(
+        "createPolicy",
+        2,
+        Rc::new(|rt, _, args| {
+            let policy = rt.create_object();
+            let rules = args.get(1).and_then(|v| v.as_object());
+            for m in ["createHTML", "createScript", "createScriptURL"] {
+                let custom = rules
+                    .and_then(|r| rt.get_property(r, m).ok())
+                    .filter(|v| v.as_object().is_some());
+                let f = rt.create_native_function(
+                    m,
+                    1,
+                    Rc::new(move |rt, _, fargs| {
+                        if let Some(ref c) = custom {
+                            return rt.call_function(c.clone(), JsValue::Undefined, fargs);
+                        }
+                        let s = fargs
+                            .first()
+                            .and_then(|v| rt.to_string(v).ok())
+                            .unwrap_or_default();
+                        Ok(JsValue::String(s))
+                    }),
+                );
+                let _ = rt.set_property(policy, m, JsValue::Object(f));
+            }
+            Ok(JsValue::Object(policy))
+        }),
+    );
+    let _ = rt.set_property(tt, "createPolicy", JsValue::Object(create_policy));
+    let _ = rt.set_property(global, "trustedTypes", JsValue::Object(tt));
 }
 
 fn define_timers_and_channels(rt: &mut JsRuntime, dom: SharedDom, global: ObjectId) {

@@ -877,6 +877,48 @@ fn expand_shorthand(name: &str, value: &[Token]) -> Vec<(String, Vec<Token>)> {
             "place-self" => &["align-self", "justify-self"],
             "outline" => &["outline-width", "outline-style", "outline-color"],
             "list-style" => &["list-style-type", "list-style-position"],
+            "text-decoration" => &[
+                "text-decoration-line",
+                "text-decoration-style",
+                "text-decoration-color",
+            ],
+            "background" => &[
+                "background-color",
+                "background-image",
+                "background-position",
+                "background-size",
+                "background-repeat",
+                "background-clip",
+            ],
+            "font" => &[
+                "font-style",
+                "font-weight",
+                "font-size",
+                "line-height",
+                "font-family",
+            ],
+            "border-top" => &["border-top-width", "border-top-style", "border-top-color"],
+            "border-right" => &["border-right-width", "border-right-style", "border-right-color"],
+            "border-bottom" => &["border-bottom-width", "border-bottom-style", "border-bottom-color"],
+            "border-left" => &["border-left-width", "border-left-style", "border-left-color"],
+            "border-width" => &[
+                "border-top-width",
+                "border-right-width",
+                "border-bottom-width",
+                "border-left-width",
+            ],
+            "border-style" => &[
+                "border-top-style",
+                "border-right-style",
+                "border-bottom-style",
+                "border-left-style",
+            ],
+            "border-color" => &[
+                "border-top-color",
+                "border-right-color",
+                "border-bottom-color",
+                "border-left-color",
+            ],
             _ => return vec![(name.to_string(), trimmed.to_vec())],
         };
         return targets
@@ -2476,6 +2518,53 @@ fn apply_longhand(
                 };
             }
         }
+        "object-position" => {
+            let parts = split_whitespace_groups(trimmed);
+            let mut px = 0.5f32;
+            let mut py = 0.5f32;
+            let parse_axis = |g: &[Token]| -> Option<(Option<bool>, f32)> {
+                match g.first()? {
+                    Token::Ident(s) => match s.to_ascii_lowercase().as_str() {
+                        "left" => Some((Some(true), 0.0)),
+                        "right" => Some((Some(true), 1.0)),
+                        "top" => Some((Some(false), 0.0)),
+                        "bottom" => Some((Some(false), 1.0)),
+                        "center" => Some((None, 0.5)),
+                        _ => None,
+                    },
+                    Token::Percentage { value: v, .. } => {
+                        Some((None, (*v as f32 / 100.0).clamp(0.0, 1.0)))
+                    }
+                    Token::Number { value: v, .. } if *v == 0.0 => Some((None, 0.0)),
+                    Token::Dimension { value: v, .. } if *v == 0.0 => Some((None, 0.0)),
+                    _ => None,
+                }
+            };
+            if parts.len() == 1 {
+                if let Some((axis, val)) = parse_axis(parts[0]) {
+                    match axis {
+                        Some(true) | None => px = val,
+                        Some(false) => py = val,
+                    }
+                }
+            } else if parts.len() >= 2 {
+                let a = parse_axis(parts[0]);
+                let b = parse_axis(parts[1]);
+                match (a, b) {
+                    (Some((Some(false), yv)), Some((Some(true), xv))) => {
+                        px = xv;
+                        py = yv;
+                    }
+                    (Some((_, xv)), Some((_, yv))) => {
+                        px = xv;
+                        py = yv;
+                    }
+                    _ => {}
+                }
+            }
+            style.object_position_x = px;
+            style.object_position_y = py;
+        }
         "flex-direction" => {
             if let Some(s) = ident.as_deref() {
                 style.flex_direction = match s {
@@ -2914,6 +3003,10 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, prop: &str) {
         "filter" => dst.filter = src.filter.clone(),
         "backdrop-filter" => dst.backdrop_filter = src.backdrop_filter.clone(),
         "object-fit" => dst.object_fit = src.object_fit,
+        "object-position" => {
+            dst.object_position_x = src.object_position_x;
+            dst.object_position_y = src.object_position_y;
+        }
         "flex-direction" => dst.flex_direction = src.flex_direction,
         "flex-wrap" => dst.flex_wrap = src.flex_wrap,
         "flex-grow" => dst.flex_grow = src.flex_grow,

@@ -20,9 +20,10 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use crate::chrome::{
-    content_viewport_height, draw_chrome, hit_test_chrome, omnibox_rect, top_chrome_height,
-    ChromeHit, ChromeState, ContextMenuItem, DevToolsTab, DownloadToast, MenuAction,
-    OmniboxSuggestion, PopupMenu, SelectPopup, SuggestionKind, TabVisual,
+    content_origin_x, content_viewport_height, content_viewport_width, draw_chrome,
+    hit_test_chrome, omnibox_rect_for, split_divider_x, toolbar_top, top_chrome_height, ChromeHit,
+    ChromeState, ContextMenuItem, DevToolsTab, DownloadToast, MenuAction, OmniboxSuggestion,
+    PopupMenu, SelectPopup, SuggestionKind, TabVisual, SPLIT_DIVIDER_W,
 };
 use crate::profile::{reveal_in_file_manager, BrowserProfile, SavedBookmark};
 
@@ -41,6 +42,9 @@ struct BrowserTab {
     loading: bool,
     load_seq: u64,
     load_started: Option<Instant>,
+    last_media_seq: u64,
+    pinned: bool,
+    reader_saved_url: Option<String>,
 }
 
 pub struct BrowserApp {
@@ -57,8 +61,12 @@ pub struct BrowserApp {
     chrome: ChromeState,
     fonts: FontSystem,
     page_fb: Framebuffer,
+    split_fb: Framebuffer,
     full_fb: Framebuffer,
     page_dirty: bool,
+    split_dirty: bool,
+    split_tab: Option<usize>,
+    split_dragging: bool,
     cursor_x: f32,
     cursor_y: f32,
     modifiers: ModifiersState,
@@ -73,6 +81,7 @@ pub struct BrowserApp {
     phys_h: u32,
     scale_factor: f32,
     settings_notice: Option<String>,
+    window_fullscreen: bool,
 }
 
 impl BrowserApp {
@@ -83,12 +92,15 @@ impl BrowserApp {
         let proxy = event_loop.create_proxy();
         let profile = BrowserProfile::load();
         let client = HttpClient::with_shared_cookies(profile.cookies.clone());
+        client.set_adblock_enabled(profile.settings.adblock_enabled);
         let mut chrome = ChromeState::default();
         chrome.dark_mode = profile.settings.dark_mode;
         chrome.bookmarks_visible = profile.settings.bookmarks_visible;
         chrome.bookmarks = profile.bookmarks.clone();
         chrome.zoom = profile.settings.default_zoom.clamp(0.5, 2.0);
         chrome.has_downloads = !profile.downloads.is_empty();
+        chrome.shields_enabled = profile.settings.adblock_enabled;
+        chrome.vertical_tabs = profile.settings.vertical_tabs;
 
         let mut app = Self {
             initial_urls,
@@ -104,8 +116,12 @@ impl BrowserApp {
             chrome,
             fonts: FontSystem::load_system_fonts(),
             page_fb: Framebuffer::new(1, 1),
+            split_fb: Framebuffer::new(1, 1),
             full_fb: Framebuffer::new(1, 1),
             page_dirty: true,
+            split_dirty: true,
+            split_tab: None,
+            split_dragging: false,
             cursor_x: 0.0,
             cursor_y: 0.0,
             modifiers: ModifiersState::empty(),
@@ -120,6 +136,7 @@ impl BrowserApp {
             phys_h: 820,
             scale_factor: 1.0,
             settings_notice: None,
+            window_fullscreen: false,
         };
         event_loop.run_app(&mut app).map_err(|e| e.to_string())
     }
@@ -577,6 +594,9 @@ impl BrowserApp {
             loading: false,
             load_seq: 0,
             load_started: None,
+            last_media_seq: 0,
+            pinned: false,
+            reader_saved_url: None,
         });
         let idx = self.tabs.len() - 1;
         self.active_tab = idx;
@@ -602,10 +622,24 @@ impl BrowserApp {
             return;
         }
         self.tabs.remove(idx);
+        if let Some(st) = self.split_tab {
+            if st == idx {
+                self.split_tab = None;
+                self.chrome.split_active = false;
+            } else if st > idx {
+                self.split_tab = Some(st - 1);
+            }
+        }
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         }
+        if self.split_tab == Some(self.active_tab) {
+            self.split_tab = None;
+            self.chrome.split_active = false;
+        }
+        self.resize_all_tabs();
         self.page_dirty = true;
+        self.split_dirty = true;
         self.sync_omnibox();
         self.sync_window_title();
     }
@@ -627,15 +661,171 @@ impl BrowserApp {
         self.sync_window_title();
     }
 
+    fn pane_layout(&self) -> (f32, f32, f32, f32) {
+        let lw = self.logical_w();
+        let ox = content_origin_x(&self.chrome);
+        let cw = content_viewport_width(lw, &self.chrome);
+        if self.chrome.split_active && self.split_tab.is_some() {
+            let div_x = split_divider_x(lw, &self.chrome);
+            let left_w = (div_x - ox - SPLIT_DIVIDER_W * 0.5).max(160.0);
+            let right_x = div_x + SPLIT_DIVIDER_W * 0.5;
+            let right_w = (lw - right_x).max(160.0);
+            (ox, left_w, right_x, right_w)
+        } else {
+            (ox, cw, lw, 0.0)
+        }
+    }
+
+    fn active_pane_origin_x(&self) -> f32 {
+        let (lx, _, rx, rw) = self.pane_layout();
+        if self.chrome.split_active && self.chrome.split_focus_right && rw > 0.0 {
+            rx
+        } else {
+            lx
+        }
+    }
+
+    fn toggle_vertical_tabs(&mut self) {
+        self.chrome.vertical_tabs = !self.chrome.vertical_tabs;
+        self.profile.settings.vertical_tabs = self.chrome.vertical_tabs;
+        self.profile.save_settings();
+        self.resize_all_tabs();
+    }
+
+    fn toggle_split_view(&mut self) {
+        if self.chrome.split_active {
+            self.chrome.split_active = false;
+            self.chrome.split_focus_right = false;
+            self.split_tab = None;
+            self.resize_all_tabs();
+            return;
+        }
+        if self.tabs.len() < 2 {
+            let prev = self.active_tab;
+            self.open_new_tab("peedle://newtab");
+            let right = self.active_tab;
+            self.active_tab = prev;
+            self.split_tab = Some(right);
+        } else {
+            let other = (0..self.tabs.len())
+                .find(|&i| i != self.active_tab)
+                .unwrap_or(0);
+            self.split_tab = Some(other);
+        }
+        self.chrome.split_active = true;
+        self.chrome.split_focus_right = false;
+        self.resize_all_tabs();
+        self.sync_omnibox();
+        self.sync_window_title();
+    }
+
+    fn split_with_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() || idx == self.active_tab {
+            return;
+        }
+        self.split_tab = Some(idx);
+        self.chrome.split_active = true;
+        self.chrome.split_focus_right = false;
+        self.resize_all_tabs();
+    }
+
+    fn toggle_shields(&mut self) {
+        let next = !self.chrome.shields_enabled;
+        self.chrome.shields_enabled = next;
+        self.profile.settings.adblock_enabled = next;
+        self.client.set_adblock_enabled(next);
+        self.profile.save_settings();
+        let url = self.active_page().url.clone();
+        if url.starts_with("http://") || url.starts_with("https://") {
+            let idx = self.active_tab;
+            self.start_navigation_for_tab(idx, &url, false);
+        }
+    }
+
+    fn toggle_reader_mode(&mut self) {
+        let idx = self.active_tab;
+        if let Some(orig) = self.tabs[idx].reader_saved_url.take() {
+            self.chrome.reader_active = false;
+            self.start_navigation_for_tab(idx, &orig, false);
+            return;
+        }
+        let cur = self.tabs[idx].page.url.clone();
+        if cur.starts_with("peedle://") || cur.starts_with("about:") {
+            return;
+        }
+        let html = self.tabs[idx].page.build_reader_mode_html();
+        self.tabs[idx].reader_saved_url = Some(cur.clone());
+        self.tabs[idx].page.load_custom_internal(&cur, &html, false);
+        self.chrome.reader_active = true;
+        self.page_dirty = true;
+        self.split_dirty = true;
+    }
+
+    fn toggle_pin_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let target_id = self.tabs[idx].id;
+        let active_id = self.tabs[self.active_tab].id;
+        let split_id = self.split_tab.and_then(|s| self.tabs.get(s).map(|t| t.id));
+        self.tabs[idx].pinned = !self.tabs[idx].pinned;
+        let mut pinned_list = Vec::new();
+        let mut normal_list = Vec::new();
+        for t in self.tabs.drain(..) {
+            if t.pinned {
+                pinned_list.push(t);
+            } else {
+                normal_list.push(t);
+            }
+        }
+        self.tabs.extend(pinned_list);
+        self.tabs.extend(normal_list);
+        if let Some(pos) = self.tabs.iter().position(|t| t.id == active_id) {
+            self.active_tab = pos;
+        }
+        if let Some(sid) = split_id {
+            self.split_tab = self.tabs.iter().position(|t| t.id == sid);
+        }
+        let _ = target_id;
+        self.page_dirty = true;
+    }
+
     fn resize_all_tabs(&mut self) {
         let z = self.chrome.zoom.clamp(0.5, 2.0);
-        let w = (self.logical_w() / z).max(200.0);
+        let (_, left_w, _, right_w) = self.pane_layout();
+        let full_w = content_viewport_width(self.logical_w(), &self.chrome);
         let vh = (content_viewport_height(self.logical_h(), &self.chrome) / z).max(100.0);
-        for tab in &mut self.tabs {
+        let left_tab = if self.chrome.split_active && self.chrome.split_focus_right {
+            self.split_tab
+        } else {
+            Some(self.active_tab)
+        };
+        let right_tab = if self.chrome.split_active {
+            if self.chrome.split_focus_right {
+                Some(self.active_tab)
+            } else {
+                self.split_tab
+            }
+        } else {
+            None
+        };
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
             tab.page.set_device_pixel_ratio(self.scale_factor);
-            tab.page.resize(w, vh);
+            let w_log = if self.chrome.split_active && right_w > 0.0 {
+                if Some(i) == left_tab {
+                    left_w
+                } else if Some(i) == right_tab {
+                    right_w
+                } else {
+                    full_w
+                }
+            } else {
+                full_w
+            };
+            tab.page.resize((w_log / z).max(160.0), vh);
         }
         self.page_dirty = true;
+        self.split_dirty = true;
     }
 
     fn scroll_to_scrollbar_y(&mut self, y: f32) {
@@ -652,15 +842,39 @@ impl BrowserApp {
 
     fn open_browser_menu(&mut self) {
         let lw = self.logical_w();
-        let mw = 230.0;
+        let mw = 248.0;
         let x = (lw - mw - 10.0).max(8.0);
-        let y = crate::chrome::TAB_BAR_H + crate::chrome::TOOLBAR_H + 4.0;
+        let y = toolbar_top(&self.chrome) + crate::chrome::TOOLBAR_H + 4.0;
         let items = vec![
             ContextMenuItem { label: "New tab   Ctrl+T".into(), action: MenuAction::NewTab, enabled: true },
             ContextMenuItem {
                 label: "Reopen closed tab".into(),
                 action: MenuAction::ReopenClosedTab,
                 enabled: !self.closed_tabs.is_empty(),
+            },
+            ContextMenuItem {
+                label: if self.chrome.vertical_tabs { "Horizontal tabs   Ctrl+Shift+V".into() } else { "Vertical tabs   Ctrl+Shift+V".into() },
+                action: MenuAction::ToggleVerticalTabs,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: if self.chrome.split_active { "Close split view   Ctrl+Shift+S".into() } else { "Split view   Ctrl+Shift+S".into() },
+                action: MenuAction::ToggleSplitView,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: if self.chrome.shields_enabled {
+                    format!("Shields: ON ({} blocked)", self.client.blocked_count())
+                } else {
+                    "Shields: OFF".into()
+                },
+                action: MenuAction::ToggleShields,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: if self.chrome.reader_active { "Exit reader mode".into() } else { "Reader mode   Ctrl+Alt+R".into() },
+                action: MenuAction::ToggleReaderMode,
+                enabled: true,
             },
             ContextMenuItem { label: "History   Ctrl+H".into(), action: MenuAction::OpenUrl("peedle://history".into()), enabled: true },
             ContextMenuItem { label: "Downloads   Ctrl+J".into(), action: MenuAction::OpenUrl("peedle://downloads".into()), enabled: true },
@@ -703,11 +917,30 @@ impl BrowserApp {
         );
         let mut items = Vec::new();
         match hit {
-            ChromeHit::Tab(i) | ChromeHit::CloseTab(i) => {
+            ChromeHit::Tab(i) | ChromeHit::CloseTab(i) | ChromeHit::TabAudio(i) => {
+                let is_pin = self.tabs.get(i).map_or(false, |t| t.pinned);
+                let is_muted = self.tabs.get(i).map_or(false, |t| t.page.tab_muted);
                 items.push(ContextMenuItem { label: "New tab".into(), action: MenuAction::NewTab, enabled: true });
+                items.push(ContextMenuItem {
+                    label: if is_pin { "Unpin tab".into() } else { "Pin tab".into() },
+                    action: MenuAction::TogglePinTab(i),
+                    enabled: true,
+                });
+                items.push(ContextMenuItem {
+                    label: if is_muted { "Unmute tab".into() } else { "Mute tab".into() },
+                    action: MenuAction::ToggleMuteTab(i),
+                    enabled: true,
+                });
+                if i != self.active_tab {
+                    items.push(ContextMenuItem {
+                        label: "Split with active tab".into(),
+                        action: MenuAction::SplitWithTab(i),
+                        enabled: true,
+                    });
+                }
                 items.push(ContextMenuItem { label: "Duplicate tab".into(), action: MenuAction::DuplicateTab(i), enabled: true });
                 items.push(ContextMenuItem { label: "Reload tab".into(), action: MenuAction::ReloadTab(i), enabled: true });
-                items.push(ContextMenuItem { label: "Close tab".into(), action: MenuAction::CloseTab(i), enabled: true });
+                items.push(ContextMenuItem { label: "Close tab".into(), action: MenuAction::CloseTab(i), enabled: !is_pin });
                 items.push(ContextMenuItem {
                     label: "Close other tabs".into(),
                     action: MenuAction::CloseOtherTabs(i),
@@ -817,6 +1050,18 @@ impl BrowserApp {
                 }
             }
             MenuAction::CloseTab(i) => self.close_tab(i),
+            MenuAction::TogglePinTab(i) => self.toggle_pin_tab(i),
+            MenuAction::ToggleMuteTab(i) => {
+                if let Some(tab) = self.tabs.get_mut(i) {
+                    tab.page.toggle_tab_mute();
+                }
+                self.page_dirty = true;
+            }
+            MenuAction::SplitWithTab(i) => self.split_with_tab(i),
+            MenuAction::ToggleVerticalTabs => self.toggle_vertical_tabs(),
+            MenuAction::ToggleSplitView => self.toggle_split_view(),
+            MenuAction::ToggleShields => self.toggle_shields(),
+            MenuAction::ToggleReaderMode => self.toggle_reader_mode(),
             MenuAction::CloseOtherTabs(keep) => {
                 if keep < self.tabs.len() {
                     let kept = self.tabs.remove(keep);
@@ -922,12 +1167,18 @@ impl BrowserApp {
         };
         let icon = match self.chrome.hovered_hit {
             ChromeHit::Tab(_)
+            | ChromeHit::TabAudio(_)
             | ChromeHit::CloseTab(_)
             | ChromeHit::NewTab
             | ChromeHit::Back
             | ChromeHit::Forward
             | ChromeHit::Reload
+            | ChromeHit::ZoomReset
             | ChromeHit::ToggleBookmark
+            | ChromeHit::ToggleShields
+            | ChromeHit::ToggleReaderMode
+            | ChromeHit::ToggleVerticalTabs
+            | ChromeHit::ToggleSplitView
             | ChromeHit::DownloadsBtn
             | ChromeHit::ToggleDevTools
             | ChromeHit::MenuBtn
@@ -939,6 +1190,7 @@ impl BrowserApp {
             | ChromeHit::ToastDownloads
             | ChromeHit::ToastClose
             | ChromeHit::DevToolsTab(_) => CursorIcon::Pointer,
+            ChromeHit::SplitDivider => CursorIcon::EwResize,
             ChromeHit::Omnibox | ChromeHit::ConsoleInput | ChromeHit::FindInput => CursorIcon::Text,
             ChromeHit::Content => match self.active_page().hovered_cursor() {
                 peedle_css::Cursor::Pointer => CursorIcon::Pointer,
@@ -979,26 +1231,84 @@ impl BrowserApp {
         }
     }
 
+    fn sync_audio_tab_flags(&mut self) {
+        self.chrome.audio_tabs = self
+            .tabs
+            .iter()
+            .map(|t| t.page.is_playing_audio() || t.page.tab_muted)
+            .collect();
+        self.chrome.pinned_tabs = self.tabs.iter().map(|t| t.pinned).collect();
+        self.chrome.blocked_count = self.client.blocked_count();
+        self.chrome.reader_active = self
+            .tabs
+            .get(self.active_tab)
+            .map_or(false, |t| t.reader_saved_url.is_some());
+    }
+
+    fn toggle_window_fullscreen(&mut self) {
+        self.window_fullscreen = !self.window_fullscreen;
+        if let Some(ref win) = self.window {
+            if self.window_fullscreen {
+                win.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            } else {
+                win.set_fullscreen(None);
+            }
+        }
+    }
+
     fn render(&mut self) {
         if self.phys_w == 0 || self.phys_h == 0 || self.tabs.is_empty() {
             return;
         }
+        self.sync_audio_tab_flags();
         let s = self.scale_factor.max(1.0);
         let lh = self.logical_h();
+        let video_fs = self.active_page().is_fullscreen_video();
+        if video_fs {
+            self.full_fb
+                .resize_or_clear(self.phys_w, self.phys_h, RgbaColor::new(0, 0, 0, 255));
+            self.tabs[self.active_tab]
+                .page
+                .render_to_framebuffer_scaled(&mut self.full_fb, s);
+            self.page_dirty = false;
+            if let Some(ref mut surface) = self.surface {
+                if let (Some(w), Some(h)) = (NonZeroU32::new(self.phys_w), NonZeroU32::new(self.phys_h)) {
+                    let _ = surface.resize(w, h);
+                    if let Ok(mut buffer) = surface.buffer_mut() {
+                        self.full_fb.to_xrgb_slice(&mut buffer);
+                        let _ = buffer.present();
+                    }
+                }
+            }
+            return;
+        }
         let top_h = top_chrome_height(&self.chrome);
         let vh = content_viewport_height(lh, &self.chrome);
         let z = self.chrome.zoom.clamp(0.5, 2.0);
         let eff_scale = (z * s).clamp(0.5, 4.0);
-        let target_pw = self.phys_w.max(1);
+        let (left_x, left_w, right_x, right_w) = self.pane_layout();
+        let (left_tab, right_tab) = if self.chrome.split_active && right_w > 0.0 {
+            if self.chrome.split_focus_right {
+                (self.split_tab.unwrap_or(self.active_tab), Some(self.active_tab))
+            } else {
+                (self.active_tab, self.split_tab)
+            }
+        } else {
+            (self.active_tab, None)
+        };
+        let left_pw = (left_w * s).ceil().max(1.0) as u32;
         let target_ph = (vh * s).ceil().max(1.0) as u32;
 
-        if self.page_dirty || self.page_fb.width != target_pw || self.page_fb.height != target_ph {
-            self.page_fb.resize_or_clear(target_pw, target_ph, RgbaColor::WHITE);
-            self.tabs[self.active_tab]
+        if self.page_dirty || self.page_fb.width != left_pw || self.page_fb.height != target_ph {
+            self.page_fb.resize_or_clear(left_pw, target_ph, RgbaColor::WHITE);
+            self.tabs[left_tab]
                 .page
                 .render_to_framebuffer_scaled(&mut self.page_fb, eff_scale);
 
-            if self.chrome.find_open && !self.chrome.find.text.trim().is_empty() {
+            if left_tab == self.active_tab
+                && self.chrome.find_open
+                && !self.chrome.find.text.trim().is_empty()
+            {
                 let q = self.chrome.find.text.trim().to_ascii_lowercase();
                 let page = &self.tabs[self.active_tab].page;
                 let sx = page.scroll_x;
@@ -1029,26 +1339,63 @@ impl BrowserApp {
             self.page_dirty = false;
         }
 
+        if let Some(rt_idx) = right_tab {
+            let right_pw = (right_w * s).ceil().max(1.0) as u32;
+            if self.split_dirty
+                || self.split_fb.width != right_pw
+                || self.split_fb.height != target_ph
+            {
+                self.split_fb.resize_or_clear(right_pw, target_ph, RgbaColor::WHITE);
+                self.tabs[rt_idx]
+                    .page
+                    .render_to_framebuffer_scaled(&mut self.split_fb, eff_scale);
+                self.split_dirty = false;
+            }
+        }
+
         self.full_fb
             .resize_or_clear(self.phys_w, self.phys_h, RgbaColor::new(17, 20, 27, 255));
         let top_phys = top_h * s;
         let vh_phys = vh * s;
+        let lx_phys = left_x * s;
+        let lw_phys = left_w * s;
         self.full_fb.push_clip(ClipRect {
-            x: 0,
+            x: lx_phys.floor() as i32,
             y: top_phys.floor() as i32,
-            w: self.phys_w as i32,
+            w: lw_phys.ceil() as i32,
             h: vh_phys.ceil() as i32,
         });
         self.full_fb.blit_rgba_opaque(
             self.page_fb.width,
             self.page_fb.height,
             &self.page_fb.data,
-            0.0,
+            lx_phys,
             top_phys,
-            self.phys_w as f32,
+            lw_phys,
             vh_phys,
         );
         self.full_fb.pop_clip();
+
+        if right_tab.is_some() {
+            let rx_phys = right_x * s;
+            let rw_phys = right_w * s;
+            self.full_fb.push_clip(ClipRect {
+                x: rx_phys.floor() as i32,
+                y: top_phys.floor() as i32,
+                w: rw_phys.ceil() as i32,
+                h: vh_phys.ceil() as i32,
+            });
+            self.full_fb.blit_rgba_opaque(
+                self.split_fb.width,
+                self.split_fb.height,
+                &self.split_fb.data,
+                rx_phys,
+                top_phys,
+                rw_phys,
+                vh_phys,
+            );
+            self.full_fb.pop_clip();
+        }
 
         let visuals: Vec<TabVisual<'_>> = self
             .tabs
@@ -1063,6 +1410,9 @@ impl BrowserApp {
                     page: &t.page,
                     loading: t.loading,
                     load_progress: progress,
+                    playing_audio: t.page.is_playing_audio(),
+                    muted: t.page.tab_muted,
+                    pinned: t.pinned,
                 }
             })
             .collect();
@@ -1100,7 +1450,11 @@ impl BrowserApp {
             .tabs
             .get(self.active_tab)
             .map_or(false, |t| t.page.has_pending_timers());
-        any_loading || smooth_scroll || active_timers
+        let active_media = self
+            .tabs
+            .get(self.active_tab)
+            .map_or(false, |t| t.page.has_active_media());
+        any_loading || smooth_scroll || active_timers || active_media
     }
 }
 
@@ -1185,8 +1539,11 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                 }
                 if tab_idx == self.active_tab {
                     self.page_dirty = true;
+                    self.split_dirty = true;
                     self.sync_omnibox();
                     self.sync_window_title();
+                } else if self.split_tab == Some(tab_idx) {
+                    self.split_dirty = true;
                 }
                 self.request_redraw();
             }
@@ -1213,6 +1570,7 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                     }
                     self.active_page_mut().scroll_by(0.0, step);
                     self.page_dirty = true;
+                    self.split_dirty = true;
                     need_draw = true;
                 }
                 if !self.tabs.is_empty() && self.active_page().has_pending_timers() {
@@ -1222,7 +1580,17 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                         self.open_new_tab(&nu);
                     }
                     self.page_dirty = true;
+                    self.split_dirty = true;
                     need_draw = true;
+                }
+                if !self.tabs.is_empty() && self.active_page().has_active_media() {
+                    let seq = self.active_page().media_frame_seq();
+                    if seq != self.tabs[self.active_tab].last_media_seq || dt_ms >= 32 {
+                        self.tabs[self.active_tab].last_media_seq = seq;
+                        self.page_dirty = true;
+                        self.split_dirty = true;
+                        need_draw = true;
+                    }
                 }
                 if need_draw {
                     self.request_redraw();
@@ -1264,6 +1632,14 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                 let s = self.scale_factor.max(1.0);
                 self.cursor_x = position.x as f32 / s;
                 self.cursor_y = position.y as f32 / s;
+                if self.split_dragging {
+                    let ox = content_origin_x(&self.chrome);
+                    let cw = content_viewport_width(self.logical_w(), &self.chrome);
+                    self.chrome.split_ratio = ((self.cursor_x - ox) / cw).clamp(0.25, 0.75);
+                    self.resize_all_tabs();
+                    self.request_redraw();
+                    return;
+                }
                 if self.scrollbar_dragging {
                     self.scroll_to_scrollbar_y(self.cursor_y);
                     self.request_redraw();
@@ -1271,12 +1647,16 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                 }
                 if self.selecting_page_text {
                     let z = self.chrome.zoom.clamp(0.5, 2.0);
-                    let cx = self.cursor_x / z;
+                    let cx = (self.cursor_x - self.active_pane_origin_x()) / z;
                     let vy = (self.cursor_y - top_chrome_height(&self.chrome)) / z;
                     let start = self.select_drag_start;
                     self.active_page_mut().set_selection_viewport(start, (cx, vy));
                     self.page_dirty = true;
+                    self.split_dirty = true;
                     self.request_redraw();
+                    return;
+                }
+                if self.active_page().is_fullscreen_video() {
                     return;
                 }
                 let hit = hit_test_chrome(
@@ -1291,11 +1671,12 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                 self.chrome.hovered_hit = hit;
                 if hit == ChromeHit::Content {
                     let z = self.chrome.zoom.clamp(0.5, 2.0);
-                    let cx = self.cursor_x / z;
+                    let cx = (self.cursor_x - self.active_pane_origin_x()) / z;
                     let vy = (self.cursor_y - top_chrome_height(&self.chrome)) / z;
                     let vh = content_viewport_height(self.logical_h(), &self.chrome) / z;
                     if vy >= 0.0 && vy < vh && self.active_page_mut().on_mouse_move(cx, vy) {
                         self.page_dirty = true;
+                        self.split_dirty = true;
                         self.request_redraw();
                     }
                 }
@@ -1329,6 +1710,7 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
             } => {
                 self.scrollbar_dragging = false;
                 self.selecting_page_text = false;
+                self.split_dragging = false;
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -1344,6 +1726,9 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                 button: MouseButton::Middle,
                 ..
             } => {
+                if self.active_page().is_fullscreen_video() {
+                    return;
+                }
                 let hit = hit_test_chrome(
                     self.cursor_x,
                     self.cursor_y,
@@ -1358,8 +1743,24 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                         self.request_redraw();
                     }
                     ChromeHit::Content => {
+                        if self.chrome.split_active {
+                            if let Some(other) = self.split_tab {
+                                let div_x = split_divider_x(self.logical_w(), &self.chrome);
+                                let clicked_right = self.cursor_x > div_x;
+                                if clicked_right != self.chrome.split_focus_right {
+                                    let old_active = self.active_tab;
+                                    self.active_tab = other;
+                                    self.split_tab = Some(old_active);
+                                    self.chrome.split_focus_right = clicked_right;
+                                    self.sync_omnibox();
+                                    self.sync_window_title();
+                                    self.page_dirty = true;
+                                    self.split_dirty = true;
+                                }
+                            }
+                        }
                         let z = self.chrome.zoom.clamp(0.5, 2.0);
-                        let cx = self.cursor_x / z;
+                        let cx = (self.cursor_x - self.active_pane_origin_x()) / z;
                         let vy = (self.cursor_y - top_chrome_height(&self.chrome)) / z;
                         if let Some(url) = self.active_page().href_at(cx, vy) {
                             self.open_new_tab(&url);
@@ -1382,6 +1783,17 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                 });
                 self.last_click_time = Some(now);
                 self.last_click_pos = (self.cursor_x, self.cursor_y);
+
+                if self.active_page().is_fullscreen_video() {
+                    let (cx, cy) = (self.cursor_x, self.cursor_y);
+                    let act = self.active_page_mut().on_click_ex(cx, cy, false);
+                    self.page_dirty = true;
+                    if let ClickAction::Navigated(dest) = act {
+                        self.navigate_active(&dest);
+                    }
+                    self.request_redraw();
+                    return;
+                }
 
                 let hit = hit_test_chrome(
                     self.cursor_x,
@@ -1442,6 +1854,12 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                         self.sync_omnibox();
                         self.sync_window_title();
                     }
+                    ChromeHit::TabAudio(i) => {
+                        if let Some(tab) = self.tabs.get_mut(i) {
+                            tab.page.toggle_tab_mute();
+                        }
+                        self.page_dirty = true;
+                    }
                     ChromeHit::CloseTab(i) => self.close_tab(i),
                     ChromeHit::NewTab => {
                         self.open_new_tab("peedle://newtab");
@@ -1463,7 +1881,7 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                         if !was_omni || is_double {
                             self.chrome.omnibox.select_all();
                         } else {
-                            let (ox, _, _, _) = omnibox_rect(self.logical_w());
+                            let (ox, _, _, _) = omnibox_rect_for(self.logical_w(), &self.chrome);
                             let rel_x = (self.cursor_x - (ox + 32.0)).max(0.0);
                             self.chrome.omnibox.set_cursor_from_x(
                                 rel_x,
@@ -1474,7 +1892,18 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                         }
                         self.refresh_suggestions();
                     }
+                    ChromeHit::ZoomReset => {
+                        self.chrome.zoom = 1.0;
+                        self.resize_all_tabs();
+                    }
                     ChromeHit::ToggleBookmark => self.toggle_current_bookmark(),
+                    ChromeHit::ToggleShields => self.toggle_shields(),
+                    ChromeHit::ToggleReaderMode => self.toggle_reader_mode(),
+                    ChromeHit::ToggleVerticalTabs => self.toggle_vertical_tabs(),
+                    ChromeHit::ToggleSplitView => self.toggle_split_view(),
+                    ChromeHit::SplitDivider => {
+                        self.split_dragging = true;
+                    }
                     ChromeHit::DownloadsBtn => self.open_new_tab("peedle://downloads"),
                     ChromeHit::MenuBtn => self.open_browser_menu(),
                     ChromeHit::BookmarkItem(i) => {
@@ -1517,8 +1946,24 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                         self.scroll_to_scrollbar_y(self.cursor_y);
                     }
                     ChromeHit::Content => {
+                        if self.chrome.split_active {
+                            if let Some(other) = self.split_tab {
+                                let div_x = split_divider_x(self.logical_w(), &self.chrome);
+                                let clicked_right = self.cursor_x > div_x;
+                                if clicked_right != self.chrome.split_focus_right {
+                                    let old_active = self.active_tab;
+                                    self.active_tab = other;
+                                    self.split_tab = Some(old_active);
+                                    self.chrome.split_focus_right = clicked_right;
+                                    self.sync_omnibox();
+                                    self.sync_window_title();
+                                    self.page_dirty = true;
+                                    self.split_dirty = true;
+                                }
+                            }
+                        }
                         let z = self.chrome.zoom.clamp(0.5, 2.0);
-                        let cx = self.cursor_x / z;
+                        let cx = (self.cursor_x - self.active_pane_origin_x()) / z;
                         let vy = (self.cursor_y - top_chrome_height(&self.chrome)) / z;
                         let cmd = self.modifiers.super_key() || self.modifiers.control_key();
                         if cmd {
@@ -1589,6 +2034,17 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                 let shift = self.modifiers.shift_key();
 
                 if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                    if self.active_page().is_fullscreen_video() {
+                        self.active_page_mut().exit_fullscreen_video();
+                        self.page_dirty = true;
+                        self.request_redraw();
+                        return;
+                    }
+                    if self.window_fullscreen {
+                        self.toggle_window_fullscreen();
+                        self.request_redraw();
+                        return;
+                    }
                     if self.chrome.popup_menu.take().is_some()
                         || self.chrome.select_popup.take().is_some()
                     {
@@ -1789,11 +2245,21 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                                 }
                                 return;
                             }
+                            "v" if shift => {
+                                self.toggle_vertical_tabs();
+                                self.request_redraw();
+                                return;
+                            }
                             "v" => {
                                 if let Some(clip) = read_clipboard() {
                                     self.paste_text(&clip);
                                     self.request_redraw();
                                 }
+                                return;
+                            }
+                            "r" if alt => {
+                                self.toggle_reader_mode();
+                                self.request_redraw();
                                 return;
                             }
                             "r" => {
@@ -1823,6 +2289,11 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                             }
                             "u" => {
                                 self.execute_menu_action(MenuAction::ViewSource);
+                                self.request_redraw();
+                                return;
+                            }
+                            "s" if shift => {
+                                self.toggle_split_view();
                                 self.request_redraw();
                                 return;
                             }
@@ -1925,6 +2396,11 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                     return;
                 }
 
+                if matches!(event.logical_key, Key::Named(NamedKey::F11)) {
+                    self.toggle_window_fullscreen();
+                    self.request_redraw();
+                    return;
+                }
                 if matches!(event.logical_key, Key::Named(NamedKey::F12)) {
                     self.chrome.devtools_open = !self.chrome.devtools_open;
                     self.resize_all_tabs();
@@ -2081,6 +2557,22 @@ impl ApplicationHandler<AppEvent> for BrowserApp {
                 }
 
                 let page_input = self.active_page().has_focused_input();
+                if !page_input {
+                    let media_key_str = match &event.logical_key {
+                        Key::Named(NamedKey::Space) => Some(" "),
+                        Key::Named(NamedKey::ArrowLeft) => Some("ArrowLeft"),
+                        Key::Named(NamedKey::ArrowRight) => Some("ArrowRight"),
+                        Key::Character(ch) => Some(ch.as_str()),
+                        _ => None,
+                    };
+                    if let Some(mk) = media_key_str {
+                        if self.active_page_mut().handle_media_key(mk) {
+                            self.page_dirty = true;
+                            self.request_redraw();
+                            return;
+                        }
+                    }
+                }
                 match &event.logical_key {
                     Key::Named(NamedKey::Tab) => {
                         if self.active_page_mut().focus_next_input(shift) {

@@ -97,8 +97,28 @@ pub fn render_svg_node_with_color(
         .and_then(|e| e.get_attr("fill"))
         .and_then(|v| parse_svg_color_with_current(v, current_color))
         .unwrap_or(Some(current_color));
+    let inherited_stroke = doc
+        .element(svg_id)
+        .and_then(|e| e.get_attr("stroke"))
+        .and_then(|v| parse_svg_color_with_current(v, current_color))
+        .unwrap_or(None);
+    let inherited_stroke_w = doc
+        .element(svg_id)
+        .and_then(|e| e.get_attr("stroke-width"))
+        .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
+        .unwrap_or(1.0);
 
-    render_svg_children(doc, svg_id, &mut canvas, fonts, inherited_fill, None, 1.0, current_color, 0);
+    render_svg_children(
+        doc,
+        svg_id,
+        &mut canvas,
+        fonts,
+        inherited_fill,
+        inherited_stroke,
+        inherited_stroke_w,
+        current_color,
+        0,
+    );
     fb.blit_rgba(
         canvas.fb.width,
         canvas.fb.height,

@@ -1275,6 +1275,123 @@ impl Framebuffer {
         img.save(path).map_err(|e| e.to_string())
     }
 
+    pub fn blit_rgba_affine(
+        &mut self,
+        src_w: u32,
+        src_h: u32,
+        src: &[u8],
+        pivot_src_x: f32,
+        pivot_src_y: f32,
+        pivot_dst_x: f32,
+        pivot_dst_y: f32,
+        mat: [f32; 4],
+        alpha: f32,
+    ) {
+        if src_w == 0 || src_h == 0 || alpha <= 0.001 {
+            return;
+        }
+        let [a, b, c, d] = mat;
+        let det = a * d - b * c;
+        if det.abs() < 1e-6 {
+            return;
+        }
+        let inv_det = 1.0 / det;
+        let ia = d * inv_det;
+        let ib = -b * inv_det;
+        let ic = -c * inv_det;
+        let id = a * inv_det;
+
+        let sw = src_w as f32;
+        let sh = src_h as f32;
+        let corners = [
+            (-pivot_src_x, -pivot_src_y),
+            (sw - pivot_src_x, -pivot_src_y),
+            (-pivot_src_x, sh - pivot_src_y),
+            (sw - pivot_src_x, sh - pivot_src_y),
+        ];
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for (cx, cy) in corners {
+            let tx = pivot_dst_x + a * cx + c * cy;
+            let ty = pivot_dst_y + b * cx + d * cy;
+            min_x = min_x.min(tx);
+            min_y = min_y.min(ty);
+            max_x = max_x.max(tx);
+            max_y = max_y.max(ty);
+        }
+        let clip = self.current_clip();
+        let x0 = (min_x.floor() as i32).max(clip.x);
+        let y0 = (min_y.floor() as i32).max(clip.y);
+        let x1 = (max_x.ceil() as i32).min(clip.x + clip.w).min(self.width as i32);
+        let y1 = (max_y.ceil() as i32).min(clip.y + clip.h).min(self.height as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        for py in y0..y1 {
+            let ry = py as f32 + 0.5 - pivot_dst_y;
+            for px in x0..x1 {
+                let rx = px as f32 + 0.5 - pivot_dst_x;
+                let sx = ia * rx + ic * ry + pivot_src_x - 0.5;
+                let sy = ib * rx + id * ry + pivot_src_y - 0.5;
+                if sx < -0.5 || sy < -0.5 || sx > sw - 0.5 || sy > sh - 0.5 {
+                    continue;
+                }
+                let x_lo = sx.floor() as i32;
+                let y_lo = sy.floor() as i32;
+                let fx = sx - x_lo as f32;
+                let fy = sy - y_lo as f32;
+                let sample = |ix: i32, iy: i32| -> [f32; 4] {
+                    if ix < 0 || iy < 0 || ix >= src_w as i32 || iy >= src_h as i32 {
+                        return [0.0; 4];
+                    }
+                    let idx = ((iy as u32 * src_w + ix as u32) * 4) as usize;
+                    if idx + 3 >= src.len() {
+                        return [0.0; 4];
+                    }
+                    let sa = src[idx + 3] as f32;
+                    [
+                        src[idx] as f32 * sa,
+                        src[idx + 1] as f32 * sa,
+                        src[idx + 2] as f32 * sa,
+                        sa,
+                    ]
+                };
+                let c00 = sample(x_lo, y_lo);
+                let c10 = sample(x_lo + 1, y_lo);
+                let c01 = sample(x_lo, y_lo + 1);
+                let c11 = sample(x_lo + 1, y_lo + 1);
+                let w00 = (1.0 - fx) * (1.0 - fy);
+                let w10 = fx * (1.0 - fy);
+                let w01 = (1.0 - fx) * fy;
+                let w11 = fx * fy;
+                let pa = c00[3] * w00 + c10[3] * w10 + c01[3] * w01 + c11[3] * w11;
+                if pa <= 0.5 {
+                    continue;
+                }
+                let pr = (c00[0] * w00 + c10[0] * w10 + c01[0] * w01 + c11[0] * w11) / pa;
+                let pg = (c00[1] * w00 + c10[1] * w10 + c01[1] * w01 + c11[1] * w11) / pa;
+                let pb = (c00[2] * w00 + c10[2] * w10 + c01[2] * w01 + c11[2] * w11) / pa;
+                let fa = (pa * alpha).clamp(0.0, 255.0).round() as u8;
+                if fa == 0 {
+                    continue;
+                }
+                self.blend_pixel(
+                    px,
+                    py,
+                    RgbaColor::new(
+                        pr.clamp(0.0, 255.0).round() as u8,
+                        pg.clamp(0.0, 255.0).round() as u8,
+                        pb.clamp(0.0, 255.0).round() as u8,
+                        fa,
+                    ),
+                );
+            }
+        }
+    }
+
     pub fn encode_png(&self) -> Result<Vec<u8>, String> {
         let img: ImageBuffer<Rgba<u8>, _> =
             ImageBuffer::from_raw(self.width, self.height, self.data.clone())
